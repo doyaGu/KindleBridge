@@ -13,6 +13,7 @@ pub mod exec;
 pub mod probe;
 pub mod server;
 mod services;
+pub mod shell;
 pub mod sync;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

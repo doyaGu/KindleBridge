@@ -210,7 +210,7 @@ impl ShellPacket {
 fn validate_direction(kind: u8, source: PacketSource) -> Result<(), ShellPacketError> {
     let valid = match source {
         PacketSource::Host => matches!(kind, 0 | 4 | 5),
-        PacketSource::Device => matches!(kind, 1 | 2 | 3),
+        PacketSource::Device => matches!(kind, 1..=3),
     };
     if valid {
         Ok(())
