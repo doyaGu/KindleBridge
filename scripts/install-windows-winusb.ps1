@@ -154,7 +154,7 @@ if ($InstanceId) {
 }
 
 if (@($devices).Count -eq 0) {
-    throw 'No connected KindleBridge MI_01 interface found. Choose Connect for development in KUAL, connect the cable, and retry.'
+    throw 'No connected KindleBridge MI_01 interface found. Choose Switch to development mode in KUAL, connect USB, and retry.'
 }
 
 $changed = @()

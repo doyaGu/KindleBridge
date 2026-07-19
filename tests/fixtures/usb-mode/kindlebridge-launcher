@@ -31,7 +31,9 @@ start_child() {
     child=$!
     rm -f "$root/run/heartbeat"
     if test "${KINDLEBRIDGE_TEST_NO_HEARTBEAT:-0}" != 1; then
-        printf 'KINDLEBRIDGE_HEARTBEAT_V1\ninstance=test-%s-%s\ntimestamp_ms=0\n' "$$" "$child" \
+        timestamp_ms=$(($(date +%s) * 1000))
+        printf 'KINDLEBRIDGE_HEARTBEAT_V1\ninstance=test-%s-%s\ntimestamp_ms=%s\n' \
+            "$$" "$child" "$timestamp_ms" \
             >"$root/run/heartbeat"
         rm -f "$root/launcher/pending-slot"
     fi

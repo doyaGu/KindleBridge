@@ -83,6 +83,7 @@ setup_case() {
     export KINDLEBRIDGE_TMP_ROOT="$CASE_ROOT/tmp"
     export KINDLEBRIDGE_TEST_ALLOW_MTP_DIRECTORY=1
     unset KINDLEBRIDGE_TEST_MOUNT_FAIL KINDLEBRIDGE_TEST_REAL_SLEEP
+    unset KINDLEBRIDGE_TEST_NO_HEARTBEAT
     unset KINDLEBRIDGE_TEST_BIND_STOCK_MTP
     unset KINDLEBRIDGE_TEST_SUPERVISOR_RACE KINDLEBRIDGE_TEST_AFTER_UNBIND_DELAY
 
@@ -492,18 +493,58 @@ assert_file_empty "$CASE_ROOT/trace" 'stale-boot cleanup mutated USB state'
 test ! -d "$CASE_ROOT/var/local/kindlebridge/usb" || fail 'stale-boot cleanup left state'
 pass 'previous-boot state is discarded without USB writes'
 
+setup_case heartbeat_health
+run_manager "$CASE_ROOT/start-output" start 0
+test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/start-output" >&2; fail 'heartbeat health setup failed'; }
+remember_daemon
+rm -f "$CASE_ROOT/mnt/us/kindlebridge/runtime/run/heartbeat"
+run_manager "$CASE_ROOT/status-output" status
+assert_equal recovering "$(sed -n '1p' "$CASE_ROOT/status-output")" \
+    'status reported active while the daemon heartbeat was unavailable'
+mkdir -p "$CASE_ROOT/mnt/us/kindlebridge/runtime/launcher"
+printf 'KINDLEBRIDGE_WATCHDOG_V1\nslot=A\ncrashes=3\nnext_start_ms=0\nhalted=1\n' \
+    >"$CASE_ROOT/mnt/us/kindlebridge/runtime/launcher/watchdog-state"
+run_manager "$CASE_ROOT/halted-status-output" status
+assert_equal degraded "$(sed -n '1p' "$CASE_ROOT/halted-status-output")" \
+    'status reported active while the launcher crash fuse was halted'
+pass 'status distinguishes recovering and degraded health from active USB'
+
+setup_case kual_feedback
+cp "$MANAGER" "$CASE_ROOT/mnt/us/kindlebridge/bin/usb-gadget-manager.sh"
+chmod 0755 "$CASE_ROOT/mnt/us/kindlebridge/bin/usb-gadget-manager.sh"
+printf '%s\n' 0.1.0-test >"$CASE_ROOT/mnt/us/kindlebridge/VERSION"
+KUAL_CAPTURE="$CASE_ROOT/kual-message"
+export KUAL_CAPTURE
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$3" >"$KUAL_CAPTURE"' \
+    >"$CASE_ROOT/bin/kual-capture"
+chmod 0755 "$CASE_ROOT/bin/kual-capture"
+export KUAL="$CASE_ROOT/bin/kual-capture"
+printf '%s\n' 1 >"$CASE_ROOT/sys/class/udc/11211000.usb/connected"
+if sh "$KUAL_WRAPPER" start >"$CASE_ROOT/kual-output" 2>&1; then
+    fail 'KUAL connected start unexpectedly succeeded'
+fi
+grep -q 'E-CABLE' "$KUAL_CAPTURE" || fail 'KUAL did not classify the connected-cable failure'
+sh "$KUAL_WRAPPER" status >"$CASE_ROOT/kual-status-output" 2>&1
+grep -q 'Last action failed: E-CABLE' "$KUAL_CAPTURE" ||
+    fail 'KUAL status did not explain the last failure'
+unset KUAL KUAL_CAPTURE
+pass 'KUAL status preserves a short actionable failure result'
+
 exitmenu_count=$(grep -c '"exitmenu": false' "$KUAL_MENU")
 assert_equal 4 "$exitmenu_count" 'not every KUAL action preserves the menu'
+grep -q 'Switch to development mode' "$KUAL_MENU" || fail 'KUAL development action is ambiguous'
+grep -q 'Switch to USB file transfer' "$KUAL_MENU" || fail 'KUAL file-transfer action is ambiguous'
+grep -q 'runtime/next.*-f' "$KUAL_MENU" || fail 'KUAL always exposes the staged-update action'
 grep -q 'start 0' "$KUAL_WRAPPER" || fail 'KUAL start still has a safety timeout'
 grep -q 'apply-staged' "$KUAL_WRAPPER" || fail 'KUAL has no offline staged activation action'
-grep -q 'E-LAUNCH' "$KUAL_WRAPPER" || fail 'KUAL launcher failures do not fit on screen as a short code'
+grep -q 'E-DAEMON' "$KUAL_WRAPPER" || fail 'KUAL daemon failures do not fit on screen as a short code'
 grep -q 'last-error.log' "$KUAL_WRAPPER" || fail 'KUAL does not preserve the full failure detail'
 if grep -q 'nohup' "$KUAL_WRAPPER"; then
     fail 'KUAL wrapper hides transition output in a detached process'
 fi
-grep -q 'active|detached|acquiring-stock-usb|starting|stopping|stale' "$PROJECT_DIR/packaging/mrpi/install.sh" ||
+grep -q 'active|recovering|degraded|detached|acquiring-stock-usb|starting|stopping|stale' "$PROJECT_DIR/packaging/mrpi/install.sh" ||
     fail 'installer can replace files during USB acquisition'
-grep -q 'active|detached|acquiring-stock-usb|starting|stopping|stale' "$PROJECT_DIR/packaging/mrpi/uninstall.sh" ||
+grep -q 'active|recovering|degraded|detached|acquiring-stock-usb|starting|stopping|stale' "$PROJECT_DIR/packaging/mrpi/uninstall.sh" ||
     fail 'uninstaller can remove files during USB acquisition'
 pass 'KUAL actions stay in-menu and start without a timeout'
 

@@ -128,6 +128,41 @@ heartbeat_instance() {
     sed -n '2s/^instance=//p' "$RUNTIME/run/heartbeat" 2>/dev/null || true
 }
 
+watchdog_is_halted() {
+    grep -q '^halted=1$' "$RUNTIME/launcher/watchdog-state" 2>/dev/null
+}
+
+heartbeat_is_fresh() {
+    heartbeat="$RUNTIME/run/heartbeat"
+    test "$(sed -n '1p' "$heartbeat" 2>/dev/null)" = KINDLEBRIDGE_HEARTBEAT_V1 || return 1
+    test -n "$(heartbeat_instance)" || return 1
+    timestamp_ms=$(sed -n '3s/^timestamp_ms=//p' "$heartbeat" 2>/dev/null || true)
+    case "$timestamp_ms" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    now_seconds=$(date +%s 2>/dev/null || true)
+    case "$now_seconds" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    heartbeat_seconds=$((timestamp_ms / 1000))
+    test "$heartbeat_seconds" -le "$now_seconds" || return 1
+    slot=$(cat "$RUNTIME/current" 2>/dev/null || true)
+    case "$slot" in
+        A|B) ;;
+        *) return 1 ;;
+    esac
+    timeout_ms=$(sed -n 's/^heartbeat_timeout_ms=//p' \
+        "$RUNTIME/slots/$slot/slot.manifest" 2>/dev/null || true)
+    case "$timeout_ms" in
+        ''|*[!0-9]*) timeout_ms=10000 ;;
+    esac
+    # Round the selected slot's liveness window up because the packaged
+    # BusyBox date reports whole seconds.
+    timeout_seconds=$(((timeout_ms + 999) / 1000))
+    age_seconds=$((now_seconds - heartbeat_seconds))
+    test "$age_seconds" -le "$timeout_seconds"
+}
+
 wait_for_active_daemon_ready() {
     previous_instance=$1
     # Three no-heartbeat startup attempts take just over 30 seconds with the
@@ -620,6 +655,18 @@ status() {
                 echo "slot=$(cat "$RUNTIME/current" 2>/dev/null || echo unknown)"
                 return 1
             fi
+            if watchdog_is_halted; then
+                echo degraded
+                echo "reason=watchdog-halted"
+                echo "slot=$(cat "$RUNTIME/current" 2>/dev/null || echo unknown)"
+                return 1
+            fi
+            if test -f "$RUNTIME/launcher/pending-slot" || ! heartbeat_is_fresh; then
+                echo recovering
+                echo "reason=daemon-heartbeat"
+                echo "slot=$(cat "$RUNTIME/current" 2>/dev/null || echo unknown)"
+                return 0
+            fi
             echo active
             link_state=$(udc_state "$udc")
             echo "serial=$(tr -d '\000' <"$USID_FILE") link=$link_state"
@@ -640,6 +687,12 @@ status() {
         mode=$(read_state mode '')
         case "$mode" in
             acquiring-stock-usb|starting|stopping) echo "$mode"; return 0 ;;
+            active)
+                echo degraded
+                echo "reason=managed-process-missing"
+                echo "slot=$(cat "$RUNTIME/current" 2>/dev/null || echo unknown)"
+                return 1
+                ;;
         esac
         echo stale
         return 1

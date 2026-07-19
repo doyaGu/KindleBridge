@@ -67,7 +67,7 @@ esac
 if test -x "$BASE/bin/usb-gadget-manager.sh"; then
     bridge_status=$("$BASE/bin/usb-gadget-manager.sh" status 2>/dev/null | sed -n '1p' || true)
     case "$bridge_status" in
-        active|detached|acquiring-stock-usb|starting|stopping|stale|stale-from-previous-boot)
+        active|recovering|degraded|detached|acquiring-stock-usb|starting|stopping|stale|stale-from-previous-boot)
             OLD_WAS_RUNNING=1
             if ! stop_output=$("$BASE/bin/usb-gadget-manager.sh" stop 2>&1); then
                 echo "KindleBridge could not prepare the update." >&2
@@ -81,7 +81,7 @@ if test -x "$BASE/bin/usb-gadget-manager.sh"; then
             ;;
         *)
             echo "KindleBridge has an unknown USB state: $bridge_status" >&2
-            echo "Unplug the USB cable, open KindleBridge Status / Help, then retry." >&2
+            echo "Unplug USB, open KindleBridge status and recovery steps, then retry." >&2
             return 1
             ;;
     esac
@@ -114,7 +114,7 @@ fi
 if test -e "$MNT_US_ROOT/KINDLEBRIDGE_DISABLE"; then
     COMMITTED=1
     echo "KindleBridge installed but disabled by KINDLEBRIDGE_DISABLE."
-    echo "Remove that file, then choose 'Connect for development' in KUAL."
+    echo "Remove that file, then choose 'Switch to development mode' in KUAL."
     return 0
 fi
 

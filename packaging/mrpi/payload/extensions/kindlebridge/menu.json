@@ -5,7 +5,7 @@
       "priority": -1,
       "items": [
         {
-          "name": "Connect for development (USB Bridge)",
+          "name": "Switch to development mode",
           "action": "./bin/kindlebridge.sh",
           "params": "start",
           "exitmenu": false,
@@ -13,7 +13,7 @@
           "status": false
         },
         {
-          "name": "Use USB file transfer (MTP)",
+          "name": "Switch to USB file transfer",
           "action": "./bin/kindlebridge.sh",
           "params": "stop",
           "exitmenu": false,
@@ -21,7 +21,7 @@
           "status": false
         },
         {
-          "name": "Status / Help",
+          "name": "Show status and recovery steps",
           "action": "./bin/kindlebridge.sh",
           "params": "status",
           "exitmenu": false,
@@ -29,7 +29,8 @@
           "status": false
         },
         {
-          "name": "Advanced: Apply daemon update",
+          "name": "Apply staged daemon update",
+          "if": "\"/mnt/us/kindlebridge/runtime/next\" -f",
           "action": "./bin/kindlebridge.sh",
           "params": "apply-staged",
           "exitmenu": false,
