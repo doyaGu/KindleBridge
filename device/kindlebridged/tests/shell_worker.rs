@@ -150,11 +150,11 @@ fn pty_shell_is_persistent_has_ttys_and_resizes() {
 
     worker
         .write_stdin(
-            b"test -t 0 && test -t 1 && test -t 2 && echo TTY-OK; cd /; export KB_TEST=persistent; echo STATE:$PWD:$KB_TEST; echo READY\n"
+            b"test -t 0 && test -t 1 && test -t 2 && printf 'TTY%s\\n' '-OK'; cd /; export KB_TEST=persistent; printf 'STATE:%s:%s\\n' \"$PWD\" \"$KB_TEST\"; printf 'READY%s\\n' '-DONE'\n"
                 .to_vec(),
         )
         .unwrap();
-    let startup = recv_stdout_until(&mut worker, b"READY", Duration::from_secs(5));
+    let startup = recv_stdout_until(&mut worker, b"READY-DONE", Duration::from_secs(5));
     let startup = String::from_utf8_lossy(&startup);
     assert!(startup.contains("TTY-OK"), "{startup}");
     assert!(startup.contains("STATE:/:persistent"), "{startup}");
@@ -168,9 +168,9 @@ fn pty_shell_is_persistent_has_ttys_and_resizes() {
         })
         .unwrap();
     worker
-        .write_stdin(b"stty size; echo RESIZED; exit 37\n".to_vec())
+        .write_stdin(b"stty size; printf 'RESIZED%s\\n' '-DONE'; exit 37\n".to_vec())
         .unwrap();
-    let resized = recv_stdout_until(&mut worker, b"RESIZED", Duration::from_secs(5));
+    let resized = recv_stdout_until(&mut worker, b"RESIZED-DONE", Duration::from_secs(5));
     assert!(
         String::from_utf8_lossy(&resized).contains("41 119"),
         "{}",
@@ -189,13 +189,15 @@ fn pty_shell_is_persistent_has_ttys_and_resizes() {
 fn pty_ctrl_c_interrupts_the_foreground_job_without_killing_the_shell() {
     let mut worker = ShellWorker::spawn(pty_shell()).unwrap();
     worker
-        .write_stdin(b"echo BEFORE; sleep 30; echo SHOULD-NOT-RUN\n".to_vec())
+        .write_stdin(
+            b"printf 'BE%s\\n' 'FORE'; sleep 30; printf 'SHOULD%s\\n' '-NOT-RUN'\n".to_vec(),
+        )
         .unwrap();
     let before = recv_stdout_until(&mut worker, b"BEFORE", Duration::from_secs(5));
     assert!(String::from_utf8_lossy(&before).contains("BEFORE"));
     worker.write_stdin(vec![0x03]).unwrap();
     worker
-        .write_stdin(b"echo INTERRUPTED; exit 0\n".to_vec())
+        .write_stdin(b"printf 'INTERRUP%s\\n' 'TED'; exit 0\n".to_vec())
         .unwrap();
     let output = recv_stdout_until(&mut worker, b"INTERRUPTED", Duration::from_secs(5));
     assert!(!String::from_utf8_lossy(&output).contains("SHOULD-NOT-RUN"));
