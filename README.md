@@ -93,6 +93,23 @@ cargo run --package kindlebridge -- --server target/debug/kindlebridge-server.ex
 cargo run --package kindlebridge -- --server target/debug/kindlebridge-server.exe shell YOUR_KINDLE_SERIAL -c "uname -a"
 ```
 
+The CLI starts one current-user host service on demand and all later CLI
+processes share its USB connection. On Windows it listens on a named pipe; on
+Linux it uses a `0600` Unix socket. It exits after ten idle minutes. Inspect or
+stop it explicitly with `kindlebridge server status` and
+`kindlebridge server stop`; `kindlebridge-server --stdio` remains available for
+tests and IDE integrations.
+
+`shell` opens a persistent root terminal in `/tmp/root` with `TERM=linux`.
+Interactive stdin selects a PTY automatically; redirected stdin selects the raw
+binary stream. Use `-t`/`-tt` to request/force a PTY, `-T` to disable one, `-n`
+to close stdin immediately, and `-e none` to disable the default line-leading
+`~.` local escape. `shell -c COMMAND` streams without the structured `exec`
+output limit and returns the remote exit status; use `exec` when stdout/stderr
+capture or `--json` is required, and `shell --ndjson` for stream events. Devices
+without `shell.v2` receive a visible warning and fall back to the legacy line
+REPL or `exec.v1` command path.
+
 The MRPI package installs the USB control plane and a small A/B daemon launcher.
 The active Bridge may upload and verify a cross-built `kindlebridged`, but it
 never replaces the daemon that owns its current USB transport:

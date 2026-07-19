@@ -3,7 +3,7 @@ param(
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
     [string]$ToolchainRoot,
-    [version]$MaximumGlibcVersion = '2.27'
+    [version]$MaximumGlibcVersion = '2.18'
 )
 
 $ErrorActionPreference = 'Stop'

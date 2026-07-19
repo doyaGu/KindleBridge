@@ -11,14 +11,17 @@ Cargo package is a development compatibility marker, not a product release.
   bundle format, broker policy, and fake device.
 - KBP1 40-byte framing, CRC32C, stream parity, session sequencing, credit
   windows, bounded traffic queues, and class scheduling.
-- Content-Length framed local JSON-RPC with versioned methods, stable errors,
-  device discovery, feature reporting, non-interactive exec, one-shot
-  `shell -c`, and a line-oriented shell REPL. The REPL reuses one host/device
-  session but is not a PTY yet.
-- A real CLI-to-server-to-device path over persistent KBP/TCP sessions. It
-  negotiates typed HELLO metadata, opens `shell.v1` streams, enforces connection
-  and stream credit, executes argv without shell reparsing, propagates bounded
-  timeout errors, and keeps the session usable across calls. The plain TCP
+- A current-user shared local server (Windows named pipe / Linux `0600` Unix
+  socket) with Content-Length framed JSON-RPC, versioned methods, stable errors,
+  automatic CLI startup, idle shutdown, and `server status` / `server stop`.
+  `shell.v2` provides persistent PTY and raw streams, binary stdin/stdout/stderr,
+  resize, close-input, exit/signal reporting, and bounded end-to-end credit.
+- A real CLI-to-server-to-device path over actor-owned persistent KBP/TCP and
+  USB sessions. It negotiates typed HELLO metadata, retains `shell.v1` only as
+  the legacy RPC service, feature-negotiates `shell.v2`, enforces connection and
+  stream credit, executes argv without shell reparsing, propagates bounded
+  timeout errors, and keeps the session usable across calls. USB providers
+  lazily reconnect after unplug, sleep, or daemon restart. The plain TCP
   entry point is development-only until pairing and encryption are connected.
 - A real `sync.v1` path on the same persistent session. Public JSON-RPC carries
   validated absolute host paths rather than Base64 file content; KBP carries
@@ -102,6 +105,9 @@ Cargo package is a development compatibility marker, not a product release.
   filesystem/hash/memory benchmarks established the initial hardware data-path baseline.
   See `docs/hardware-lab/kt6-5.17.1.0.4.md`.
 - Workspace unit/integration tests, formatting, and Clippy with warnings denied.
+  Shell coverage includes PTY persistence/resize, raw binary channel separation,
+  a 32 MiB untruncated stream, malformed-stream isolation, and two simultaneous
+  shells under concurrent sync and log traffic with a 50 ms echo-P95 gate.
   The shell USB-lifecycle suite defines 24 deterministic cases, including exact
   managed-entrypoint ownership, idempotent actions, controlled supervisor
   shutdown, and manual crash-fuse recovery. Three additional MRPI
@@ -120,11 +126,11 @@ Cargo package is a development compatibility marker, not a product release.
   by unplug/replug, sleep/wake, crashes, concurrency, and stock-MTP recovery tests.
   The Windows onboarding script still needs validation on a clean host and
   across supported Windows versions.
-- Wi-Fi/TCP discovery, authenticated pairing, session encryption, automatic
-  transport reconnect, and measured throughput/latency under concurrent streams.
+- Wi-Fi/TCP discovery, authenticated pairing, session encryption, multi-transport
+  reconnect, and hardware throughput/latency measurements under concurrent streams.
 - A narrowly scoped, locally authenticated root broker IPC implementation.
-- End-to-end interactive shell/PTY, root exec grants, sync progress/cancellation
-  and directory semantics, app install and rollback, `run --watch`, logs/events,
+- Root exec grants, sync progress/cancellation and directory semantics, app
+  install and rollback, `run --watch`, logs/events,
   process control, forward/reverse, GDB,
   core dumps, basic perf, screenshot, and bugreport services.
 - KT6 fault-injection validation of offline daemon A/B activation and automatic

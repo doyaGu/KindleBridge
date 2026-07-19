@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$KindleTool,
-    [string]$Version = '0.1.0-dev.3',
+    [string]$Version = '0.1.0-dev.6',
     [switch]$SkipDeviceBuild
 )
 
