@@ -6,6 +6,8 @@ $RepositoryRoot = Split-Path -Parent $PSScriptRoot
 
 Push-Location $RepositoryRoot
 try {
+    & (Join-Path $PSScriptRoot 'install-windows-winusb.ps1') -Validate
+
     $GitBash = Join-Path $env:ProgramFiles 'Git\bin\bash.exe'
     if (-not (Test-Path -LiteralPath $GitBash -PathType Leaf)) {
         throw "Git Bash not found: $GitBash"
