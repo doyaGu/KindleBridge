@@ -503,6 +503,13 @@ impl SessionState {
                 }
                 self.apply_open_response(direction, header, context)
             }
+            Command::Credit if matches!(phase, StreamPhase::Closed | StreamPhase::Reset) => {
+                // Credit can already be in flight when the responder closes or
+                // either endpoint resets a stream. It has no meaning after the
+                // terminal transition, but rejecting it would turn a harmless
+                // per-stream race into a connection-wide protocol failure.
+                Ok(())
+            }
             Command::Data | Command::Credit | Command::Close | Command::Reset => {
                 if phase != StreamPhase::Accepted {
                     return Err(ProtocolError::StreamNotAccepted(header.stream_id));

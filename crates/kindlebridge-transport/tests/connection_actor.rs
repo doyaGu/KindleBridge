@@ -57,7 +57,7 @@ fn received_credit_is_returned_only_after_the_worker_consumes_data() {
         ))
         .unwrap();
 
-    let mut stream = opener.join().unwrap().unwrap();
+    let stream = opener.join().unwrap().unwrap();
     let initial_credit = host_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(initial_credit.header.command, Command::Credit);
     assert_eq!(initial_credit.header.stream_id, stream_id);

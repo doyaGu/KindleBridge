@@ -1,7 +1,7 @@
 //! Bounded scheduling and backend selection for `KindleBridge` transports.
 
 use std::array;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use kindlebridge_wire::{Command, Frame};
 use thiserror::Error;
@@ -57,6 +57,7 @@ impl ScheduledFrame {
 #[derive(Debug)]
 pub struct FrameScheduler {
     queues: [VecDeque<ScheduledFrame>; CLASS_COUNT],
+    stream_classes: HashMap<u32, VecDeque<usize>>,
     deficits: [usize; CLASS_COUNT],
     quanta: [usize; CLASS_COUNT],
     cursor: usize,
@@ -69,6 +70,7 @@ impl FrameScheduler {
     pub fn new(max_queued_bytes: usize) -> Self {
         Self {
             queues: array::from_fn(|_| VecDeque::new()),
+            stream_classes: HashMap::new(),
             deficits: [0; CLASS_COUNT],
             quanta: DEFAULT_QUANTA,
             cursor: 0,
@@ -86,7 +88,12 @@ impl FrameScheduler {
         if next > self.max_queued_bytes {
             return Err(SchedulerError::QueueFull);
         }
-        self.queues[item.class as usize].push_back(item);
+        let class = item.class as usize;
+        self.stream_classes
+            .entry(item.frame.header.stream_id)
+            .or_default()
+            .push_back(class);
+        self.queues[class].push_back(item);
         self.queued_bytes = next;
         Ok(())
     }
@@ -101,13 +108,18 @@ impl FrameScheduler {
         let attempts = CLASS_COUNT.saturating_mul(512);
         for _ in 0..attempts {
             let index = self.cursor;
-            let Some(front) = self.queues[index].front() else {
+            let Some(position) = self.queues[index].iter().position(|item| {
+                self.stream_classes
+                    .get(&item.frame.header.stream_id)
+                    .and_then(|classes| classes.front())
+                    .is_some_and(|class| *class == index)
+            }) else {
                 self.deficits[index] = 0;
                 self.advance();
                 continue;
             };
 
-            let cost = front.wire_len();
+            let cost = self.queues[index][position].wire_len();
             if self.deficits[index] < cost {
                 self.deficits[index] = self.deficits[index].saturating_add(self.quanta[index]);
             }
@@ -118,8 +130,17 @@ impl FrameScheduler {
 
             self.deficits[index] -= cost;
             let frame = self.queues[index]
-                .pop_front()
-                .expect("front was checked above");
+                .remove(position)
+                .expect("eligible frame was checked above");
+            let stream_id = frame.frame.header.stream_id;
+            let classes = self
+                .stream_classes
+                .get_mut(&stream_id)
+                .expect("enqueued frame has stream ordering metadata");
+            debug_assert_eq!(classes.pop_front(), Some(index));
+            if classes.is_empty() {
+                self.stream_classes.remove(&stream_id);
+            }
             self.queued_bytes -= cost;
             // Advance after every frame so a stream of tiny control frames cannot
             // monopolize the transport. Deficit is retained for the next round.
@@ -216,10 +237,19 @@ mod tests {
     use super::*;
 
     fn scheduled(class: TrafficClass, payload_len: usize, sequence: u32) -> ScheduledFrame {
+        scheduled_on(class, payload_len, 1, sequence)
+    }
+
+    fn scheduled_on(
+        class: TrafficClass,
+        payload_len: usize,
+        stream_id: u32,
+        sequence: u32,
+    ) -> ScheduledFrame {
         ScheduledFrame {
             class,
             frame: Frame {
-                header: Header::new(Command::Data, 1, sequence),
+                header: Header::new(Command::Data, stream_id, sequence),
                 payload: vec![0; payload_len],
             },
         }
@@ -245,7 +275,7 @@ mod tests {
             .unwrap();
         for sequence in 0..100 {
             scheduler
-                .enqueue(scheduled(TrafficClass::Control, 100, sequence))
+                .enqueue(scheduled_on(TrafficClass::Control, 100, 3, sequence))
                 .unwrap();
         }
         assert_eq!(scheduler.dequeue().unwrap().class, TrafficClass::Control);
@@ -257,6 +287,32 @@ mod tests {
             }
         }
         assert!(saw_bulk, "weighted scheduling starved the bulk queue");
+    }
+
+    #[test]
+    fn control_frames_never_overtake_earlier_data_on_the_same_stream() {
+        let mut scheduler = FrameScheduler::new(64 * 1024);
+        scheduler
+            .enqueue(scheduled_on(TrafficClass::Bulk, 4_000, 1, 1))
+            .unwrap();
+        scheduler
+            .enqueue(ScheduledFrame {
+                class: TrafficClass::Control,
+                frame: Frame {
+                    header: Header::new(Command::Close, 1, 2),
+                    payload: Vec::new(),
+                },
+            })
+            .unwrap();
+
+        assert_eq!(
+            scheduler.dequeue().unwrap().frame.header.command,
+            Command::Data
+        );
+        assert_eq!(
+            scheduler.dequeue().unwrap().frame.header.command,
+            Command::Close
+        );
     }
 
     #[test]

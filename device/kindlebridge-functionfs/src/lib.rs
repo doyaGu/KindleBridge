@@ -15,8 +15,8 @@ pub use event::{
 };
 pub use probe::{
     run, run_probe_session, FunctionFsDevice, FunctionFsEndpoints, FunctionFsError,
-    FunctionFsFrameStream, FunctionFsIo, SessionOutcome, MAX_FRAME_COUNT, MAX_FUNCTIONFS_IO,
-    MAX_PAYLOAD,
+    FunctionFsFrameReader, FunctionFsFrameStream, FunctionFsFrameWriter, FunctionFsIo,
+    SessionOutcome, MAX_FRAME_COUNT, MAX_FUNCTIONFS_IO, MAX_PAYLOAD,
 };
 
 #[cfg(test)]

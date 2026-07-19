@@ -2,12 +2,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
 use kindlebridge_schema::device_protocol::{ServiceAccept, ServiceOpen};
 use kindlebridge_wire::{
-    Command, Frame, FrameContext, Header, ProtocolError, SessionState, FLAG_END_STREAM,
+    Command, Frame, FrameContext, Header, ProtocolError, SessionState, StreamPhase, FLAG_END_STREAM,
 };
 use thiserror::Error;
 
@@ -55,12 +56,18 @@ pub enum ConnectionError {
 
 #[derive(Clone, Debug)]
 pub struct Connection {
+    inner: Arc<ConnectionInner>,
+}
+
+#[derive(Debug)]
+struct ConnectionInner {
     commands: SyncSender<ActorCommand>,
+    terminal_error: Mutex<Option<ConnectionError>>,
 }
 
 #[derive(Debug)]
 pub struct IncomingStreams {
-    receiver: Receiver<IncomingStream>,
+    receiver: Receiver<Result<IncomingStream, ConnectionError>>,
 }
 
 #[derive(Clone, Debug)]
@@ -86,8 +93,12 @@ impl Connection {
         let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
         let (incoming_tx, incoming_rx) = mpsc::sync_channel(INCOMING_STREAM_DEPTH);
         let connection = Self {
-            commands: command_tx.clone(),
+            inner: Arc::new(ConnectionInner {
+                commands: command_tx.clone(),
+                terminal_error: Mutex::new(None),
+            }),
         };
+        let actor_connection = Arc::downgrade(&connection.inner);
         thread::Builder::new()
             .name("kbp-reader".to_owned())
             .spawn(move || read_frames(source, inbound_tx))
@@ -95,7 +106,7 @@ impl Connection {
         thread::Builder::new()
             .name("kbp-connection".to_owned())
             .spawn(move || {
-                Actor::new(state, sink, command_tx, incoming_tx).run(command_rx, inbound_rx);
+                Actor::new(state, sink, actor_connection, incoming_tx).run(command_rx, inbound_rx);
             })
             .expect("could not start KBP connection actor");
         (
@@ -125,7 +136,15 @@ impl Connection {
     }
 
     pub fn shutdown(&self) {
-        let _ = self.commands.try_send(ActorCommand::Shutdown);
+        let _ = self.inner.commands.try_send(ActorCommand::Shutdown);
+    }
+
+    #[must_use]
+    pub fn is_online(&self) -> bool {
+        self.inner
+            .terminal_error
+            .lock()
+            .is_ok_and(|error| error.is_none())
     }
 
     fn request<T: Send + 'static>(
@@ -133,12 +152,20 @@ impl Connection {
         build: impl FnOnce(SyncSender<Result<T, ConnectionError>>) -> ActorCommand,
     ) -> Result<T, ConnectionError> {
         let (response_tx, response_rx) = mpsc::sync_channel(1);
-        self.commands
+        self.inner
+            .commands
             .send(build(response_tx))
-            .map_err(|_| ConnectionError::Disconnected)?;
-        response_rx
-            .recv()
-            .map_err(|_| ConnectionError::Disconnected)?
+            .map_err(|_| self.disconnect_error())?;
+        response_rx.recv().map_err(|_| self.disconnect_error())?
+    }
+
+    fn disconnect_error(&self) -> ConnectionError {
+        self.inner
+            .terminal_error
+            .lock()
+            .ok()
+            .and_then(|error| error.clone())
+            .unwrap_or(ConnectionError::Disconnected)
     }
 }
 
@@ -146,7 +173,7 @@ impl IncomingStreams {
     pub fn recv(&self) -> Result<IncomingStream, ConnectionError> {
         self.receiver
             .recv()
-            .map_err(|_| ConnectionError::Disconnected)
+            .map_err(|_| ConnectionError::Disconnected)?
     }
 }
 
@@ -193,7 +220,7 @@ impl Stream {
         })
     }
 
-    pub fn recv(&mut self) -> Result<Frame, ConnectionError> {
+    pub fn recv(&self) -> Result<Frame, ConnectionError> {
         self.connection.request(|response| ActorCommand::Receive {
             stream_id: self.id,
             response,
@@ -213,6 +240,14 @@ impl Stream {
             reason: reason.into(),
             response,
         })
+    }
+
+    pub fn cancel_receive(&self) -> Result<(), ConnectionError> {
+        self.connection
+            .request(|response| ActorCommand::CancelReceive {
+                stream_id: self.id,
+                response,
+            })
     }
 }
 
@@ -259,6 +294,10 @@ enum ActorCommand {
         reason: Vec<u8>,
         response: SyncSender<Result<(), ConnectionError>>,
     },
+    CancelReceive {
+        stream_id: u32,
+        response: SyncSender<Result<(), ConnectionError>>,
+    },
     Shutdown,
 }
 
@@ -295,8 +334,8 @@ impl StreamEntry {
 struct Actor<W> {
     state: SessionState,
     sink: W,
-    own_connection: Connection,
-    incoming: SyncSender<IncomingStream>,
+    own_connection: Weak<ConnectionInner>,
+    incoming: SyncSender<Result<IncomingStream, ConnectionError>>,
     streams: HashMap<u32, StreamEntry>,
     sequences: HashMap<u32, u32>,
     control_sequence: u32,
@@ -307,13 +346,13 @@ impl<W: FrameSink> Actor<W> {
     fn new(
         state: SessionState,
         sink: W,
-        commands: SyncSender<ActorCommand>,
-        incoming: SyncSender<IncomingStream>,
+        commands: Weak<ConnectionInner>,
+        incoming: SyncSender<Result<IncomingStream, ConnectionError>>,
     ) -> Self {
         Self {
             state,
             sink,
-            own_connection: Connection { commands },
+            own_connection: commands,
             incoming,
             streams: HashMap::new(),
             sequences: HashMap::new(),
@@ -488,6 +527,20 @@ impl<W: FrameSink> Actor<W> {
                 let _ = response.send(result.clone());
                 result
             }
+            ActorCommand::CancelReceive {
+                stream_id,
+                response,
+            } => {
+                let entry = self
+                    .streams
+                    .get_mut(&stream_id)
+                    .ok_or(ConnectionError::UnknownStream(stream_id))?;
+                if let Some(receiver) = entry.receiver.take() {
+                    let _ = receiver.send(Err(ConnectionError::Disconnected));
+                }
+                let _ = response.send(Ok(()));
+                Ok(())
+            }
             ActorCommand::Shutdown => Ok(()),
         }
     }
@@ -502,7 +555,12 @@ impl<W: FrameSink> Actor<W> {
         };
         self.state
             .process_inbound(&frame.header, context)
-            .map_err(protocol_error)?;
+            .map_err(|error| {
+                ConnectionError::Protocol(format!(
+                    "inbound {:?} on stream {}: {error}",
+                    frame.header.command, frame.header.stream_id
+                ))
+            })?;
 
         match frame.header.command {
             Command::Open => self.accept_incoming_open(frame),
@@ -533,14 +591,19 @@ impl<W: FrameSink> Actor<W> {
         let stream_id = frame.header.stream_id;
         self.streams
             .insert(stream_id, StreamEntry::new(TrafficClass::Bulk, 0));
+        let connection = self
+            .own_connection
+            .upgrade()
+            .map(|inner| Connection { inner })
+            .ok_or(ConnectionError::Disconnected)?;
         self.incoming
-            .send(IncomingStream {
+            .send(Ok(IncomingStream {
                 service: service.service,
                 stream: Stream {
                     id: stream_id,
-                    connection: self.own_connection.clone(),
+                    connection,
                 },
-            })
+            }))
             .map_err(|_| ConnectionError::Disconnected)
     }
 
@@ -714,7 +777,18 @@ impl<W: FrameSink> Actor<W> {
         if frame.header.command != Command::Data || frame.header.payload_length == 0 {
             return Ok(());
         }
-        self.queue_credit(frame.header.stream_id, frame.header.payload_length)?;
+        // Once END_STREAM has been observed, stream-level credit is no longer
+        // useful and may race the peer's CLOSE.  Connection credit remains
+        // necessary so bytes consumed by a completed stream can be reused by
+        // other streams on the same transport.
+        if frame.header.flags & FLAG_END_STREAM == 0
+            && self
+                .state
+                .stream(frame.header.stream_id)
+                .is_some_and(|stream| stream.phase == StreamPhase::Accepted)
+        {
+            self.queue_credit(frame.header.stream_id, frame.header.payload_length)?;
+        }
         self.queue_credit(0, frame.header.payload_length)
     }
 
@@ -725,7 +799,12 @@ impl<W: FrameSink> Actor<W> {
         let frame = Frame::new(header, Vec::new()).map_err(wire_error)?;
         self.state
             .process_outbound(&frame.header, FrameContext::default())
-            .map_err(protocol_error)?;
+            .map_err(|error| {
+                ConnectionError::Protocol(format!(
+                    "outbound CREDIT on stream {}: {error}",
+                    frame.header.stream_id
+                ))
+            })?;
         self.scheduler
             .enqueue(ScheduledFrame {
                 class: TrafficClass::Control,
@@ -751,7 +830,12 @@ impl<W: FrameSink> Actor<W> {
         let frame = Frame::new(header, payload).map_err(wire_error)?;
         self.state
             .process_outbound(&frame.header, context)
-            .map_err(protocol_error)?;
+            .map_err(|error| {
+                ConnectionError::Protocol(format!(
+                    "outbound {:?} on stream {}: {error}",
+                    frame.header.command, frame.header.stream_id
+                ))
+            })?;
         let class = if TrafficClass::for_command(command) == TrafficClass::Control {
             TrafficClass::Control
         } else {
@@ -776,6 +860,13 @@ impl<W: FrameSink> Actor<W> {
     }
 
     fn fail_all(&mut self, error: ConnectionError) {
+        if let Some(connection) = self.own_connection.upgrade() {
+            if let Ok(mut terminal_error) = connection.terminal_error.lock() {
+                if terminal_error.is_none() {
+                    *terminal_error = Some(error.clone());
+                }
+            }
+        }
         for entry in self.streams.values_mut() {
             if let Some(opener) = entry.opener.take() {
                 let _ = opener.send(Err(error.clone()));
@@ -787,6 +878,7 @@ impl<W: FrameSink> Actor<W> {
                 let _ = pending.response.send(Err(error.clone()));
             }
         }
+        let _ = self.incoming.try_send(Err(error));
     }
 }
 

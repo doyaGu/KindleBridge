@@ -207,6 +207,14 @@ pub struct FunctionFsFrameStream {
     writer: FrameWriter<FunctionFsIo<FunctionFsWriteEndpoint>>,
 }
 
+pub struct FunctionFsFrameReader {
+    reader: FrameReader<ResynchronizingReader<FunctionFsIo<BufReader<FunctionFsReadEndpoint>>>>,
+}
+
+pub struct FunctionFsFrameWriter {
+    writer: FrameWriter<FunctionFsIo<FunctionFsWriteEndpoint>>,
+}
+
 impl FunctionFsFrameStream {
     pub fn new(
         endpoints: FunctionFsEndpoints,
@@ -217,6 +225,44 @@ impl FunctionFsFrameStream {
             reader: FrameReader::new(ResynchronizingReader::new(bulk_out), config)?,
             writer: FrameWriter::new(bulk_in, config)?,
         })
+    }
+
+    #[must_use]
+    pub fn into_split(self) -> (FunctionFsFrameReader, FunctionFsFrameWriter) {
+        (
+            FunctionFsFrameReader {
+                reader: self.reader,
+            },
+            FunctionFsFrameWriter {
+                writer: self.writer,
+            },
+        )
+    }
+}
+
+impl FunctionFsFrameReader {
+    pub fn read_frame(&mut self) -> Result<Frame, TransportError> {
+        self.reader.read_frame()
+    }
+
+    pub fn resynchronize(&mut self) -> Result<(), TransportError> {
+        self.reader
+            .get_mut()
+            .resynchronize()
+            .map_err(|source| TransportError::Io {
+                operation: IoOperation::ReadHeader,
+                source,
+            })
+    }
+}
+
+impl FunctionFsFrameWriter {
+    pub fn write_frame(&mut self, frame: &Frame) -> Result<(), TransportError> {
+        self.writer.write_frame_contiguous(frame)
+    }
+
+    pub fn flush(&mut self) -> Result<(), TransportError> {
+        self.writer.flush()
     }
 }
 

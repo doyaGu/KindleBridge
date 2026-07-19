@@ -429,6 +429,31 @@ fn only_responder_closes_and_stream_ids_are_never_reused() {
 }
 
 #[test]
+fn in_flight_credit_after_stream_close_is_ignored() {
+    let mut device = SessionState::new(SessionConfig::new(EndpointRole::Device, LIMITS));
+    device
+        .process_outbound(&header(Command::Hello, 0, 0), FrameContext::hello(80))
+        .unwrap();
+    device
+        .process_inbound(&header(Command::Hello, 0, 0), FrameContext::hello(100))
+        .unwrap();
+    device
+        .process_inbound(&header(Command::Open, 1, 0), FrameContext::default())
+        .unwrap();
+    device
+        .process_outbound(&header(Command::Accept, 1, 0), FrameContext::accept(50))
+        .unwrap();
+    device
+        .process_outbound(&header(Command::Close, 1, 1), FrameContext::default())
+        .unwrap();
+
+    device
+        .process_inbound(&credit(1, 1, 10), FrameContext::default())
+        .unwrap();
+    assert_eq!(device.stream(1).unwrap().phase, StreamPhase::Closed);
+}
+
+#[test]
 fn reject_is_terminal_and_goaway_blocks_new_streams() {
     let mut session = online_host();
     session
