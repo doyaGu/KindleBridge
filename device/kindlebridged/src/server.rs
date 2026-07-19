@@ -2,26 +2,43 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(test)]
 use std::sync::mpsc::{self, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use kindlebridge_functionfs::{FunctionFsDevice, FunctionFsError, FunctionFsFrameStream};
-use kindlebridge_schema::device_protocol::{
-    is_valid_session_id, DeviceCall, DeviceHello, DeviceReply, HostHello, ServiceAccept,
-    ServiceOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE,
-    APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE, APP_START_FEATURE, APP_STOP_FEATURE,
-    APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, EXEC_FEATURE,
-    LEGACY_RPC_SERVICE, LOG_TAIL_FEATURE, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE,
-    PROTOCOL_VERSION, SYNC_CREDIT_BATCH_SIZE, SYNC_FEATURE, SYNC_SERVICE,
+use kindlebridge_functionfs::{
+    FunctionFsDevice, FunctionFsError, FunctionFsFrameReader, FunctionFsFrameStream,
+    FunctionFsFrameWriter,
 };
+use kindlebridge_schema::device_protocol::{
+    is_valid_session_id, DeviceCall, DeviceHello, DeviceReply, HostHello, ShellOpen, SyncReply,
+    SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE, APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE,
+    APP_START_FEATURE, APP_STOP_FEATURE, APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW,
+    DEFAULT_STREAM_WINDOW, EXEC_FEATURE, LEGACY_RPC_SERVICE, LOG_TAIL_FEATURE,
+    PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION, SHELL_STREAM_WINDOW,
+    SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE, SYNC_SERVICE,
+};
+#[cfg(test)]
+use kindlebridge_schema::device_protocol::{ServiceAccept, ServiceOpen, SYNC_CREDIT_BATCH_SIZE};
+use kindlebridge_schema::shell_protocol::{PacketSource, ShellPacket, ShellStreamState};
 use kindlebridge_schema::{
     error_codes, methods, AppInstallParams, AppTargetParams, ExecParams, LogTailParams,
     ProcessSignalParams, RpcError, SerialParams, SyncStatusParams, MAX_SYNC_BLOCK_SIZE,
 };
+use kindlebridge_transport::{
+    actor::{
+        Connection, ConnectionError, FrameSink as ActorFrameSink, FrameSource as ActorFrameSource,
+        IncomingStream as ActorIncomingStream, Stream as ActorStream,
+    },
+    TrafficClass,
+};
+#[cfg(test)]
+use kindlebridge_transport_tcp::ErrorClass;
 use kindlebridge_transport_tcp::{
-    ErrorClass, FrameIo, TcpFrameListener, TransportConfig, TransportError,
+    FrameIo, ShutdownMode, TcpFrameListener, TransportConfig, TransportError,
 };
 use kindlebridge_wire::{
     Command, DecodeLimits, EndpointRole, Frame, FrameContext, Header, ProtocolError, SessionConfig,
@@ -32,6 +49,7 @@ use thiserror::Error;
 
 use crate::exec::{self, ExecError};
 use crate::services;
+use crate::shell::{ShellEvent, ShellWorker, ShellWorkerError};
 use crate::sync::{PullTransfer, PushTransfer, StoreError, SyncStore};
 use crate::DeviceInfo;
 
@@ -40,8 +58,11 @@ const DEFAULT_SYNC_ROOT: &str = "/mnt/us/kindlebridge-data";
 const DEFAULT_ACTIVATION_ROOT: &str = "/var/local/kindlebridge/activations";
 const DEFAULT_PROC_ROOT: &str = "/proc";
 const DEFAULT_LOG_PATH: &str = "/var/local/kindlebridge/usb.log";
+#[cfg(test)]
 const SYNC_PUSH_QUEUE_DEPTH: usize = 3;
+const MAX_CONCURRENT_SHELLS: usize = 4;
 
+#[cfg(test)]
 #[derive(Debug)]
 enum PipelineFailure<E> {
     Stage(E),
@@ -49,11 +70,13 @@ enum PipelineFailure<E> {
     WorkerPanicked,
 }
 
+#[cfg(test)]
 struct PipelineOutcome<A, E> {
     result: Result<(), PipelineFailure<E>>,
     last_written: Option<A>,
 }
 
+#[cfg(test)]
 fn run_bounded_pipeline<C, T, A, E, Read, Write, Stored, MustDrain>(
     context: &mut C,
     mut read: Read,
@@ -280,7 +303,15 @@ impl TcpServer {
     pub fn serve_once(&self) -> Result<(), ServerError> {
         let (mut stream, peer) = self.listener.accept()?;
         self.validate_peer(peer.ip())?;
-        serve_session(&mut stream, &self.config, &self.sync_store, false)
+        let reader = stream.try_clone()?;
+        let state = negotiate_actor_session(&mut stream, &self.config)?;
+        serve_actor_connection(
+            state,
+            TcpActorSource(reader),
+            TcpActorSink(stream),
+            &self.config,
+            &self.sync_store,
+        )
     }
 
     pub fn serve_forever(&self) -> Result<(), ServerError> {
@@ -289,9 +320,22 @@ impl TcpServer {
             if self.validate_peer(peer.ip()).is_err() {
                 continue;
             }
-            // One host owns the development link. A disconnect returns to
-            // accept without terminating the daemon.
-            let _ = serve_session(&mut stream, &self.config, &self.sync_store, false);
+            let result = stream
+                .try_clone()
+                .map_err(ServerError::from)
+                .and_then(|reader| {
+                    let state = negotiate_actor_session(&mut stream, &self.config)?;
+                    serve_actor_connection(
+                        state,
+                        TcpActorSource(reader),
+                        TcpActorSink(stream),
+                        &self.config,
+                        &self.sync_store,
+                    )
+                });
+            if let Err(error) = result {
+                eprintln!("KindleBridge TCP session ended: {error}");
+            }
         }
     }
 
@@ -339,7 +383,15 @@ impl UsbServer {
             return Ok(false);
         };
         let mut stream = FunctionFsFrameStream::new(endpoints, transport_config(&self.config))?;
-        serve_session(&mut stream, &self.config, &self.sync_store, false)?;
+        let state = negotiate_actor_session(&mut stream, &self.config)?;
+        let (reader, writer) = stream.into_split();
+        serve_actor_connection(
+            state,
+            FunctionFsActorSource(reader),
+            FunctionFsActorSink(writer),
+            &self.config,
+            &self.sync_store,
+        )?;
         Ok(true)
     }
 
@@ -350,17 +402,480 @@ impl UsbServer {
                 return Ok(());
             };
             let mut stream = FunctionFsFrameStream::new(endpoints, transport_config(&self.config))?;
-            // A host CLI process may release and reclaim WinUSB without
-            // disabling the USB configuration. Keep the endpoint pair open
-            // and admit a fresh KBP HELLO in place; physical disconnects still
-            // return here so FunctionFS can wait for its next ENABLE event.
-            if let Err(error) = serve_session(&mut stream, &self.config, &self.sync_store, true) {
+            let result = negotiate_actor_session(&mut stream, &self.config).and_then(|state| {
+                let (reader, writer) = stream.into_split();
+                serve_actor_connection(
+                    state,
+                    FunctionFsActorSource(reader),
+                    FunctionFsActorSink(writer),
+                    &self.config,
+                    &self.sync_store,
+                )
+            });
+            if let Err(error) = result {
                 eprintln!("KindleBridge USB session ended: {error}");
             }
         }
     }
 }
 
+struct TcpActorSource(kindlebridge_transport_tcp::TcpFrameStream);
+
+impl ActorFrameSource for TcpActorSource {
+    fn read_frame(&mut self) -> Result<Frame, String> {
+        self.0.read_frame().map_err(|error| error.to_string())
+    }
+}
+
+struct TcpActorSink(kindlebridge_transport_tcp::TcpFrameStream);
+
+impl Drop for TcpActorSink {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(ShutdownMode::Both);
+    }
+}
+
+impl ActorFrameSink for TcpActorSink {
+    fn write_frame(&mut self, frame: &Frame) -> Result<(), String> {
+        self.0.write_frame(frame).map_err(|error| error.to_string())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        self.0.flush().map_err(|error| error.to_string())
+    }
+}
+
+struct FunctionFsActorSource(FunctionFsFrameReader);
+
+impl ActorFrameSource for FunctionFsActorSource {
+    fn read_frame(&mut self) -> Result<Frame, String> {
+        self.0.read_frame().map_err(|error| error.to_string())
+    }
+}
+
+struct FunctionFsActorSink(FunctionFsFrameWriter);
+
+impl ActorFrameSink for FunctionFsActorSink {
+    fn write_frame(&mut self, frame: &Frame) -> Result<(), String> {
+        self.0.write_frame(frame).map_err(|error| error.to_string())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        self.0.flush().map_err(|error| error.to_string())
+    }
+}
+
+fn negotiate_actor_session(
+    stream: &mut dyn FrameIo,
+    config: &ServerConfig,
+) -> Result<SessionState, ServerError> {
+    let hello_frame = stream.read_frame()?;
+    expect(&hello_frame, Command::Hello, 0)?;
+    let host_hello: HostHello = decode(&hello_frame.payload, "host HELLO")?;
+    validate_hello(&host_hello, config)?;
+    let mut state = SessionState::new(SessionConfig::new(EndpointRole::Device, config.limits()));
+    state.process_inbound(
+        &hello_frame.header,
+        FrameContext::hello(host_hello.initial_connection_window),
+    )?;
+    let hello = DeviceHello {
+        protocol_version: PROTOCOL_VERSION,
+        session_id: host_hello.session_id,
+        serial: config.device.serial.clone(),
+        model: config.device.model.clone(),
+        firmware: config.device.firmware.clone(),
+        target: config.device.target.clone(),
+        features: vec![
+            APP_LIST_FEATURE.to_owned(),
+            EXEC_FEATURE.to_owned(),
+            LOG_TAIL_FEATURE.to_owned(),
+            PROCESS_LIST_FEATURE.to_owned(),
+            SHELL_V2_FEATURE.to_owned(),
+            SYNC_FEATURE.to_owned(),
+        ],
+        initial_connection_window: config.connection_window,
+    };
+    send(
+        stream,
+        &mut state,
+        frame(Command::Hello, 0, 0, encode(&hello)?)?,
+        FrameContext::hello(config.connection_window),
+    )?;
+    Ok(state)
+}
+
+fn serve_actor_connection<R, W>(
+    state: SessionState,
+    source: R,
+    sink: W,
+    config: &ServerConfig,
+    sync_store: &SyncStore,
+) -> Result<(), ServerError>
+where
+    R: ActorFrameSource,
+    W: ActorFrameSink,
+{
+    let (_connection, incoming) = Connection::start(state, source, sink);
+    let shells = Arc::new(AtomicUsize::new(0));
+    loop {
+        let incoming = match incoming.recv() {
+            Ok(incoming) => incoming,
+            Err(ConnectionError::Disconnected | ConnectionError::Transport(_)) => return Ok(()),
+            Err(error) => return Err(ServerError::Connection(error)),
+        };
+        let config = config.clone();
+        let sync_store = sync_store.clone();
+        let shells = Arc::clone(&shells);
+        thread::spawn(move || {
+            let service = incoming.service.clone();
+            let result = match service.as_str() {
+                LEGACY_RPC_SERVICE => serve_actor_rpc(incoming, &config, &sync_store),
+                SYNC_SERVICE => serve_actor_sync(incoming, &config, &sync_store),
+                SHELL_V2_SERVICE => match ShellSlot::reserve(shells) {
+                    Some(slot) => serve_actor_shell(incoming, slot),
+                    None => incoming
+                        .reject("at most four shell sessions may be active")
+                        .map_err(ServerError::Connection),
+                },
+                _ => incoming
+                    .reject(format!("unsupported service {service}"))
+                    .map_err(ServerError::Connection),
+            };
+            if let Err(error) = result {
+                eprintln!("KindleBridge {service} stream ended: {error}");
+            }
+        });
+    }
+}
+
+struct ShellSlot(Arc<AtomicUsize>);
+
+impl ShellSlot {
+    fn reserve(active: Arc<AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                (value < MAX_CONCURRENT_SHELLS).then_some(value + 1)
+            })
+            .ok()
+            .map(|_| Self(active))
+    }
+}
+
+impl Drop for ShellSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn serve_actor_rpc(
+    incoming: ActorIncomingStream,
+    config: &ServerConfig,
+    sync_store: &SyncStore,
+) -> Result<(), ServerError> {
+    let mut stream = incoming.accept(config.stream_window, TrafficClass::Bulk)?;
+    let request = actor_data(&mut stream)?;
+    if request.header.flags & FLAG_END_STREAM == 0 {
+        stream.reset("device calls must end their request")?;
+        return Ok(());
+    }
+    let call: DeviceCall = decode(&request.payload, "device call")?;
+    let mut reply = dispatch(call, config, sync_store);
+    let mut response = encode(&reply)?;
+    if response.len() > config.stream_window as usize {
+        reply = DeviceReply::failure(RpcError::new(
+            error_codes::EXEC_OUTPUT_LIMIT,
+            "Command output exceeds the device link limit",
+        ));
+        response = encode(&reply)?;
+    }
+    stream.send_data(response, true)?;
+    stream.close()?;
+    Ok(())
+}
+
+fn serve_actor_shell(incoming: ActorIncomingStream, _slot: ShellSlot) -> Result<(), ServerError> {
+    let mut stream = incoming.accept(SHELL_STREAM_WINDOW, TrafficClass::Interactive)?;
+    let open_frame = actor_data(&mut stream)?;
+    if open_frame.header.flags & FLAG_END_STREAM != 0 {
+        stream.reset("shell open metadata must not end the stream")?;
+        return Ok(());
+    }
+    let open: ShellOpen = match decode(&open_frame.payload, "shell open") {
+        Ok(open) => open,
+        Err(error) => {
+            stream.reset(error.to_string())?;
+            return Ok(());
+        }
+    };
+    let mut worker = match ShellWorker::spawn(open.clone()) {
+        Ok(worker) => worker,
+        Err(error) => {
+            stream.reset(error.to_string())?;
+            return Ok(());
+        }
+    };
+    let input = worker.input();
+    let input_stream = stream.clone();
+    let stream_stopped = Arc::new(AtomicBool::new(false));
+    let input_stopped = Arc::clone(&stream_stopped);
+    let input_thread = thread::spawn(move || {
+        let mut protocol = ShellStreamState::new(open.mode);
+        loop {
+            let frame = match input_stream.recv() {
+                Ok(frame) => frame,
+                Err(_) => {
+                    input_stopped.store(true, Ordering::Release);
+                    let _ = input.hangup();
+                    break;
+                }
+            };
+            match frame.header.command {
+                Command::Data => {
+                    let packet = match ShellPacket::decode(&frame.payload, PacketSource::Host) {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            input_stopped.store(true, Ordering::Release);
+                            let _ = input_stream.reset(error.to_string());
+                            let _ = input.hangup();
+                            break;
+                        }
+                    };
+                    if let Err(error) = protocol.accept(&packet) {
+                        input_stopped.store(true, Ordering::Release);
+                        let _ = input_stream.reset(error.to_string());
+                        let _ = input.hangup();
+                        break;
+                    }
+                    let result = match packet {
+                        ShellPacket::Stdin(bytes) => input.write_stdin(bytes),
+                        ShellPacket::CloseStdin => input.close_input(),
+                        ShellPacket::Resize(size) => input.resize(size),
+                        _ => unreachable!("host packet direction was validated"),
+                    };
+                    if result.is_err() {
+                        input_stopped.store(true, Ordering::Release);
+                        let _ = input_stream.reset("shell process input stopped");
+                        break;
+                    }
+                }
+                Command::Reset | Command::Close => {
+                    input_stopped.store(true, Ordering::Release);
+                    let _ = input.hangup();
+                    break;
+                }
+                _ => {
+                    input_stopped.store(true, Ordering::Release);
+                    let _ = input_stream.reset("unexpected shell stream frame");
+                    let _ = input.hangup();
+                    break;
+                }
+            }
+        }
+    });
+
+    loop {
+        match worker.recv_timeout(Duration::from_secs(1)) {
+            Ok(ShellEvent::Stdout(bytes)) => {
+                if stream_stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                stream.send_data(ShellPacket::Stdout(bytes).encode()?, false)?;
+            }
+            Ok(ShellEvent::Stderr(bytes)) => {
+                if stream_stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                stream.send_data(ShellPacket::Stderr(bytes).encode()?, false)?;
+            }
+            Ok(ShellEvent::Exit(status)) => {
+                if stream_stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                let result = stream.send_data(ShellPacket::Exit(status).encode()?, true);
+                let _ = stream.cancel_receive();
+                result?;
+                stream.close()?;
+                break;
+            }
+            Err(ShellWorkerError::ReceiveTimeout) => {}
+            Err(error) => {
+                if stream_stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                let _ = stream.cancel_receive();
+                stream.reset(error.to_string())?;
+                break;
+            }
+        }
+    }
+    let _ = input_thread.join();
+    Ok(())
+}
+
+fn serve_actor_sync(
+    incoming: ActorIncomingStream,
+    _config: &ServerConfig,
+    sync_store: &SyncStore,
+) -> Result<(), ServerError> {
+    let mut stream = incoming.accept(DEFAULT_STREAM_WINDOW, TrafficClass::Bulk)?;
+    let request_frame = actor_data(&mut stream)?;
+    let request: SyncRequest = decode(&request_frame.payload, "sync request")?;
+    let block_size = match &request {
+        SyncRequest::Push { block_size, .. } | SyncRequest::Pull { block_size, .. } => *block_size,
+    };
+    if block_size == 0 || block_size > MAX_SYNC_BLOCK_SIZE {
+        return actor_sync_failure(
+            &stream,
+            RpcError::invalid_params("block_size must be between 1 and 1048576"),
+        );
+    }
+    match request {
+        SyncRequest::Push {
+            transfer_id,
+            remote_path,
+            total_size,
+            file_hash,
+            block_size,
+        } => {
+            if request_frame.header.flags & FLAG_END_STREAM != 0 {
+                return actor_sync_failure(
+                    &stream,
+                    RpcError::invalid_params("push metadata must not end the stream"),
+                );
+            }
+            let transfer = sync_store
+                .begin_push(transfer_id.as_deref(), &remote_path, total_size, &file_hash)
+                .map_err(StoreError::into_rpc);
+            match transfer {
+                Ok(transfer) => actor_sync_push(stream, block_size, transfer),
+                Err(error) => actor_sync_failure(&stream, error),
+            }
+        }
+        SyncRequest::Pull {
+            transfer_id,
+            remote_path,
+            offset,
+            block_size,
+        } => {
+            if request_frame.header.flags & FLAG_END_STREAM == 0 {
+                return actor_sync_failure(
+                    &stream,
+                    RpcError::invalid_params("pull metadata must end the stream"),
+                );
+            }
+            let transfer = sync_store
+                .begin_pull(transfer_id.as_deref(), &remote_path, offset)
+                .map_err(StoreError::into_rpc);
+            match transfer {
+                Ok(transfer) => actor_sync_pull(stream, block_size, transfer),
+                Err(error) => actor_sync_failure(&stream, error),
+            }
+        }
+    }
+}
+
+fn actor_sync_push(
+    mut stream: ActorStream,
+    block_size: u32,
+    mut transfer: PushTransfer,
+) -> Result<(), ServerError> {
+    let ready = SyncReply::Ready {
+        transfer_id: transfer.transfer_id().to_owned(),
+        offset: transfer.offset(),
+        total_size: transfer.total_size(),
+        file_hash: transfer.file_hash().to_owned(),
+    };
+    stream.send_data(encode(&ready)?, false)?;
+    let block_size = block_size as usize;
+    loop {
+        let data = actor_data(&mut stream)?;
+        if data.payload.len() > block_size {
+            stream.reset("sync DATA exceeds negotiated block size")?;
+            return Ok(());
+        }
+        let is_last = data.header.flags & FLAG_END_STREAM != 0;
+        if transfer.is_complete() {
+            if !data.payload.is_empty() {
+                stream.reset("completed sync push accepts only an empty final DATA")?;
+                return Ok(());
+            }
+        } else {
+            transfer.write_chunk(&data.payload)?;
+        }
+        if is_last {
+            break;
+        }
+    }
+    let status = match transfer.finish() {
+        Ok(status) => status,
+        Err(error) => return actor_sync_failure(&stream, error.into_rpc()),
+    };
+    let complete = SyncReply::Complete {
+        transfer_id: status.transfer_id,
+        next_offset: status.next_offset,
+        total_size: status.total_size,
+    };
+    stream.send_data(encode(&complete)?, true)?;
+    stream.close()?;
+    Ok(())
+}
+
+fn actor_sync_pull(
+    stream: ActorStream,
+    block_size: u32,
+    mut transfer: PullTransfer,
+) -> Result<(), ServerError> {
+    let ready = SyncReply::Ready {
+        transfer_id: transfer.transfer_id().to_owned(),
+        offset: transfer.offset(),
+        total_size: transfer.total_size(),
+        file_hash: transfer.file_hash().to_owned(),
+    };
+    stream.send_data(encode(&ready)?, false)?;
+    let mut buffer = vec![0_u8; block_size as usize];
+    if transfer.offset() == transfer.total_size() {
+        transfer.finish()?;
+        stream.send_data(Vec::new(), true)?;
+    } else {
+        loop {
+            let count = transfer.read_chunk(&mut buffer)?;
+            if count == 0 {
+                stream.reset("sync source ended before declared size")?;
+                return Ok(());
+            }
+            let is_last = transfer.offset() == transfer.total_size();
+            if is_last {
+                transfer.finish()?;
+            } else {
+                transfer.checkpoint_if_due()?;
+            }
+            stream.send_data(buffer[..count].to_vec(), is_last)?;
+            if is_last {
+                break;
+            }
+        }
+    }
+    stream.close()?;
+    Ok(())
+}
+
+fn actor_sync_failure(stream: &ActorStream, error: RpcError) -> Result<(), ServerError> {
+    stream.send_data(encode(&SyncReply::Failure { error })?, true)?;
+    stream.close()?;
+    Ok(())
+}
+
+fn actor_data(stream: &mut ActorStream) -> Result<Frame, ServerError> {
+    let frame = stream.recv()?;
+    if frame.header.command != Command::Data {
+        return Err(ServerError::UnexpectedFrame(
+            "expected DATA on actor service stream",
+        ));
+    }
+    Ok(frame)
+}
+
+#[cfg(test)]
 fn serve_session(
     stream: &mut dyn FrameIo,
     config: &ServerConfig,
@@ -546,6 +1061,7 @@ fn serve_session(
     }
 }
 
+#[cfg(test)]
 fn server_error_allows_in_place_restart(error: &ServerError) -> bool {
     matches!(
         error,
@@ -563,6 +1079,7 @@ fn is_fresh_hello(frame: &Frame) -> bool {
     frame.header.command == Command::Hello && frame.header.stream_id == 0
 }
 
+#[cfg(test)]
 fn transport_error_allows_in_place_restart(error: &TransportError) -> bool {
     if matches!(
         error,
@@ -577,10 +1094,12 @@ fn transport_error_allows_in_place_restart(error: &TransportError) -> bool {
     )
 }
 
+#[cfg(test)]
 fn pause_before_in_place_restart() {
     thread::sleep(Duration::from_millis(50));
 }
 
+#[cfg(test)]
 fn recover_frame_boundary(stream: &mut dyn FrameIo) -> Result<(), ServerError> {
     loop {
         match stream.resynchronize() {
@@ -593,6 +1112,7 @@ fn recover_frame_boundary(stream: &mut dyn FrameIo) -> Result<(), ServerError> {
     }
 }
 
+#[cfg(test)]
 fn serve_shell_stream(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -640,6 +1160,7 @@ fn serve_shell_stream(
     )
 }
 
+#[cfg(test)]
 fn serve_sync_stream(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -744,6 +1265,7 @@ fn serve_sync_stream(
     }
 }
 
+#[cfg(test)]
 struct PushChunk {
     payload: Arc<[u8]>,
     payload_length: u32,
@@ -751,12 +1273,14 @@ struct PushChunk {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 struct StoredPushChunk {
     frame_start: u64,
     payload_length: u32,
     is_last: bool,
 }
 
+#[cfg(test)]
 struct PushReceiveContext<'a> {
     stream: &'a mut dyn FrameIo,
     state: &'a mut SessionState,
@@ -770,6 +1294,7 @@ struct PushReceiveContext<'a> {
     end_stream_received: bool,
 }
 
+#[cfg(test)]
 fn serve_sync_push(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -986,6 +1511,7 @@ fn serve_sync_push(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn serve_sync_pull(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -1240,6 +1766,7 @@ fn require_serial(serial: &str, config: &ServerConfig) -> Result<(), RpcError> {
     }
 }
 
+#[cfg(test)]
 fn read_stream_data(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -1259,6 +1786,7 @@ fn read_stream_data(
     }
 }
 
+#[cfg(test)]
 fn restore_received_credit(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -1275,6 +1803,7 @@ fn restore_received_credit(
     restore_connection_credit(stream, state, control_sequence, delta)
 }
 
+#[cfg(test)]
 fn restore_connection_credit(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -1289,6 +1818,7 @@ fn restore_connection_credit(
     Ok(())
 }
 
+#[cfg(test)]
 fn wait_for_send_capacity(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -1308,6 +1838,7 @@ fn wait_for_send_capacity(
     }
 }
 
+#[cfg(test)]
 fn wait_for_full_send_credit(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -1327,6 +1858,7 @@ fn wait_for_full_send_credit(
     }
 }
 
+#[cfg(test)]
 fn read_credit(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -1351,6 +1883,7 @@ fn read_credit(
     Ok(())
 }
 
+#[cfg(test)]
 fn send_sync_failure(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -1379,6 +1912,7 @@ fn send_sync_failure(
     )
 }
 
+#[cfg(test)]
 fn send_data(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -1394,6 +1928,7 @@ fn send_data(
     send(stream, state, data, FrameContext::default())
 }
 
+#[cfg(test)]
 fn send_data_buffered(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -1409,12 +1944,14 @@ fn send_data_buffered(
     send_buffered(stream, state, data, FrameContext::default())
 }
 
+#[cfg(test)]
 fn next_sequence(sequence: u32) -> Result<u32, ServerError> {
     sequence
         .checked_add(1)
         .ok_or(ServerError::SequenceExhausted)
 }
 
+#[cfg(test)]
 fn read_application_frame(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -1433,6 +1970,7 @@ fn read_application_frame(
     }
 }
 
+#[cfg(test)]
 fn send_credit(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -1552,6 +2090,12 @@ pub enum ServerError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Sync(#[from] StoreError),
+    #[error(transparent)]
+    Connection(#[from] ConnectionError),
+    #[error(transparent)]
+    Shell(#[from] ShellWorkerError),
+    #[error(transparent)]
+    ShellPacket(#[from] kindlebridge_schema::shell_protocol::ShellPacketError),
     #[error("invalid {label} payload: {source}")]
     InvalidPayload {
         label: &'static str,
@@ -1587,6 +2131,18 @@ mod tests {
     use super::*;
 
     const TEST_SESSION_ID: &str = "000102030405060708090a0b0c0d0e0f";
+
+    #[test]
+    fn shell_registry_allows_four_sessions_and_releases_slots() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut slots = Vec::new();
+        for _ in 0..MAX_CONCURRENT_SHELLS {
+            slots.push(ShellSlot::reserve(Arc::clone(&active)).unwrap());
+        }
+        assert!(ShellSlot::reserve(Arc::clone(&active)).is_none());
+        slots.pop();
+        assert!(ShellSlot::reserve(active).is_some());
+    }
 
     struct ScriptedFrameIo {
         reads: VecDeque<Result<Frame, TransportError>>,

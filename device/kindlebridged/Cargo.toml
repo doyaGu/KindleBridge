@@ -9,6 +9,7 @@ license.workspace = true
 blake3 = { version = "1.8", features = ["neon"] }
 clap = { version = "4.5", features = ["derive"] }
 kindlebridge-schema = { path = "../../crates/kindlebridge-schema" }
+kindlebridge-transport = { path = "../../crates/kindlebridge-transport" }
 kindlebridge-transport-tcp = { path = "../../crates/kindlebridge-transport-tcp" }
 kindlebridge-wire = { path = "../../crates/kindlebridge-wire" }
 kindlebridge-broker = { path = "../kindlebridge-broker" }

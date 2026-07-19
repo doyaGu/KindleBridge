@@ -1,5 +1,6 @@
 //! Persistent PTY and raw-process workers for `shell.v2`.
 
+use std::fs;
 use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
@@ -23,6 +24,8 @@ pub enum ShellWorkerError {
     MissingTerminalSize,
     #[error("a raw shell must not include a terminal size")]
     TerminalSizeForRaw,
+    #[error("terminal rows and columns must both be non-zero")]
+    InvalidTerminalSize,
     #[error("terminal resize is only valid for a PTY shell")]
     ResizeForRaw,
     #[error("could not start shell process: {0}")]
@@ -56,20 +59,60 @@ enum ShellCommand {
 
 #[derive(Debug)]
 pub struct ShellWorker {
+    input: ShellInput,
+    events: Receiver<ShellEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShellInput {
     mode: ShellMode,
     commands: SyncSender<ShellCommand>,
-    events: Receiver<ShellEvent>,
 }
 
 impl ShellWorker {
     pub fn spawn(open: ShellOpen) -> Result<Self, ShellWorkerError> {
         validate_open(&open)?;
+        if open.cwd == "/tmp/root" {
+            fs::create_dir_all(&open.cwd).map_err(ShellWorkerError::Spawn)?;
+        }
         match open.mode {
             ShellMode::Raw => spawn_raw(open),
             ShellMode::Pty => spawn_pty(open),
         }
     }
 
+    pub fn write_stdin(&self, bytes: Vec<u8>) -> Result<(), ShellWorkerError> {
+        self.input.write_stdin(bytes)
+    }
+
+    pub fn close_input(&self) -> Result<(), ShellWorkerError> {
+        self.input.close_input()
+    }
+
+    pub fn resize(&self, size: TerminalSize) -> Result<(), ShellWorkerError> {
+        self.input.resize(size)
+    }
+
+    #[must_use]
+    pub fn input(&self) -> ShellInput {
+        self.input.clone()
+    }
+
+    pub fn hangup(&self) -> Result<(), ShellWorkerError> {
+        self.input.hangup()
+    }
+
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<ShellEvent, ShellWorkerError> {
+        self.events
+            .recv_timeout(timeout)
+            .map_err(|error| match error {
+                RecvTimeoutError::Timeout => ShellWorkerError::ReceiveTimeout,
+                RecvTimeoutError::Disconnected => ShellWorkerError::WorkerStopped,
+            })
+    }
+}
+
+impl ShellInput {
     pub fn write_stdin(&self, bytes: Vec<u8>) -> Result<(), ShellWorkerError> {
         if bytes.len() > MAX_SHELL_PACKET_PAYLOAD {
             return Err(ShellWorkerError::InputTooLarge {
@@ -97,19 +140,16 @@ impl ShellWorker {
             .map_err(|_| ShellWorkerError::WorkerStopped)
     }
 
-    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<ShellEvent, ShellWorkerError> {
-        self.events
-            .recv_timeout(timeout)
-            .map_err(|error| match error {
-                RecvTimeoutError::Timeout => ShellWorkerError::ReceiveTimeout,
-                RecvTimeoutError::Disconnected => ShellWorkerError::WorkerStopped,
-            })
+    pub fn hangup(&self) -> Result<(), ShellWorkerError> {
+        self.commands
+            .send(ShellCommand::Shutdown)
+            .map_err(|_| ShellWorkerError::WorkerStopped)
     }
 }
 
 impl Drop for ShellWorker {
     fn drop(&mut self) {
-        let _ = self.commands.try_send(ShellCommand::Shutdown);
+        let _ = self.input.commands.try_send(ShellCommand::Shutdown);
     }
 }
 
@@ -119,6 +159,9 @@ fn validate_open(open: &ShellOpen) -> Result<(), ShellWorkerError> {
     }
     match (open.mode, open.terminal_size) {
         (ShellMode::Pty, None) => Err(ShellWorkerError::MissingTerminalSize),
+        (ShellMode::Pty, Some(size)) if !size.is_valid() => {
+            Err(ShellWorkerError::InvalidTerminalSize)
+        }
         (ShellMode::Raw, Some(_)) => Err(ShellWorkerError::TerminalSizeForRaw),
         _ => Ok(()),
     }
@@ -154,8 +197,10 @@ fn spawn_raw(open: ShellOpen) -> Result<ShellWorker, ShellWorkerError> {
     });
 
     Ok(ShellWorker {
-        mode: ShellMode::Raw,
-        commands: command_tx,
+        input: ShellInput {
+            mode: ShellMode::Raw,
+            commands: command_tx,
+        },
         events: event_rx,
     })
 }
@@ -199,8 +244,10 @@ fn spawn_pty(open: ShellOpen) -> Result<ShellWorker, ShellWorkerError> {
     });
 
     Ok(ShellWorker {
-        mode: ShellMode::Pty,
-        commands: command_tx,
+        input: ShellInput {
+            mode: ShellMode::Pty,
+            commands: command_tx,
+        },
         events: event_rx,
     })
 }

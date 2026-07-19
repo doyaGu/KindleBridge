@@ -4,6 +4,8 @@ use std::time::Duration;
 use kindlebridge_schema::shell_protocol::ShellExit;
 use kindlebridged::shell::{ShellEvent, ShellWorker, ShellWorkerError};
 
+const LARGE_OUTPUT_SIZE: usize = 32 * 1024 * 1024;
+
 #[test]
 fn shell_worker_rejects_an_empty_command_before_spawning() {
     let open = ShellOpen {
@@ -17,6 +19,27 @@ fn shell_worker_rejects_an_empty_command_before_spawning() {
     assert!(matches!(
         ShellWorker::spawn(open),
         Err(ShellWorkerError::EmptyArgv)
+    ));
+}
+
+#[test]
+fn shell_worker_rejects_a_zero_sized_pty_before_spawning() {
+    let open = ShellOpen {
+        mode: ShellMode::Pty,
+        argv: vec!["/bin/sh".to_owned()],
+        terminal_size: Some(TerminalSize {
+            rows: 0,
+            columns: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }),
+        cwd: "/tmp/root".to_owned(),
+        term: "linux".to_owned(),
+    };
+
+    assert!(matches!(
+        ShellWorker::spawn(open),
+        Err(ShellWorkerError::InvalidTerminalSize)
     ));
 }
 
@@ -65,6 +88,29 @@ fn raw_shell_preserves_binary_stdin_and_closes_it_explicitly() {
         }
     }
     assert_eq!(output, input);
+}
+
+#[test]
+fn raw_shell_streams_32_mib_without_truncation() {
+    let mut worker = ShellWorker::spawn(raw_large_output_command()).unwrap();
+    worker.close_input().unwrap();
+
+    let mut received = 0_usize;
+    loop {
+        match worker.recv_timeout(Duration::from_secs(30)).unwrap() {
+            ShellEvent::Stdout(bytes) => {
+                assert!(bytes.iter().all(|byte| *byte == 0));
+                received += bytes.len();
+            }
+            ShellEvent::Stderr(bytes) => panic!("unexpected stderr: {bytes:?}"),
+            ShellEvent::Exit(status) => {
+                assert_eq!(status.exit_code, 0);
+                assert_eq!(status.signal, 0);
+                break;
+            }
+        }
+    }
+    assert_eq!(received, LARGE_OUTPUT_SIZE);
 }
 
 #[test]
@@ -139,6 +185,69 @@ fn pty_shell_is_persistent_has_ttys_and_resizes() {
 }
 
 #[cfg(unix)]
+#[test]
+fn pty_ctrl_c_interrupts_the_foreground_job_without_killing_the_shell() {
+    let mut worker = ShellWorker::spawn(pty_shell()).unwrap();
+    worker
+        .write_stdin(b"echo BEFORE; sleep 30; echo SHOULD-NOT-RUN\n".to_vec())
+        .unwrap();
+    let before = recv_stdout_until(&mut worker, b"BEFORE", Duration::from_secs(5));
+    assert!(String::from_utf8_lossy(&before).contains("BEFORE"));
+    worker.write_stdin(vec![0x03]).unwrap();
+    worker
+        .write_stdin(b"echo INTERRUPTED; exit 0\n".to_vec())
+        .unwrap();
+    let output = recv_stdout_until(&mut worker, b"INTERRUPTED", Duration::from_secs(5));
+    assert!(!String::from_utf8_lossy(&output).contains("SHOULD-NOT-RUN"));
+    loop {
+        if let ShellEvent::Exit(status) = worker.recv_timeout(Duration::from_secs(5)).unwrap() {
+            assert_eq!(status.exit_code, 0);
+            break;
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_ctrl_d_closes_input_and_exits_the_login_shell() {
+    let mut worker = ShellWorker::spawn(pty_shell()).unwrap();
+    worker.write_stdin(vec![0x04]).unwrap();
+    loop {
+        if let ShellEvent::Exit(status) = worker.recv_timeout(Duration::from_secs(5)).unwrap() {
+            assert_eq!(status.exit_code, 0);
+            break;
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_shell_reports_signal_exit() {
+    let mut worker = ShellWorker::spawn(ShellOpen {
+        mode: ShellMode::Raw,
+        argv: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "kill -TERM $$".to_owned(),
+        ],
+        terminal_size: None,
+        cwd: std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        term: "linux".to_owned(),
+    })
+    .unwrap();
+    loop {
+        if let ShellEvent::Exit(status) = worker.recv_timeout(Duration::from_secs(5)).unwrap() {
+            assert_eq!(status.exit_code, -1);
+            assert_eq!(status.signal, 15);
+            break;
+        }
+    }
+}
+
+#[cfg(unix)]
 fn recv_stdout_until(worker: &mut ShellWorker, marker: &[u8], timeout: Duration) -> Vec<u8> {
     let deadline = std::time::Instant::now() + timeout;
     let mut output = Vec::new();
@@ -199,6 +308,57 @@ fn raw_copy_command() -> ShellOpen {
         mode: ShellMode::Raw,
         argv,
         terminal_size: None,
+        cwd: std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        term: "linux".to_owned(),
+    }
+}
+
+fn raw_large_output_command() -> ShellOpen {
+    #[cfg(windows)]
+    let argv = vec![
+        std::path::Path::new(&std::env::var("SYSTEMROOT").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe")
+            .to_string_lossy()
+            .into_owned(),
+        "-NoProfile".to_owned(),
+        "-NonInteractive".to_owned(),
+        "-Command".to_owned(),
+        "$o=[Console]::OpenStandardOutput();$b=New-Object byte[] 65536;for($i=0;$i -lt 512;$i++){$o.Write($b,0,$b.Length)};$o.Flush()".to_owned(),
+    ];
+    #[cfg(not(windows))]
+    let argv = vec![
+        "/bin/dd".to_owned(),
+        "if=/dev/zero".to_owned(),
+        "bs=65536".to_owned(),
+        "count=512".to_owned(),
+        "status=none".to_owned(),
+    ];
+    ShellOpen {
+        mode: ShellMode::Raw,
+        argv,
+        terminal_size: None,
+        cwd: std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        term: "linux".to_owned(),
+    }
+}
+
+#[cfg(unix)]
+fn pty_shell() -> ShellOpen {
+    ShellOpen {
+        mode: ShellMode::Pty,
+        argv: vec!["/bin/sh".to_owned()],
+        terminal_size: Some(TerminalSize {
+            rows: 24,
+            columns: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }),
         cwd: std::env::current_dir()
             .unwrap()
             .to_string_lossy()
