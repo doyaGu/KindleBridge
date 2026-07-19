@@ -271,6 +271,12 @@ impl<R: ChildRunner, C: Clock, D: DisableFlag> Launcher<R, C, D> {
                 if valid {
                     let heartbeat = heartbeat.expect("valid heartbeat is present");
                     if now.saturating_sub(heartbeat.timestamp_ms) > manifest.heartbeat_timeout_ms {
+                        eprintln!(
+                            "kindlebridge-launcher: slot {} heartbeat is {} ms old (limit {} ms); restarting daemon",
+                            running.slot,
+                            now.saturating_sub(heartbeat.timestamp_ms),
+                            manifest.heartbeat_timeout_ms
+                        );
                         self.runner.terminate(running.id)?;
                         return self.record_failure(running, &manifest);
                     }
@@ -296,6 +302,13 @@ impl<R: ChildRunner, C: Clock, D: DisableFlag> Launcher<R, C, D> {
                         }
                     };
                     if heartbeat_timed_out {
+                        eprintln!(
+                            "kindlebridge-launcher: slot {} heartbeat was unavailable for longer than {} ms; restarting daemon",
+                            running.slot,
+                            running
+                                .last_valid_heartbeat_ms
+                                .map_or(manifest.startup_timeout_ms, |_| manifest.heartbeat_timeout_ms)
+                        );
                         self.runner.terminate(running.id)?;
                         return self.record_failure(running, &manifest);
                     }

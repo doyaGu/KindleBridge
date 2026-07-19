@@ -9,6 +9,8 @@ use crate::{Error, ErrorKind, Result};
 const CURRENT_FILE: &str = "current";
 const NEXT_FILE: &str = "next";
 const MAX_DAEMON_SIZE: u64 = 32 * 1024 * 1024;
+const PRODUCTION_HEARTBEAT_TIMEOUT_MS: u64 = 10_000;
+const PRODUCTION_HEALTHY_AFTER_MS: u64 = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedUpdate {
@@ -82,7 +84,7 @@ fn validate_arm_elf(bytes: &[u8]) -> Result<()> {
 
 fn slot_manifest(slot: Slot) -> String {
     format!(
-        "KINDLEBRIDGE_SLOT_V1\nslot={slot}\nexecutable=bin/kindlebridged\nheartbeat=run/heartbeat\nstartup_timeout_ms=10000\nheartbeat_timeout_ms=1500\nhealthy_after_ms=3000\nmax_crashes=3\nbackoff_initial_ms=100\nbackoff_max_ms=1000\n"
+        "KINDLEBRIDGE_SLOT_V1\nslot={slot}\nexecutable=bin/kindlebridged\nheartbeat=run/heartbeat\nstartup_timeout_ms=10000\nheartbeat_timeout_ms={PRODUCTION_HEARTBEAT_TIMEOUT_MS}\nhealthy_after_ms={PRODUCTION_HEALTHY_AFTER_MS}\nmax_crashes=3\nbackoff_initial_ms=100\nbackoff_max_ms=1000\n"
     )
 }
 
@@ -147,7 +149,9 @@ mod tests {
             fs::read(root.join("slots/B/bin/kindlebridged")).unwrap(),
             bytes
         );
-        SlotManifest::load(&SafeRoot::open(&root).unwrap(), Slot::B).unwrap();
+        let manifest = SlotManifest::load(&SafeRoot::open(&root).unwrap(), Slot::B).unwrap();
+        assert_eq!(manifest.heartbeat_timeout_ms, 10_000);
+        assert_eq!(manifest.healthy_after_ms, 10_000);
         fs::remove_dir_all(root).unwrap();
     }
 
