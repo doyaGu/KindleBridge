@@ -16,8 +16,8 @@ interface.
 
 ## Install
 
-Start USB Bridge on the Kindle, connect it to Windows, and inspect the proposed
-change from a normal PowerShell window:
+Choose **Connect for development** in KindleBridge's KUAL menu, connect the
+Kindle to Windows, and inspect the proposed change from a normal PowerShell window:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows-winusb.ps1 -DryRun

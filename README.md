@@ -110,7 +110,7 @@ the inactive A/B slot, and records it as staged. The active slot and USB session
 remain untouched. Then unplug USB and choose **Apply staged daemon update** in
 KUAL. The USB manager starts the requested slot while the UDC is unbound and
 does not expose it to the host until its instance-bound heartbeat has remained
-healthy for three seconds. Three startup failures restore the previous slot
+healthy for ten seconds. Three startup failures restore the previous slot
 before USB is bound.
 
 There is deliberately no live daemon activation or transport supervisor. The
