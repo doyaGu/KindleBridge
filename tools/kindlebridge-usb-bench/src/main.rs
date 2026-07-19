@@ -19,6 +19,8 @@ const MAX_PAYLOAD: u32 = 1024 * 1024;
 const DEFAULT_PAYLOAD: u32 = 256 * 1024;
 const DEFAULT_ROUNDS: u32 = 128;
 const MAX_ROUNDS: u32 = 99_998;
+const KT6_SAFE_TRANSFER_SIZE: usize = 16 * 1024;
+const KT6_SAFE_QUEUE_DEPTH: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProbeMode {
@@ -87,7 +89,7 @@ fn main() {
 
 fn run(raw_arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let arguments = parse_arguments(&raw_arguments)?;
-    let buffers = BufferConfig::default();
+    let buffers = probe_buffer_config();
     let transport = open(
         &UsbMatch {
             vendor_id: arguments.vendor_id,
@@ -218,6 +220,15 @@ fn run(raw_arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn probe_buffer_config() -> BufferConfig {
+    BufferConfig {
+        transfer_size: KT6_SAFE_TRANSFER_SIZE,
+        read_queue_depth: KT6_SAFE_QUEUE_DEPTH,
+        write_queue_depth: KT6_SAFE_QUEUE_DEPTH,
+        ..BufferConfig::default()
+    }
+}
+
 fn test_payload(length: usize) -> Vec<u8> {
     (0..length)
         .map(|index| u8::try_from(index % 251).expect("modulo result fits in u8"))
@@ -337,6 +348,10 @@ mod tests {
                 rounds: 128,
             }
         );
+        let buffers = probe_buffer_config();
+        assert_eq!(buffers.transfer_size, 16 * 1024);
+        assert_eq!(buffers.read_queue_depth, 4);
+        assert_eq!(buffers.write_queue_depth, 4);
     }
 
     #[test]
