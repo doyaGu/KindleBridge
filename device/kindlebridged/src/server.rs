@@ -13,8 +13,8 @@ use kindlebridge_schema::device_protocol::{
     ServiceOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE,
     APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE, APP_START_FEATURE, APP_STOP_FEATURE,
     APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, EXEC_FEATURE,
-    LOG_TAIL_FEATURE, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION,
-    SHELL_SERVICE, SYNC_CREDIT_BATCH_SIZE, SYNC_FEATURE, SYNC_SERVICE,
+    LEGACY_RPC_SERVICE, LOG_TAIL_FEATURE, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE,
+    PROTOCOL_VERSION, SYNC_CREDIT_BATCH_SIZE, SYNC_FEATURE, SYNC_SERVICE,
 };
 use kindlebridge_schema::{
     error_codes, methods, AppInstallParams, AppTargetParams, ExecParams, LogTailParams,
@@ -476,7 +476,7 @@ fn serve_session(
             state.process_inbound(&open_frame.header, FrameContext::default())?;
             let service: ServiceOpen = decode(&open_frame.payload, "OPEN")?;
             let stream_id = open_frame.header.stream_id;
-            if !matches!(service.service.as_str(), SHELL_SERVICE | SYNC_SERVICE) {
+            if !matches!(service.service.as_str(), LEGACY_RPC_SERVICE | SYNC_SERVICE) {
                 send(
                     stream,
                     &mut state,
@@ -511,7 +511,7 @@ fn serve_session(
                 return Err(error);
             }
             let service_result = match service.service.as_str() {
-                SHELL_SERVICE => serve_shell_stream(
+                LEGACY_RPC_SERVICE => serve_shell_stream(
                     stream,
                     &mut state,
                     config,
@@ -2048,7 +2048,7 @@ mod tests {
                 1,
                 0,
                 encode(&ServiceOpen {
-                    service: SHELL_SERVICE.to_owned(),
+                    service: LEGACY_RPC_SERVICE.to_owned(),
                 })
                 .unwrap(),
             )

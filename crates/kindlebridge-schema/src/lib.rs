@@ -9,6 +9,7 @@ use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 pub mod device_protocol;
+pub mod shell_protocol;
 
 pub const JSONRPC_VERSION: &str = "2.0";
 pub const API_VERSION: &str = "v1";

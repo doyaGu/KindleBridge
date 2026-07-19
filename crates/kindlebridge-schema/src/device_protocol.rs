@@ -9,13 +9,16 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const SESSION_ID_HEX_LENGTH: usize = 32;
 pub const DEFAULT_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 pub const DEFAULT_STREAM_WINDOW: u32 = 8 * 1024 * 1024;
+pub const SHELL_STREAM_WINDOW: u32 = 256 * 1024;
 /// Largest payload the official host may place in one host-to-device frame.
 ///
 /// Recovery must be able to overwrite one abandoned outbound frame, so this is
 /// deliberately independent from the larger connection credit window.
 pub const MAX_HOST_TO_DEVICE_PAYLOAD: u32 = 1024 * 1024;
 pub const SYNC_CREDIT_BATCH_SIZE: u32 = DEFAULT_STREAM_WINDOW / 2;
-pub const SHELL_SERVICE: &str = "shell.v1";
+/// Generic request/reply service retained for older daemons.
+pub const LEGACY_RPC_SERVICE: &str = "shell.v1";
+pub const SHELL_V2_SERVICE: &str = "shell.v2";
 pub const SYNC_SERVICE: &str = "sync.v1";
 pub const APP_INSTALL_FEATURE: &str = "app.install.v1";
 pub const APP_LIST_FEATURE: &str = "app.list.v1";
@@ -29,6 +32,65 @@ pub const LOG_TAIL_FEATURE: &str = "log.tail.v1";
 pub const PROCESS_LIST_FEATURE: &str = "process.list.v1";
 pub const PROCESS_SIGNAL_FEATURE: &str = "process.signal.v1";
 pub const SYNC_FEATURE: &str = "sync.v1";
+pub const SHELL_V2_FEATURE: &str = SHELL_V2_SERVICE;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellMode {
+    Pty,
+    Raw,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalSize {
+    pub rows: u16,
+    pub columns: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+}
+
+impl TerminalSize {
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.rows != 0 && self.columns != 0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellOpen {
+    pub mode: ShellMode,
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_size: Option<TerminalSize>,
+    pub cwd: String,
+    pub term: String,
+}
+
+impl ShellOpen {
+    #[must_use]
+    pub fn interactive(terminal_size: TerminalSize) -> Self {
+        Self {
+            mode: ShellMode::Pty,
+            argv: vec!["/bin/sh".to_owned(), "-l".to_owned()],
+            terminal_size: Some(terminal_size),
+            cwd: "/tmp/root".to_owned(),
+            term: "linux".to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub fn command(command: impl Into<String>) -> Self {
+        Self {
+            mode: ShellMode::Raw,
+            argv: vec!["/bin/sh".to_owned(), "-lc".to_owned(), command.into()],
+            terminal_size: None,
+            cwd: "/tmp/root".to_owned(),
+            term: "linux".to_owned(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

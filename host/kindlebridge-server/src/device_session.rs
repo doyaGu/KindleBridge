@@ -12,9 +12,9 @@ use kindlebridge_schema::device_protocol::{
     is_valid_session_id, is_valid_transfer_id, DeviceCall, DeviceHello, DeviceReply, HostHello,
     ServiceAccept, ServiceOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE,
     APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE, APP_START_FEATURE, APP_STOP_FEATURE,
-    APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, LOG_TAIL_FEATURE,
-    MAX_HOST_TO_DEVICE_PAYLOAD, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION,
-    SHELL_SERVICE, SYNC_CREDIT_BATCH_SIZE, SYNC_FEATURE, SYNC_SERVICE,
+    APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, LEGACY_RPC_SERVICE,
+    LOG_TAIL_FEATURE, MAX_HOST_TO_DEVICE_PAYLOAD, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE,
+    PROTOCOL_VERSION, SYNC_CREDIT_BATCH_SIZE, SYNC_FEATURE, SYNC_SERVICE,
 };
 use kindlebridge_schema::{
     error_codes, AppInstallParams, AppList, AppSummary, AppTargetParams, DeviceFeatures,
@@ -519,7 +519,7 @@ impl DeviceSession {
                 stream_id,
                 0,
                 encode(&ServiceOpen {
-                    service: SHELL_SERVICE.to_owned(),
+                    service: LEGACY_RPC_SERVICE.to_owned(),
                 })?,
             )?,
             FrameContext::default(),
