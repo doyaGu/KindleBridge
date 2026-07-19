@@ -7,8 +7,8 @@ on Kindle firmware 5.16.3 and later.
 
 The current tree is an internal development candidate. It is not a public 1.0 release.
 The MRPI development package installs only under `/mnt/us` and `/var/local`,
-starts the USB bridge on demand, and returns ownership to stock MTP through
-Kindle's `volumd`/HAL lifecycle. KUAL start has no timeout. See
+starts the USB bridge automatically, and returns ownership to stock MTP through
+Kindle's `volumd`/HAL lifecycle. See
 [`STATUS.md`](STATUS.md) for the release gates and current gaps.
 
 ## Workspace
@@ -124,8 +124,18 @@ Use `--usb-serial` only to select among multiple attached Kindles and
 running `usb-gadget-manager.sh stop`. The manager asks stock `volumd` to perform the
 MTP-to-network and network-to-MTP transitions; it never resets the MTU3
 controller or binds stock MTP directly. The current KT6 firmware does not
-install the FunctionFS interface GUID automatically, so the development host
-still needs the documented GUID setup from the hardware-lab report.
+install the FunctionFS interface GUID automatically. On Windows, first inspect
+and then install the repository's fail-closed `MI_01` onboarding change:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows-winusb.ps1 -DryRun
+# Run the following command from an elevated PowerShell window:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows-winusb.ps1
+```
+
+This keeps the stock VID/PID and MTP driver and uses Windows' inbox WinUSB
+service; it does not require pid.codes or a third-party driver. See
+[`docs/windows-winusb-onboarding.md`](docs/windows-winusb-onboarding.md).
 
 ## Internal MRPI development package
 
@@ -138,20 +148,33 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/build-mrpi-dev
 The build uses the workspace Rust KindleTool checkout at `../KindleTool`; it
 does not build or invoke the legacy C/MinGW implementation.
 
-Copy the generated install package from `dist/` to `/mnt/us/mrpackages` and run
-it through MRPI. The package does not install, invoke, or monitor USBNetLite.
-Its KUAL menu stays open for start, stop, and status actions. Start has no time
-limit, while status is shown in KUAL's message area. `/mnt/us/KINDLEBRIDGE_DISABLE` prevents
+Copy the generated install package from `dist/` to `/mnt/us/mrpackages`, unplug
+USB, and run it through MRPI. The installer stops the previous Bridge, replaces
+the package atomically, starts the new version, and restores the previous version
+if activation fails. The normal user flow is therefore only **unplug, run MRPI,
+reconnect**. If the cable is still attached, installation fails before replacing
+the existing version and tells the user to unplug it.
+
+The package does not install, invoke, or monitor USBNetLite. Its KUAL menu uses
+task-oriented **Connect for development**, **Use USB file transfer**, and
+**Status / Help** actions. Repeating either connection action is safe; transitions
+have no KUAL time limit and remain in the menu. `/mnt/us/KINDLEBRIDGE_DISABLE` prevents
 activation. Explicit manager invocations may still select a bounded timeout for
 laboratory tests; `start 0` disables it. Stop always restores stock MTP; a
 temporary `g_ether` rescue transport is not restored or required at runtime.
 Start and stop require an unplugged USB cable on KT6. Once active, KindleBridge
 supports normal host unplug/replug without another mode transition.
 
-The rewritten ownership manager has deterministic offline lifecycle coverage,
-but its stock `volumd` handoff still needs one controlled KT6 validation before
-this package is considered hardware-safe. `/mnt/us/KINDLEBRIDGE_DISABLE` should
-remain present until that validation is intentionally started.
+The ownership manager's stock-MTP-to-Bridge path, host discovery, repeated exec,
+unplug/replug reconnects, and large sync have been exercised on the KT6 in
+addition to deterministic offline lifecycle coverage. Bridge-to-MTP handback
+and re-entry, sleep/wake, crash recovery, and the full repeated-cycle gate have
+not yet completed; keep `/mnt/us/KINDLEBRIDGE_DISABLE` for unattended startup.
+
+Portable formatting, Rust test/Clippy, shell lifecycle, and Windows-onboarding
+selector checks run in GitHub Actions. The Windows host integration, ARM
+`kindlehf` cross-build, packaging, and physical KT6 gates remain local because
+the required toolchain and hardware are not available on hosted runners.
 
 ## KBB development bundles
 
