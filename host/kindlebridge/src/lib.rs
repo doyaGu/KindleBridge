@@ -969,6 +969,7 @@ fn format_app_result(
 
 fn format_app(app: &AppSummary) -> String {
     let state = match app.state {
+        AppState::Unknown => "unknown".to_owned(),
         AppState::Stopped => "stopped".to_owned(),
         AppState::Running => format!("running pid={}", app.pid.unwrap_or(0)),
     };

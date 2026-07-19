@@ -383,6 +383,7 @@ pub struct SyncStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppState {
+    Unknown,
     Stopped,
     Running,
 }
@@ -715,6 +716,15 @@ mod tests {
     fn sync_defaults_to_a_full_usb_transfer_batch() {
         assert_eq!(DEFAULT_SYNC_BLOCK_SIZE, MAX_SYNC_BLOCK_SIZE);
         assert_eq!(DEFAULT_SYNC_BLOCK_SIZE, 1024 * 1024);
+    }
+
+    #[test]
+    fn unknown_app_state_has_a_stable_wire_value() {
+        assert_eq!(serde_json::to_value(AppState::Unknown).unwrap(), "unknown");
+        assert_eq!(
+            serde_json::from_str::<AppState>("\"unknown\"").unwrap(),
+            AppState::Unknown
+        );
     }
 
     #[test]

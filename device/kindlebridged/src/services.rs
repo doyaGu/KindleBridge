@@ -42,7 +42,7 @@ pub fn app_list(activation_root: &Path) -> Result<AppList, RpcError> {
         let summary = AppSummary {
             app_id: entry.id.clone(),
             version: entry.code_version.clone(),
-            state: AppState::Stopped,
+            state: AppState::Unknown,
             rollback_available: rollback_ids.contains(entry.id.as_str()),
             pid: None,
         };
@@ -424,7 +424,8 @@ mod tests {
         assert_eq!(apps.apps[0].app_id, "org.example.reader");
         assert_eq!(apps.apps[0].version, "2.0.0");
         assert!(apps.apps[0].rollback_available);
-        assert_eq!(apps.apps[0].state, AppState::Stopped);
+        assert_eq!(apps.apps[0].state, AppState::Unknown);
+        assert_eq!(apps.apps[0].pid, None);
     }
 
     #[test]
