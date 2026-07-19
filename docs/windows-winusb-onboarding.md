@@ -16,7 +16,7 @@ interface.
 
 ## Install
 
-Choose **Connect for development** in KindleBridge's KUAL menu, connect the
+Choose **Switch to development mode** in KindleBridge's KUAL menu, connect the
 Kindle to Windows, and inspect the proposed change from a normal PowerShell window:
 
 ```powershell

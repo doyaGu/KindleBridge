@@ -68,15 +68,15 @@ Cargo package is a development compatibility marker, not a product release.
   menu, and treats repeated start/stop as success. MRPI upgrades stop the old
   manager, replace files atomically, start the new manager, and restore the old
   installation after a failed activation. Laboratory invocations may opt into
-  a bounded watchdog. Twenty-two deterministic shell lifecycle tests
+  a bounded watchdog. Twenty-four deterministic shell lifecycle tests
   cover connected fail-closed behavior, MTP and existing stock-network entry,
   rollback, stale and detached state reporting, PID ownership, precise
   Bridge-only cleanup,
-  stock handback, direct-FSP-backing selection with a compatibility fallback,
-  and KUAL behavior. The current stock-`volumd` manager has
-  completed the stock-MTP-to-Bridge handoff on KT6; discovery, repeated root
-  exec, multi-window stability, and large sync then passed. Hardware handback,
-  re-entry, sleep/wake, and repeated-cycle validation remain gates.
+  stock handback, heartbeat-aware health reporting, direct-FSP-backing selection
+  with a compatibility fallback, and actionable KUAL behavior. The current
+  stock-`volumd` manager has completed both handoff directions and re-entry on
+  KT6; discovery, repeated root exec, multi-window stability, and large sync then
+  passed. Repeated sleep/wake and repeated-cycle validation remain gates.
 - The package integrates a root-confined A/B daemon launcher into the USB
   manager. Host `daemon stage` uploads through `sync.v1`, verifies BLAKE3 plus
   the ELF32 little-endian ARM header on-device, writes only the inactive slot,
@@ -91,7 +91,10 @@ Cargo package is a development compatibility marker, not a product release.
   gaps after readiness, and retries heartbeat writes instead of abandoning them
   after one filesystem error. Production manifests use a ten-second
   steady-state timeout so a userstore `fsync` cannot be mistaken for a daemon
-  crash; the watchdog records the exact timeout reason before a restart.
+  crash. A healthy daemon also receives one heartbeat window after a watchdog
+  scheduling or wall-clock discontinuity, preventing resume-order races without
+  masking a daemon that remains stuck. The watchdog records the exact timeout
+  reason before a restart.
   Launcher, USB manager, and package-layout updates remain MRPI-only.
 - `kindlehf` cross-builds that are ELF32 ARM hard-float and require at most
   GLIBC_2.18, below the KT6 firmware ceiling used by the build check.
@@ -99,7 +102,7 @@ Cargo package is a development compatibility marker, not a product release.
   filesystem/hash/memory benchmarks established the initial hardware data-path baseline.
   See `docs/hardware-lab/kt6-5.17.1.0.4.md`.
 - Workspace unit/integration tests, formatting, and Clippy with warnings denied.
-  The shell USB-lifecycle suite defines 22 deterministic cases, including exact
+  The shell USB-lifecycle suite defines 24 deterministic cases, including exact
   managed-entrypoint ownership, idempotent actions, controlled supervisor
   shutdown, and manual crash-fuse recovery. Three additional MRPI
   scenarios cover self-managed success, connected fail-closed behavior, and

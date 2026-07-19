@@ -113,11 +113,13 @@ does not expose it to the host until its instance-bound heartbeat has remained
 healthy for ten seconds. Three startup failures restore the previous slot
 before USB is bound.
 
-There is deliberately no live daemon activation or transport supervisor. The
-daemon is the sole owner of the FunctionFS endpoints, so killing it destroys
-the transport needed to repair it. The launcher, USB ownership manager, and
-package layout therefore remain MRPI-managed control-plane components; normal
-apps and payloads can still update online.
+There is deliberately no host-triggered live daemon activation. The launcher
+may restart the currently selected daemon after a sustained liveness failure,
+but changing A/B slots remains an unplugged, pre-bind operation. The daemon is
+the sole owner of the FunctionFS endpoints, so an online slot replacement would
+destroy the transport needed to repair it. The launcher, USB ownership manager,
+and package layout therefore remain MRPI-managed control-plane components;
+normal apps and payloads can still update online.
 
 Use `--usb-serial` only to select among multiple attached Kindles and
 `--no-usb` to disable automatic discovery. Unplug the cable again before
@@ -156,20 +158,23 @@ reconnect**. If the cable is still attached, installation fails before replacing
 the existing version and tells the user to unplug it.
 
 The package does not install, invoke, or monitor USBNetLite. Its KUAL menu uses
-task-oriented **Connect for development**, **Use USB file transfer**, and
-**Status / Help** actions. Repeating either connection action is safe; transitions
-have no KUAL time limit and remain in the menu. `/mnt/us/KINDLEBRIDGE_DISABLE` prevents
-activation. Explicit manager invocations may still select a bounded timeout for
-laboratory tests; `start 0` disables it. Stop always restores stock MTP; a
-temporary `g_ether` rescue transport is not restored or required at runtime.
+task-oriented **Switch to development mode**, **Switch to USB file transfer**,
+and **Show status and recovery steps** actions. A staged-update action appears
+only when an update is ready. Repeating either mode action is safe; transitions
+have no KUAL time limit and remain in the menu. `/mnt/us/KINDLEBRIDGE_DISABLE`
+prevents activation. Explicit manager invocations may still select a bounded
+timeout for laboratory tests; `start 0` disables it. Stop always restores stock
+MTP; a temporary `g_ether` rescue transport is not restored or required at runtime.
 Start and stop require an unplugged USB cable on KT6. Once active, KindleBridge
 supports normal host unplug/replug without another mode transition.
 
-The ownership manager's stock-MTP-to-Bridge path, host discovery, repeated exec,
-unplug/replug reconnects, and large sync have been exercised on the KT6 in
-addition to deterministic offline lifecycle coverage. Bridge-to-MTP handback
-and re-entry, sleep/wake, crash recovery, and the full repeated-cycle gate have
-not yet completed; keep `/mnt/us/KINDLEBRIDGE_DISABLE` for unattended startup.
+The ownership manager's stock-MTP-to-Bridge path, Bridge-to-MTP handback,
+re-entry, host discovery, repeated exec, unplug/replug reconnects, and large
+sync have been exercised repeatedly on the KT6. A long sleep exposed a wall-clock
+heartbeat race; the launcher now gives an already-healthy daemon one normal
+heartbeat window after a watchdog scheduling discontinuity. Repeated sleep/wake,
+crash recovery, and the full soak gate still require hardware revalidation; keep
+`/mnt/us/KINDLEBRIDGE_DISABLE` for unattended startup.
 
 Portable formatting, Rust test/Clippy, shell lifecycle, and Windows-onboarding
 selector checks run in GitHub Actions. The Windows host integration, ARM
