@@ -3,6 +3,10 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Mutex,
+    },
 };
 
 #[cfg(unix)]
@@ -16,7 +20,11 @@ use kindlebridge_transport_tcp::{
 };
 use kindlebridge_wire::{Command, DecodeLimits, Frame, Header, MAGIC};
 
-use crate::{descriptor_bytes, string_bytes, wait_for_enable, EventError, WaitOutcome};
+use crate::{
+    descriptor_bytes,
+    event::{read_event, MAX_EVENTS_BEFORE_ACTIVE},
+    string_bytes, Event, EventError, EventKind, SetupPacket, WaitOutcome,
+};
 
 pub const MAX_PAYLOAD: u32 = 1024 * 1024;
 pub const MAX_FRAME_COUNT: u64 = 100_000;
@@ -251,6 +259,8 @@ impl FunctionFsEndpoints {
 #[derive(Debug)]
 pub struct FunctionFsReadEndpoint {
     file: File,
+    #[cfg(unix)]
+    control: Arc<FunctionFsControl>,
 }
 
 impl Read for FunctionFsReadEndpoint {
@@ -258,7 +268,7 @@ impl Read for FunctionFsReadEndpoint {
         #[cfg(unix)]
         {
             loop {
-                wait_until_ready(&self.file, PollFlags::IN)?;
+                wait_until_ready(&self.file, &self.control, PollFlags::IN)?;
                 match self.file.read(buffer) {
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                     outcome => return outcome,
@@ -273,6 +283,8 @@ impl Read for FunctionFsReadEndpoint {
 #[derive(Debug)]
 pub struct FunctionFsWriteEndpoint {
     file: File,
+    #[cfg(unix)]
+    control: Arc<FunctionFsControl>,
 }
 
 impl Write for FunctionFsWriteEndpoint {
@@ -280,7 +292,7 @@ impl Write for FunctionFsWriteEndpoint {
         #[cfg(unix)]
         {
             loop {
-                wait_until_ready(&self.file, PollFlags::OUT)?;
+                wait_until_ready(&self.file, &self.control, PollFlags::OUT)?;
                 match self.file.write(buffer) {
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                     outcome => return outcome,
@@ -297,18 +309,42 @@ impl Write for FunctionFsWriteEndpoint {
 }
 
 #[cfg(unix)]
-fn wait_until_ready(file: &File, expected: PollFlags) -> std::io::Result<()> {
+pub(crate) fn wait_until_ready(
+    file: &File,
+    control: &Arc<FunctionFsControl>,
+    expected: PollFlags,
+) -> std::io::Result<()> {
     loop {
-        let mut fds = [PollFd::new(file, expected)];
-        match poll(&mut fds, None) {
-            Ok(0) => continue,
-            Ok(_) => {
-                let ready = fds[0].revents();
+        let mut ep0 = control.lock()?;
+        let poll_result = {
+            let mut fds = [
+                PollFd::new(file, expected),
+                PollFd::new(&*ep0, PollFlags::IN),
+            ];
+            match poll(&mut fds, None) {
+                Ok(count) => Ok((count, fds[0].revents(), fds[1].revents())),
+                Err(error) => Err(error),
+            }
+        };
+        match poll_result {
+            Ok((0, _, _)) => continue,
+            Ok((_, ready, control_ready)) => {
+                if !control_ready.is_empty() {
+                    match control
+                        .consume_event(&mut ep0)
+                        .map_err(std::io::Error::other)?
+                    {
+                        ControlTransition::NoChange | ControlTransition::Active => continue,
+                        ControlTransition::Inactive => {
+                            return Err(lifecycle_abort("FunctionFS became inactive"));
+                        }
+                        ControlTransition::Disconnected => {
+                            return Err(lifecycle_abort("FunctionFS was unbound"));
+                        }
+                    }
+                }
                 if ready.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "FunctionFS endpoint disconnected",
-                    ));
+                    return Err(lifecycle_abort("FunctionFS endpoint disconnected"));
                 }
                 if ready.contains(expected) {
                     return Ok(());
@@ -324,12 +360,168 @@ fn wait_until_ready(file: &File, expected: PollFlags) -> std::io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn lifecycle_abort(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::ConnectionAborted, message)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum ControlState {
+    Inactive = 0,
+    Active = 1,
+    Disconnected = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControlTransition {
+    NoChange,
+    Active,
+    Inactive,
+    Disconnected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControlAction {
+    Active,
+    Inactive,
+    Disconnected,
+    Stall(SetupPacket),
+}
+
+pub(crate) fn classify_control_event(event: Event) -> ControlAction {
+    match event.kind {
+        EventKind::Enable | EventKind::Resume => ControlAction::Active,
+        EventKind::Bind | EventKind::Disable | EventKind::Suspend => ControlAction::Inactive,
+        EventKind::Unbind => ControlAction::Disconnected,
+        EventKind::Setup => ControlAction::Stall(event.setup),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct FunctionFsControl {
+    ep0: Mutex<File>,
+    state: AtomicU8,
+}
+
+impl FunctionFsControl {
+    fn new(ep0: File) -> Self {
+        Self {
+            ep0: Mutex::new(ep0),
+            state: AtomicU8::new(ControlState::Inactive as u8),
+        }
+    }
+
+    fn lock(&self) -> std::io::Result<std::sync::MutexGuard<'_, File>> {
+        self.ep0
+            .lock()
+            .map_err(|_| std::io::Error::other("FunctionFS ep0 lock was poisoned"))
+    }
+
+    fn state(&self) -> ControlState {
+        match self.state.load(Ordering::Acquire) {
+            value if value == ControlState::Active as u8 => ControlState::Active,
+            value if value == ControlState::Disconnected as u8 => ControlState::Disconnected,
+            _ => ControlState::Inactive,
+        }
+    }
+
+    fn consume_event(&self, ep0: &mut File) -> Result<ControlTransition, EventError> {
+        let Some(event) = read_event(ep0)? else {
+            self.state
+                .store(ControlState::Disconnected as u8, Ordering::Release);
+            return Ok(ControlTransition::Disconnected);
+        };
+        let transition = match classify_control_event(event) {
+            ControlAction::Active => {
+                self.state
+                    .store(ControlState::Active as u8, Ordering::Release);
+                ControlTransition::Active
+            }
+            ControlAction::Inactive => {
+                self.state
+                    .store(ControlState::Inactive as u8, Ordering::Release);
+                ControlTransition::Inactive
+            }
+            ControlAction::Disconnected => {
+                self.state
+                    .store(ControlState::Disconnected as u8, Ordering::Release);
+                ControlTransition::Disconnected
+            }
+            ControlAction::Stall(setup) => {
+                stall_unsupported_setup(ep0, setup)
+                    .map_err(|source| EventError::StallSetup { setup, source })?;
+                ControlTransition::NoChange
+            }
+        };
+        Ok(transition)
+    }
+
+    fn wait_for_active(&self) -> Result<WaitOutcome, EventError> {
+        match self.state() {
+            ControlState::Active => return Ok(WaitOutcome::Active),
+            ControlState::Disconnected => return Ok(WaitOutcome::Disconnected),
+            ControlState::Inactive => {}
+        }
+        let mut ep0 = self.lock().map_err(EventError::Io)?;
+        for _ in 0..MAX_EVENTS_BEFORE_ACTIVE {
+            match self.consume_event(&mut ep0)? {
+                ControlTransition::Active => return Ok(WaitOutcome::Active),
+                ControlTransition::Disconnected => return Ok(WaitOutcome::Disconnected),
+                ControlTransition::NoChange | ControlTransition::Inactive => {}
+            }
+        }
+        Err(EventError::EventLimit(MAX_EVENTS_BEFORE_ACTIVE))
+    }
+}
+
+#[cfg(test)]
+mod control_state_tests {
+    use super::*;
+
+    #[test]
+    fn cached_active_state_reopens_endpoints_without_waiting_for_another_enable() {
+        let manifest = File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("crate manifest is readable");
+        let control = FunctionFsControl::new(manifest);
+        control
+            .state
+            .store(ControlState::Active as u8, Ordering::Release);
+
+        assert_eq!(control.wait_for_active().unwrap(), WaitOutcome::Active);
+    }
+}
+
+#[cfg(unix)]
+fn stall_unsupported_setup(ep0: &File, setup: SetupPacket) -> std::io::Result<()> {
+    const USB_DIR_IN: u8 = 0x80;
+    let result = if setup.request_type & USB_DIR_IN != 0 {
+        let empty: &mut [u8] = &mut [];
+        rustix::io::read(ep0, empty).map(|_| ())
+    } else {
+        rustix::io::write(ep0, &[]).map(|_| ())
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(rustix::io::Errno::L2HLT | rustix::io::Errno::IDRM) => Ok(()),
+        Err(error) => Err(std::io::Error::from(error)),
+    }
+}
+
+#[cfg(not(unix))]
+fn stall_unsupported_setup(_ep0: &File, setup: SetupPacket) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("cannot stall FunctionFS SETUP request {setup:?} on this platform"),
+    ))
+}
+
 /// An initialized FunctionFS control endpoint. The caller is responsible only
 /// for preparing/mounting the gadget; this type never touches configfs or UDC.
 #[derive(Debug)]
 pub struct FunctionFsDevice {
     functionfs_dir: PathBuf,
-    ep0: File,
+    control: Arc<FunctionFsControl>,
 }
 
 impl FunctionFsDevice {
@@ -347,7 +539,7 @@ impl FunctionFsDevice {
         write_control_block(&mut ep0, "string", &string_bytes())?;
         Ok(Self {
             functionfs_dir: functionfs_dir.to_path_buf(),
-            ep0,
+            control: Arc::new(FunctionFsControl::new(ep0)),
         })
     }
 
@@ -355,14 +547,18 @@ impl FunctionFsDevice {
     /// `None` means FunctionFS was unbound; a service manager may reopen it after
     /// the gadget is prepared again.
     pub fn accept(&mut self) -> Result<Option<FunctionFsEndpoints>, FunctionFsError> {
-        if wait_for_enable(&mut self.ep0)? == WaitOutcome::Disconnected {
+        if self.control.wait_for_active()? == WaitOutcome::Disconnected {
             return Ok(None);
         }
         Ok(Some(FunctionFsEndpoints {
             bulk_out: FunctionFsIo::new(buffer_functionfs_reader(open_read_endpoint(
                 &self.functionfs_dir.join("ep1"),
+                Arc::clone(&self.control),
             )?)),
-            bulk_in: FunctionFsIo::new(open_write_endpoint(&self.functionfs_dir.join("ep2"))?),
+            bulk_in: FunctionFsIo::new(open_write_endpoint(
+                &self.functionfs_dir.join("ep2"),
+                Arc::clone(&self.control),
+            )?),
         }))
     }
 }
@@ -487,12 +683,32 @@ pub fn run(functionfs_dir: &Path) -> Result<SessionOutcome, FunctionFsError> {
     run_probe_session(bulk_out, bulk_in)
 }
 
-fn open_read_endpoint(path: &Path) -> Result<FunctionFsReadEndpoint, FunctionFsError> {
-    open_endpoint(path, true).map(|file| FunctionFsReadEndpoint { file })
+fn open_read_endpoint(
+    path: &Path,
+    control: Arc<FunctionFsControl>,
+) -> Result<FunctionFsReadEndpoint, FunctionFsError> {
+    let file = open_endpoint(path, true)?;
+    #[cfg(unix)]
+    return Ok(FunctionFsReadEndpoint { file, control });
+    #[cfg(not(unix))]
+    {
+        drop(control);
+        Ok(FunctionFsReadEndpoint { file })
+    }
 }
 
-fn open_write_endpoint(path: &Path) -> Result<FunctionFsWriteEndpoint, FunctionFsError> {
-    open_endpoint(path, false).map(|file| FunctionFsWriteEndpoint { file })
+fn open_write_endpoint(
+    path: &Path,
+    control: Arc<FunctionFsControl>,
+) -> Result<FunctionFsWriteEndpoint, FunctionFsError> {
+    let file = open_endpoint(path, false)?;
+    #[cfg(unix)]
+    return Ok(FunctionFsWriteEndpoint { file, control });
+    #[cfg(not(unix))]
+    {
+        drop(control);
+        Ok(FunctionFsWriteEndpoint { file })
+    }
 }
 
 fn open_endpoint(path: &Path, read: bool) -> Result<File, FunctionFsError> {

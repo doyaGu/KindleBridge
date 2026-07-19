@@ -373,6 +373,13 @@ fn is_fresh_hello(frame: &Frame) -> bool {
 }
 
 fn transport_error_allows_in_place_restart(error: &TransportError) -> bool {
+    if matches!(
+        error,
+        TransportError::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::ConnectionAborted
+    ) {
+        return false;
+    }
     matches!(
         error.class(),
         ErrorClass::Timeout | ErrorClass::Io | ErrorClass::Truncated | ErrorClass::Protocol
@@ -1252,6 +1259,19 @@ mod tests {
                 2
             );
         }
+    }
+
+    #[test]
+    fn functionfs_lifecycle_abort_reopens_endpoints_instead_of_resynchronizing_in_place() {
+        let lifecycle_abort = TransportError::Io {
+            operation: kindlebridge_transport_tcp::IoOperation::ReadHeader,
+            source: io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "simulated FunctionFS lifecycle event",
+            ),
+        };
+
+        assert!(!transport_error_allows_in_place_restart(&lifecycle_abort));
     }
 
     #[test]

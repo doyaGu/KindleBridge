@@ -466,11 +466,16 @@ impl UsbTransport {
 /// Discover, verify and claim one KBP vendor interface using nusb's blocking API.
 pub fn open(criteria: &UsbMatch, buffers: BufferConfig) -> Result<UsbTransport, TransportError> {
     let buffers = buffers.validate()?;
+    trace_usb_open(format_args!("enumerating USB devices"));
     let device_infos: Vec<DeviceInfo> = nusb::list_devices()
         .wait()
         .map_err(TransportError::Enumerate)?
         .filter(|device| device_info_matches(device, criteria))
         .collect();
+    trace_usb_open(format_args!(
+        "enumeration found {} matching device(s)",
+        device_infos.len()
+    ));
     let device_info = match device_infos.as_slice() {
         [] => return Err(TransportError::DeviceNotFound),
         [device] => device,
@@ -485,10 +490,12 @@ pub fn open(criteria: &UsbMatch, buffers: BufferConfig) -> Result<UsbTransport, 
         return Err(TransportError::InterfaceNotFound);
     }
 
+    trace_usb_open(format_args!("opening matching USB device"));
     let device = device_info
         .open()
         .wait()
         .map_err(|source| usb_operation_error("open device", source))?;
+    trace_usb_open(format_args!("USB device opened"));
     let configuration = device
         .active_configuration()
         .map_err(|error| TransportError::ActiveConfiguration(error.to_string()))?;
@@ -515,10 +522,15 @@ pub fn open(criteria: &UsbMatch, buffers: BufferConfig) -> Result<UsbTransport, 
     validate_rounded_pools(buffers, selection)?;
 
     // Intentionally claim only this interface. Never detach a class driver or claim the parent.
+    trace_usb_open(format_args!(
+        "claiming vendor interface {}",
+        selection.interface_number
+    ));
     let interface = device
         .claim_interface(selection.interface_number)
         .wait()
         .map_err(|source| usb_operation_error("claim vendor interface", source))?;
+    trace_usb_open(format_args!("vendor interface claimed"));
     if interface.get_alt_setting() != selection.alternate_setting {
         interface
             .set_alt_setting(selection.alternate_setting)
@@ -577,6 +589,12 @@ pub fn open(criteria: &UsbMatch, buffers: BufferConfig) -> Result<UsbTransport, 
             inner: Some(writer),
         },
     })
+}
+
+fn trace_usb_open(arguments: std::fmt::Arguments<'_>) {
+    if std::env::var_os("KINDLEBRIDGE_TRACE_USB_OPEN").is_some() {
+        eprintln!("kindlebridge-transport-usb: {arguments}");
+    }
 }
 
 fn usb_operation_error(operation: &'static str, source: nusb::Error) -> TransportError {

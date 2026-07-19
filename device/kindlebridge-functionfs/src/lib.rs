@@ -11,7 +11,7 @@ pub use descriptors::{
     descriptor_bytes, string_bytes, DESCRIPTOR_LENGTH, DEVICE_INTERFACE_GUID, STRING_LENGTH,
 };
 pub use event::{
-    wait_for_enable, Event, EventError, EventKind, SetupPacket, WaitOutcome, EVENT_SIZE,
+    wait_for_active, Event, EventError, EventKind, SetupPacket, WaitOutcome, EVENT_SIZE,
 };
 pub use probe::{
     run, run_probe_session, FunctionFsDevice, FunctionFsEndpoints, FunctionFsError,

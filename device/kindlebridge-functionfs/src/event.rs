@@ -1,7 +1,7 @@
 use std::{fmt, io::Read};
 
 pub const EVENT_SIZE: usize = 12;
-const MAX_EVENTS_BEFORE_ENABLE: usize = 4096;
+pub(crate) const MAX_EVENTS_BEFORE_ACTIVE: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -67,7 +67,7 @@ impl Event {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WaitOutcome {
-    Enabled,
+    Active,
     Disconnected,
 }
 
@@ -77,6 +77,10 @@ pub enum EventError {
     WrongSize(usize),
     UnknownType(u8),
     UnsupportedSetup(SetupPacket),
+    StallSetup {
+        setup: SetupPacket,
+        source: std::io::Error,
+    },
     EventLimit(usize),
 }
 
@@ -89,10 +93,16 @@ impl fmt::Display for EventError {
             Self::UnsupportedSetup(setup) => {
                 write!(formatter, "unsupported FunctionFS SETUP request {setup:?}")
             }
+            Self::StallSetup { setup, source } => {
+                write!(
+                    formatter,
+                    "stalling unsupported FunctionFS SETUP request {setup:?} failed: {source}"
+                )
+            }
             Self::EventLimit(limit) => {
                 write!(
                     formatter,
-                    "FunctionFS ENABLE not received within {limit} events"
+                    "FunctionFS active state not received within {limit} events"
                 )
             }
         }
@@ -102,38 +112,43 @@ impl fmt::Display for EventError {
 impl std::error::Error for EventError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(error) => Some(error),
+            Self::Io(error) | Self::StallSetup { source: error, .. } => Some(error),
             _ => None,
         }
     }
 }
 
-/// Wait for ENABLE using one fixed-size ABI record at a time. No event-provided
-/// length controls allocation, and the loop has a hard event-count bound.
-pub fn wait_for_enable<R: Read>(reader: &mut R) -> Result<WaitOutcome, EventError> {
-    wait_for_enable_bounded(reader, MAX_EVENTS_BEFORE_ENABLE)
+/// Wait until FunctionFS can serve data endpoints using one fixed-size ABI
+/// record at a time. A fresh configuration reports ENABLE; a bus-suspended
+/// configuration reports RESUME without necessarily emitting another ENABLE.
+/// No event-provided length controls allocation, and the loop is bounded.
+pub fn wait_for_active<R: Read>(reader: &mut R) -> Result<WaitOutcome, EventError> {
+    wait_for_active_bounded(reader, MAX_EVENTS_BEFORE_ACTIVE)
 }
 
-pub(crate) fn wait_for_enable_bounded<R: Read>(
+pub(crate) fn wait_for_active_bounded<R: Read>(
     reader: &mut R,
     max_events: usize,
 ) -> Result<WaitOutcome, EventError> {
-    let mut bytes = [0_u8; EVENT_SIZE];
     for _ in 0..max_events {
-        match reader.read_exact(&mut bytes) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(WaitOutcome::Disconnected);
-            }
-            Err(error) => return Err(EventError::Io(error)),
-        }
-        let event = Event::parse(&bytes)?;
+        let Some(event) = read_event(reader)? else {
+            return Ok(WaitOutcome::Disconnected);
+        };
         match event.kind {
-            EventKind::Enable => return Ok(WaitOutcome::Enabled),
+            EventKind::Enable | EventKind::Resume => return Ok(WaitOutcome::Active),
             EventKind::Unbind => return Ok(WaitOutcome::Disconnected),
             EventKind::Setup => return Err(EventError::UnsupportedSetup(event.setup)),
-            EventKind::Bind | EventKind::Disable | EventKind::Suspend | EventKind::Resume => {}
+            EventKind::Bind | EventKind::Disable | EventKind::Suspend => {}
         }
     }
     Err(EventError::EventLimit(max_events))
+}
+
+pub(crate) fn read_event<R: Read>(reader: &mut R) -> Result<Option<Event>, EventError> {
+    let mut bytes = [0_u8; EVENT_SIZE];
+    match reader.read_exact(&mut bytes) {
+        Ok(()) => Event::parse(&bytes).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(error) => Err(EventError::Io(error)),
+    }
 }

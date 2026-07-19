@@ -11,7 +11,7 @@ use kindlebridge_wire::{Command, DecodeLimits, Frame, Header, WireError, HEADER_
 
 use crate::{
     descriptor_bytes,
-    event::{wait_for_enable_bounded, EventError},
+    event::{wait_for_active_bounded, EventError},
     probe::{
         buffer_functionfs_reader, receive_expected, write_control_block, ResynchronizingReader,
         MAX_RESYNCHRONIZE_BYTES,
@@ -20,6 +20,8 @@ use crate::{
     SetupPacket, WaitOutcome, DESCRIPTOR_LENGTH, EVENT_SIZE, MAX_FRAME_COUNT, MAX_FUNCTIONFS_IO,
     MAX_PAYLOAD, STRING_LENGTH,
 };
+
+use crate::probe::{classify_control_event, ControlAction};
 
 const GOLDEN_DESCRIPTORS: [u8; DESCRIPTOR_LENGTH] = [
     0x03, 0x00, 0x00, 0x00, // magic v2
@@ -135,31 +137,60 @@ fn event_parser_matches_fixed_twelve_byte_abi() {
 }
 
 #[test]
-fn enable_wait_is_fixed_buffered_and_event_bounded() {
+fn activation_wait_is_fixed_buffered_event_bounded_and_resume_aware() {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&event(EventKind::Bind));
     bytes.extend_from_slice(&event(EventKind::Disable));
     bytes.extend_from_slice(&event(EventKind::Enable));
     assert_eq!(
-        wait_for_enable_bounded(&mut Cursor::new(bytes), 3).unwrap(),
-        WaitOutcome::Enabled
+        wait_for_active_bounded(&mut Cursor::new(bytes), 3).unwrap(),
+        WaitOutcome::Active
+    );
+
+    let mut resumed = Vec::new();
+    resumed.extend_from_slice(&event(EventKind::Suspend));
+    resumed.extend_from_slice(&event(EventKind::Resume));
+    assert_eq!(
+        wait_for_active_bounded(&mut Cursor::new(resumed), 2).unwrap(),
+        WaitOutcome::Active
     );
 
     let mut only_bind = Vec::new();
     only_bind.extend_from_slice(&event(EventKind::Bind));
     only_bind.extend_from_slice(&event(EventKind::Bind));
     assert!(matches!(
-        wait_for_enable_bounded(&mut Cursor::new(only_bind), 2),
+        wait_for_active_bounded(&mut Cursor::new(only_bind), 2),
         Err(EventError::EventLimit(2))
     ));
 
     assert_eq!(
-        wait_for_enable_bounded(&mut Cursor::new(event(EventKind::Unbind)), 1).unwrap(),
+        wait_for_active_bounded(&mut Cursor::new(event(EventKind::Unbind)), 1).unwrap(),
         WaitOutcome::Disconnected
     );
     assert_eq!(
-        wait_for_enable_bounded(&mut Cursor::new(Vec::<u8>::new()), 1).unwrap(),
+        wait_for_active_bounded(&mut Cursor::new(Vec::<u8>::new()), 1).unwrap(),
         WaitOutcome::Disconnected
+    );
+}
+
+#[test]
+fn active_control_event_classification_does_not_confuse_setup_with_disconnect() {
+    let setup = Event::parse(&event(EventKind::Setup)).unwrap();
+    assert!(matches!(
+        classify_control_event(setup),
+        ControlAction::Stall(_)
+    ));
+    assert_eq!(
+        classify_control_event(Event::parse(&event(EventKind::Suspend)).unwrap()),
+        ControlAction::Inactive
+    );
+    assert_eq!(
+        classify_control_event(Event::parse(&event(EventKind::Resume)).unwrap()),
+        ControlAction::Active
+    );
+    assert_eq!(
+        classify_control_event(Event::parse(&event(EventKind::Unbind)).unwrap()),
+        ControlAction::Disconnected
     );
 }
 
@@ -170,7 +201,7 @@ fn setup_event_is_rejected_without_unbounded_control_transfer() {
     bytes[1] = 0x55;
     bytes[6..8].copy_from_slice(&0xffff_u16.to_le_bytes());
     assert!(matches!(
-        wait_for_enable_bounded(&mut Cursor::new(bytes), 1),
+        wait_for_active_bounded(&mut Cursor::new(bytes), 1),
         Err(EventError::UnsupportedSetup(SetupPacket {
             request_type: 0x40,
             request: 0x55,
