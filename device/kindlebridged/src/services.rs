@@ -157,8 +157,9 @@ pub fn log_tail(log_path: &Path, params: &LogTailParams) -> Result<LogSnapshot, 
     }
 
     let lines = log_lines(&bytes[discarded_prefix..], oldest_cursor);
+    let published_end = lines.last().map_or(oldest_cursor, |line| line.end);
     if let Some(cursor) = requested_cursor {
-        let is_boundary = cursor == file_length || lines.iter().any(|line| line.start == cursor);
+        let is_boundary = cursor == published_end || lines.iter().any(|line| line.start == cursor);
         if !is_boundary {
             return Err(RpcError::invalid_params(
                 "cursor must identify the beginning of a log entry",
@@ -185,7 +186,10 @@ pub fn log_tail(log_path: &Path, params: &LogTailParams) -> Result<LogSnapshot, 
     let next_cursor = lines
         .get(end_index.saturating_sub(1))
         .filter(|_| end_index > start_index)
-        .map_or_else(|| requested_cursor.unwrap_or(file_length), |line| line.end);
+        .map_or_else(
+            || requested_cursor.unwrap_or(published_end),
+            |line| line.end,
+        );
     Ok(LogSnapshot {
         entries,
         next_cursor,
@@ -204,10 +208,13 @@ fn log_lines(bytes: &[u8], base: u64) -> Vec<LogLine<'_>> {
     let mut offset = 0_usize;
     while offset < bytes.len() {
         let remaining = &bytes[offset..];
-        let length = remaining
+        let Some(length) = remaining
             .iter()
             .position(|byte| *byte == b'\n')
-            .map_or(remaining.len(), |index| index + 1);
+            .map(|index| index + 1)
+        else {
+            break;
+        };
         let raw = &remaining[..length];
         let message = raw.strip_suffix(b"\n").unwrap_or(raw);
         let message = message.strip_suffix(b"\r").unwrap_or(message);
@@ -486,5 +493,39 @@ mod tests {
         assert_eq!(second.entries[0].message, "three");
         assert_eq!(second.next_cursor, 14);
         assert!(!second.has_more);
+    }
+
+    #[test]
+    fn log_tail_does_not_publish_an_unterminated_line_or_advance_past_it() {
+        let directory = TestDirectory::new("log-partial-line");
+        let path = directory.0.join("usb.log");
+        fs::write(&path, b"one\npartial").unwrap();
+
+        let first = log_tail(
+            &path,
+            &LogTailParams {
+                serial: "TEST".to_owned(),
+                cursor: Some(0),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0].message, "one");
+        assert_eq!(first.next_cursor, 4);
+
+        fs::write(&path, b"one\npartial line\n").unwrap();
+        let second = log_tail(
+            &path,
+            &LogTailParams {
+                serial: "TEST".to_owned(),
+                cursor: Some(first.next_cursor),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.entries[0].message, "partial line");
+        assert_eq!(second.next_cursor, 17);
     }
 }
