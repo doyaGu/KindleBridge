@@ -70,7 +70,9 @@ struct RunningChild {
     id: u64,
     slot: Slot,
     started_ms: u64,
+    last_poll_ms: u64,
     instance: String,
+    last_heartbeat_timestamp_ms: Option<u64>,
     first_heartbeat_ms: Option<u64>,
     last_valid_heartbeat_ms: Option<u64>,
     healthy: bool,
@@ -218,7 +220,9 @@ impl<R: ChildRunner, C: Clock, D: DisableFlag> Launcher<R, C, D> {
             id: child_id,
             slot: active,
             started_ms: now,
+            last_poll_ms: now,
             instance,
+            last_heartbeat_timestamp_ms: None,
             first_heartbeat_ms: None,
             last_valid_heartbeat_ms: None,
             healthy: false,
@@ -262,24 +266,32 @@ impl<R: ChildRunner, C: Clock, D: DisableFlag> Launcher<R, C, D> {
             ChildStatus::Exited { .. } => self.record_failure(running, &manifest),
             ChildStatus::Running => {
                 let now = self.clock.now_ms();
-                let heartbeat = read_heartbeat(&self.root, &manifest.heartbeat)?;
-                let valid = heartbeat.as_ref().is_some_and(|heartbeat| {
-                    heartbeat.instance == running.instance
-                        && heartbeat.timestamp_ms >= running.started_ms
-                        && heartbeat.timestamp_ms <= now
-                });
-                if valid {
-                    let heartbeat = heartbeat.expect("valid heartbeat is present");
-                    if now.saturating_sub(heartbeat.timestamp_ms) > manifest.heartbeat_timeout_ms {
-                        eprintln!(
-                            "kindlebridge-launcher: slot {} heartbeat is {} ms old (limit {} ms); restarting daemon",
-                            running.slot,
-                            now.saturating_sub(heartbeat.timestamp_ms),
-                            manifest.heartbeat_timeout_ms
-                        );
-                        self.runner.terminate(running.id)?;
-                        return self.record_failure(running, &manifest);
+                let poll_gap = now.saturating_sub(running.last_poll_ms);
+                let clock_went_backward = now < running.last_poll_ms;
+                let clock_discontinuity = clock_went_backward
+                    || (running.healthy && poll_gap > manifest.heartbeat_timeout_ms);
+                running.last_poll_ms = now;
+                if clock_discontinuity {
+                    eprintln!(
+                        "kindlebridge-launcher: watchdog clock changed by {poll_gap} ms; allowing heartbeat recovery"
+                    );
+                    if running.healthy {
+                        running.last_valid_heartbeat_ms = Some(now);
+                    } else {
+                        running.started_ms = now;
+                        running.last_heartbeat_timestamp_ms = None;
+                        running.first_heartbeat_ms = None;
+                        running.last_valid_heartbeat_ms = None;
                     }
+                }
+                let heartbeat = read_heartbeat(&self.root, &manifest.heartbeat)?;
+                let heartbeat_advanced = heartbeat.as_ref().is_some_and(|heartbeat| {
+                    heartbeat.instance == running.instance
+                        && running.last_heartbeat_timestamp_ms != Some(heartbeat.timestamp_ms)
+                });
+                if heartbeat_advanced {
+                    let heartbeat = heartbeat.expect("advanced heartbeat is present");
+                    running.last_heartbeat_timestamp_ms = Some(heartbeat.timestamp_ms);
                     running.last_valid_heartbeat_ms = Some(now);
                     let first = *running.first_heartbeat_ms.get_or_insert(now);
                     if now.saturating_sub(first) >= manifest.healthy_after_ms {
@@ -805,6 +817,94 @@ mod tests {
         assert!(launcher.runner_mut().terminated.is_empty());
 
         clock.advance(901);
+        assert!(matches!(
+            launcher.step().unwrap(),
+            StepOutcome::BackingOff { .. }
+        ));
+        assert_eq!(launcher.runner_mut().terminated, vec![1]);
+    }
+
+    #[test]
+    fn healthy_child_gets_one_heartbeat_window_after_a_large_clock_jump() {
+        let directory = setup_root("resume-clock-jump");
+        let clock = MockClock::default();
+        let mut launcher = launcher(&directory.0, clock.clone(), MockDisable::default());
+        launcher.step().unwrap();
+        let request = launcher.runner_mut().requests[0].clone();
+
+        fs::write(
+            &request.heartbeat,
+            encode_heartbeat(&request.instance, clock.now_ms()),
+        )
+        .unwrap();
+        launcher.step().unwrap();
+        clock.advance(3001);
+        fs::write(
+            &request.heartbeat,
+            encode_heartbeat(&request.instance, clock.now_ms()),
+        )
+        .unwrap();
+        assert!(matches!(
+            launcher.step().unwrap(),
+            StepOutcome::Healthy { .. }
+        ));
+
+        // The KT6 can resume the launcher before the daemon heartbeat thread.
+        // A multi-hour wall-clock jump must allow one normal heartbeat window
+        // rather than killing the healthy FunctionFS owner immediately.
+        clock.advance(26_538_782);
+        assert!(matches!(
+            launcher.step().unwrap(),
+            StepOutcome::Healthy { .. }
+        ));
+        assert!(launcher.runner_mut().terminated.is_empty());
+
+        clock.advance(100);
+        fs::write(
+            &request.heartbeat,
+            encode_heartbeat(&request.instance, clock.now_ms()),
+        )
+        .unwrap();
+        assert!(matches!(
+            launcher.step().unwrap(),
+            StepOutcome::Healthy { .. }
+        ));
+        assert!(launcher.runner_mut().terminated.is_empty());
+    }
+
+    #[test]
+    fn resume_grace_does_not_hide_sustained_heartbeat_loss() {
+        let directory = setup_root("resume-heartbeat-loss");
+        let clock = MockClock::default();
+        let mut launcher = launcher(&directory.0, clock.clone(), MockDisable::default());
+        launcher.step().unwrap();
+        let request = launcher.runner_mut().requests[0].clone();
+
+        fs::write(
+            &request.heartbeat,
+            encode_heartbeat(&request.instance, clock.now_ms()),
+        )
+        .unwrap();
+        launcher.step().unwrap();
+        clock.advance(3001);
+        fs::write(
+            &request.heartbeat,
+            encode_heartbeat(&request.instance, clock.now_ms()),
+        )
+        .unwrap();
+        launcher.step().unwrap();
+
+        clock.advance(26_538_782);
+        assert!(matches!(
+            launcher.step().unwrap(),
+            StepOutcome::Healthy { .. }
+        ));
+        clock.advance(900);
+        assert!(matches!(
+            launcher.step().unwrap(),
+            StepOutcome::Healthy { .. }
+        ));
+        clock.advance(101);
         assert!(matches!(
             launcher.step().unwrap(),
             StepOutcome::BackingOff { .. }
