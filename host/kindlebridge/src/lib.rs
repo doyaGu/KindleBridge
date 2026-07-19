@@ -1252,6 +1252,11 @@ mod tests {
 
     #[test]
     fn sync_rpc_carries_paths_and_never_file_bytes() {
+        let local_path = std::env::current_dir()
+            .unwrap()
+            .join("payload.bin")
+            .to_string_lossy()
+            .into_owned();
         let mut caller = RecordingCaller {
             calls: Vec::new(),
             replies: VecDeque::from([json!({
@@ -1265,7 +1270,7 @@ mod tests {
             &TopLevelCommand::Sync(SyncArgs {
                 command: SyncCommand::Push {
                     serial: "KT6-TEST".to_owned(),
-                    local_path: "C:\\payload.bin".to_owned(),
+                    local_path: local_path.clone(),
                     remote_path: "apps/payload.bin".to_owned(),
                     block_size: 65_536,
                     resume: None,
@@ -1275,7 +1280,7 @@ mod tests {
         )
         .unwrap();
         let params = caller.calls[0].1.as_ref().unwrap();
-        assert_eq!(params["local_path"], "C:\\payload.bin");
+        assert_eq!(params["local_path"], local_path);
         assert_eq!(params["remote_path"], "apps/payload.bin");
         assert!(params.get("data_base64").is_none());
         assert!(params.get("block_hash").is_none());
