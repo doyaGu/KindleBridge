@@ -74,6 +74,7 @@ setup_case() {
     CASE_ROOT="$RUN_ROOT/$name"
     export KINDLEBRIDGE_TEST_ROOT="$CASE_ROOT"
     export KINDLEBRIDGE_MNT_US_ROOT="$CASE_ROOT/mnt/us"
+    export KINDLEBRIDGE_BASE_US_ROOT="$CASE_ROOT/mnt/base-us"
     export KINDLEBRIDGE_VAR_LOCAL_ROOT="$CASE_ROOT/var/local"
     export KINDLEBRIDGE_SYS_ROOT="$CASE_ROOT/sys"
     export KINDLEBRIDGE_PROC_ROOT="$CASE_ROOT/proc"
@@ -83,10 +84,12 @@ setup_case() {
     export KINDLEBRIDGE_TEST_ALLOW_MTP_DIRECTORY=1
     unset KINDLEBRIDGE_TEST_MOUNT_FAIL KINDLEBRIDGE_TEST_REAL_SLEEP
     unset KINDLEBRIDGE_TEST_BIND_STOCK_MTP
+    unset KINDLEBRIDGE_TEST_SUPERVISOR_RACE KINDLEBRIDGE_TEST_AFTER_UNBIND_DELAY
 
     mkdir -p \
         "$CASE_ROOT/bin" \
         "$CASE_ROOT/lipc" \
+        "$CASE_ROOT/mnt/base-us" \
         "$CASE_ROOT/mnt/us/kindlebridge/bin" \
         "$CASE_ROOT/mnt/us/kindlebridge/runtime/slots/A/bin" \
         "$CASE_ROOT/mnt/us/kindlebridge/runtime/slots/B/bin" \
@@ -148,6 +151,16 @@ remember_daemon() {
     done
 }
 
+assert_daemon_sync_root() {
+    expected=$1
+    daemon_pid=$(cat "$CASE_ROOT/mnt/us/kindlebridge/runtime/run/daemon.pid")
+    actual=$(tr '\000' '\n' <"/proc/$daemon_pid/cmdline" | awk '
+        previous == "--sync-root" { print; exit }
+        { previous=$0 }
+    ')
+    assert_equal "$expected" "$actual" 'daemon received the wrong sync root'
+}
+
 ORIGINAL_PATH=$PATH
 mkdir -p "$RUN_ROOT"
 
@@ -195,6 +208,7 @@ setup_case no_speculative_poll
 run_manager "$CASE_ROOT/output" start 0
 test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/output" >&2; fail 'stock MTP to bridge start failed'; }
 remember_daemon
+assert_daemon_sync_root "$CASE_ROOT/mnt/us/kindlebridge-data"
 pre_request_sleeps=$(awk '
     /^lipc-set useUsbForNetwork 1$/ { print count + 0; found=1; exit }
     /^sleep 1$/ { count++ }
@@ -202,6 +216,17 @@ pre_request_sleeps=$(awk '
 ' "$CASE_ROOT/trace" | head -n 1)
 assert_equal 0 "$pre_request_sleeps" 'start polled for a network state it had not requested'
 pass 'stock handoff starts without a speculative 15-second poll'
+
+setup_case direct_fsp_backing_store
+printf 'fsp %s fuse.fsp rw,nosuid,nodev,noatime 0 0\n' "$CASE_ROOT/mnt/us" \
+    >"$CASE_ROOT/proc/mounts"
+printf '/dev/loop/0 %s ext4 rw,relatime,data=ordered 0 0\n' "$CASE_ROOT/mnt/base-us" \
+    >>"$CASE_ROOT/proc/mounts"
+run_manager "$CASE_ROOT/output" start 0
+test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/output" >&2; fail 'FSP backing-store start failed'; }
+remember_daemon
+assert_daemon_sync_root "$CASE_ROOT/mnt/base-us/kindlebridge-data"
+pass 'FSP userstore uses its direct backing store for sync'
 
 setup_case existing_stock_network
 printf '%s\n' 1 >"$CASE_ROOT/lipc/volumd.useUsbForNetwork"
@@ -281,6 +306,51 @@ assert_before '^hal-event usbUnconfigured$' '^hal-event usbPlugOut$' \
     "$CASE_ROOT/trace" 'stock handback sent usbPlugOut out of order'
 pass 'stock MTP to bridge to stock MTP lifecycle'
 
+setup_case idempotent_actions
+run_manager "$CASE_ROOT/start-output" start 0
+test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/start-output" >&2; fail 'idempotent start setup failed'; }
+remember_daemon
+printf '%s' '' >"$CASE_ROOT/trace"
+run_manager "$CASE_ROOT/repeated-start-output" start 0
+test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/repeated-start-output" >&2; fail 'repeated start failed'; }
+grep -q 'already active' "$CASE_ROOT/repeated-start-output" ||
+    fail 'repeated start did not explain the existing state'
+assert_file_empty "$CASE_ROOT/trace" 'repeated start mutated an active bridge'
+run_manager "$CASE_ROOT/stop-output" stop
+test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/stop-output" >&2; fail 'idempotent stop setup failed'; }
+printf '%s' '' >"$CASE_ROOT/trace"
+run_manager "$CASE_ROOT/repeated-stop-output" stop
+test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/repeated-stop-output" >&2; fail 'repeated stop failed'; }
+grep -q 'already inactive' "$CASE_ROOT/repeated-stop-output" ||
+    fail 'repeated stop did not explain the existing state'
+assert_file_empty "$CASE_ROOT/trace" 'repeated stop mutated an inactive bridge'
+pass 'start and stop are safe to repeat'
+
+setup_case supervised_stop_race
+export KINDLEBRIDGE_TEST_SUPERVISOR_RACE=1
+export KINDLEBRIDGE_TEST_AFTER_UNBIND_DELAY=1
+run_manager "$CASE_ROOT/start-output" start 0
+test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/start-output" >&2; fail 'supervised-stop setup failed'; }
+remember_daemon
+run_manager "$CASE_ROOT/stop-output" stop
+test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/stop-output" >&2; fail 'supervised stop failed'; }
+test ! -f "$CASE_ROOT/mnt/us/kindlebridge/runtime/launcher/watchdog-state" ||
+    fail 'controlled stop was recorded as daemon crashes and halted the next start'
+pass 'controlled stop cannot trip the persistent launcher crash fuse'
+
+setup_case manual_retry
+mkdir -p "$CASE_ROOT/mnt/us/kindlebridge/runtime/launcher"
+printf 'KINDLEBRIDGE_WATCHDOG_V1\nslot=A\ncrashes=3\nnext_start_ms=1\nhalted=1\n' \
+    >"$CASE_ROOT/mnt/us/kindlebridge/runtime/launcher/watchdog-state"
+run_manager "$CASE_ROOT/start-output" start 0
+test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/start-output" >&2; fail 'manual retry stayed fused'; }
+remember_daemon
+test ! -f "$CASE_ROOT/mnt/us/kindlebridge/runtime/launcher/watchdog-state" ||
+    fail 'manual retry did not clear the previous crash fuse'
+run_manager "$CASE_ROOT/stop-output" stop
+test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/stop-output" >&2; fail 'manual retry cleanup failed'; }
+pass 'manual start clears a previous launcher crash fuse'
+
 setup_case connected_stop
 run_manager "$CASE_ROOT/start-output" start 0
 test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/start-output" >&2; fail 'connected-stop setup failed'; }
@@ -311,6 +381,65 @@ assert_equal detached "$(sed -n '1p' "$CASE_ROOT/status-output")" \
 run_manager "$CASE_ROOT/cleanup-output" stop
 test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/cleanup-output" >&2; fail 'detached-status cleanup failed'; }
 pass 'status reports a detached UDC instead of a false active state'
+
+setup_case pid_ownership
+mkdir -p "$CASE_ROOT/unrelated" "$CASE_ROOT/var/local/kindlebridge/usb"
+cp "$FIXTURES/same-name-launcher" "$CASE_ROOT/unrelated/kindlebridge-launcher"
+chmod 0755 "$CASE_ROOT/unrelated/kindlebridge-launcher"
+export KINDLEBRIDGE_TEST_SIGNAL_MARKER="$CASE_ROOT/unrelated/signal-received"
+"$CASE_ROOT/unrelated/kindlebridge-launcher" &
+unrelated_pid=$!
+PIDS="$PIDS $unrelated_pid"
+export KINDLEBRIDGE_PID_PROC_ROOT="$CASE_ROOT/pid-proc"
+mkdir -p "$KINDLEBRIDGE_PID_PROC_ROOT/$unrelated_pid"
+printf '%s\0' "$CASE_ROOT/unrelated/kindlebridge-launcher" \
+    >"$KINDLEBRIDGE_PID_PROC_ROOT/$unrelated_pid/cmdline"
+printf '%s\n' test-boot-id >"$CASE_ROOT/var/local/kindlebridge/usb/boot_id"
+printf '%s\n' active >"$CASE_ROOT/var/local/kindlebridge/usb/mode"
+printf '%s\n' 11211000.usb >"$CASE_ROOT/var/local/kindlebridge/usb/udc"
+printf '%s\n' "$unrelated_pid" >"$CASE_ROOT/var/local/kindlebridge/usb/launcher_pid"
+run_manager "$CASE_ROOT/output" stop
+test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/output" >&2; fail 'PID ownership cleanup failed'; }
+attempts=20
+while test "$attempts" -gt 0 && test ! -e "$KINDLEBRIDGE_TEST_SIGNAL_MARKER"; do
+    /usr/bin/sleep 0.05
+    attempts=$((attempts - 1))
+done
+test ! -e "$KINDLEBRIDGE_TEST_SIGNAL_MARKER" ||
+    fail 'manager signalled a same-named process outside the active runtime'
+kill "$unrelated_pid" 2>/dev/null || true
+wait "$unrelated_pid" 2>/dev/null || true
+pass 'cleanup verifies process ownership before sending signals'
+
+setup_case pid_argv_ownership
+mkdir -p "$CASE_ROOT/unrelated" "$CASE_ROOT/var/local/kindlebridge/usb"
+cp "$FIXTURES/same-name-launcher" "$CASE_ROOT/unrelated/unrelated-process"
+chmod 0755 "$CASE_ROOT/unrelated/unrelated-process"
+export KINDLEBRIDGE_TEST_SIGNAL_MARKER="$CASE_ROOT/unrelated/signal-received"
+"$CASE_ROOT/unrelated/unrelated-process" &
+unrelated_pid=$!
+PIDS="$PIDS $unrelated_pid"
+export KINDLEBRIDGE_PID_PROC_ROOT="$CASE_ROOT/pid-proc"
+mkdir -p "$KINDLEBRIDGE_PID_PROC_ROOT/$unrelated_pid"
+printf '%s\0%s\0' "$CASE_ROOT/unrelated/unrelated-process" \
+    "$CASE_ROOT/mnt/us/kindlebridge/bin/kindlebridge-launcher" \
+    >"$KINDLEBRIDGE_PID_PROC_ROOT/$unrelated_pid/cmdline"
+printf '%s\n' test-boot-id >"$CASE_ROOT/var/local/kindlebridge/usb/boot_id"
+printf '%s\n' active >"$CASE_ROOT/var/local/kindlebridge/usb/mode"
+printf '%s\n' 11211000.usb >"$CASE_ROOT/var/local/kindlebridge/usb/udc"
+printf '%s\n' "$unrelated_pid" >"$CASE_ROOT/var/local/kindlebridge/usb/launcher_pid"
+run_manager "$CASE_ROOT/output" stop
+test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/output" >&2; fail 'PID argv ownership cleanup failed'; }
+attempts=20
+while test "$attempts" -gt 0 && test ! -e "$KINDLEBRIDGE_TEST_SIGNAL_MARKER"; do
+    /usr/bin/sleep 0.05
+    attempts=$((attempts - 1))
+done
+test ! -e "$KINDLEBRIDGE_TEST_SIGNAL_MARKER" ||
+    fail 'manager treated a command argument as the managed executable'
+kill "$unrelated_pid" 2>/dev/null || true
+wait "$unrelated_pid" 2>/dev/null || true
+pass 'cleanup matches the managed executable rather than arbitrary arguments'
 
 setup_case staged_apply
 run_manager "$CASE_ROOT/start-output" start 0
@@ -367,6 +496,8 @@ exitmenu_count=$(grep -c '"exitmenu": false' "$KUAL_MENU")
 assert_equal 4 "$exitmenu_count" 'not every KUAL action preserves the menu'
 grep -q 'start 0' "$KUAL_WRAPPER" || fail 'KUAL start still has a safety timeout'
 grep -q 'apply-staged' "$KUAL_WRAPPER" || fail 'KUAL has no offline staged activation action'
+grep -q 'E-LAUNCH' "$KUAL_WRAPPER" || fail 'KUAL launcher failures do not fit on screen as a short code'
+grep -q 'last-error.log' "$KUAL_WRAPPER" || fail 'KUAL does not preserve the full failure detail'
 if grep -q 'nohup' "$KUAL_WRAPPER"; then
     fail 'KUAL wrapper hides transition output in a detached process'
 fi

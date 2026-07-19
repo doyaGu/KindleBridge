@@ -25,14 +25,34 @@ shift
 slot=$(cat "$root/current")
 daemon="$root/slots/$slot/bin/kindlebridged"
 mkdir -p "$root/run"
-"$daemon" "$@" &
-child=$!
-rm -f "$root/run/heartbeat"
-if test "${KINDLEBRIDGE_TEST_NO_HEARTBEAT:-0}" != 1; then
-    printf 'KINDLEBRIDGE_HEARTBEAT_V1\ninstance=test-%s-%s\ntimestamp_ms=0\n' "$$" "$child" \
-        >"$root/run/heartbeat"
-    rm -f "$root/launcher/pending-slot"
+
+start_child() {
+    "$daemon" "$@" &
+    child=$!
+    rm -f "$root/run/heartbeat"
+    if test "${KINDLEBRIDGE_TEST_NO_HEARTBEAT:-0}" != 1; then
+        printf 'KINDLEBRIDGE_HEARTBEAT_V1\ninstance=test-%s-%s\ntimestamp_ms=0\n' "$$" "$child" \
+            >"$root/run/heartbeat"
+        rm -f "$root/launcher/pending-slot"
+    fi
+    printf '%s\n' "$child" >"$root/run/daemon.pid"
+}
+
+start_child "$@"
+if test "${KINDLEBRIDGE_TEST_SUPERVISOR_RACE:-0}" = 1; then
+    crashes=0
+    while :; do
+        wait "$child" 2>/dev/null || true
+        crashes=$((crashes + 1))
+        mkdir -p "$root/launcher"
+        halted=0
+        test "$crashes" -lt 3 || halted=1
+        printf 'KINDLEBRIDGE_WATCHDOG_V1\nslot=%s\ncrashes=%s\nnext_start_ms=0\nhalted=%s\n' \
+            "$slot" "$crashes" "$halted" >"$root/launcher/watchdog-state"
+        test "$halted" = 0 || exit 1
+        start_child "$@"
+    done
+else
+    trap 'kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 0' HUP INT TERM
+    wait "$child"
 fi
-printf '%s\n' "$child" >"$root/run/daemon.pid"
-trap 'kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 0' HUP INT TERM
-wait "$child"

@@ -5,6 +5,7 @@
 set -eu
 
 MNT_US_ROOT=${KINDLEBRIDGE_MNT_US_ROOT:-/mnt/us}
+BASE_US_ROOT=${KINDLEBRIDGE_BASE_US_ROOT:-/mnt/base-us}
 VAR_LOCAL_ROOT=${KINDLEBRIDGE_VAR_LOCAL_ROOT:-/var/local}
 SYS_ROOT=${KINDLEBRIDGE_SYS_ROOT:-/sys}
 PROC_ROOT=${KINDLEBRIDGE_PROC_ROOT:-/proc}
@@ -47,6 +48,62 @@ pid_is() {
     grep -q "$pattern" "$PID_PROC_ROOT/$pid/cmdline" 2>/dev/null
 }
 
+pid_entrypoint() {
+    pid=$1
+    test -n "$pid" || return 1
+    test -r "$PID_PROC_ROOT/$pid/cmdline" || return 1
+    executable=$(tr '\000' '\n' <"$PID_PROC_ROOT/$pid/cmdline" 2>/dev/null | sed -n '1p')
+    case "$executable" in
+        */sh | */bash)
+            tr '\000' '\n' <"$PID_PROC_ROOT/$pid/cmdline" 2>/dev/null | sed -n '2p'
+            ;;
+        *) printf '%s\n' "$executable" ;;
+    esac
+}
+
+launcher_pid_is_owned() {
+    test "$(pid_entrypoint "$1")" = "$LAUNCHER"
+}
+
+daemon_pid_is_owned() {
+    entrypoint=$(pid_entrypoint "$1") || return 1
+    case "$entrypoint" in
+        "$RUNTIME"/slots/*/kindlebridged) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+owned_pid_is() {
+    role=$1
+    pid=$2
+    case "$role" in
+        launcher) launcher_pid_is_owned "$pid" ;;
+        daemon) daemon_pid_is_owned "$pid" ;;
+        *) return 1 ;;
+    esac
+}
+
+terminate_owned_pid() {
+    role=$1
+    pid=$2
+    owned_pid_is "$role" "$pid" || return 0
+    kill "$pid" 2>/dev/null || true
+    attempts=5
+    while test "$attempts" -gt 0 && owned_pid_is "$role" "$pid"; do
+        sleep 1
+        attempts=$((attempts - 1))
+    done
+    if owned_pid_is "$role" "$pid"; then
+        log "$role process $pid ignored TERM; sending KILL"
+        kill -9 "$pid" 2>/dev/null || true
+        sleep 1
+    fi
+    if owned_pid_is "$role" "$pid"; then
+        log "$role process $pid did not exit"
+        return 1
+    fi
+}
+
 current_daemon_pid() {
     cat "$DAEMON_PID_FILE" 2>/dev/null || read_state daemon_pid ''
 }
@@ -56,11 +113,11 @@ wait_for_daemon() {
     attempts=10
     while test "$attempts" -gt 0; do
         daemon_pid=$(current_daemon_pid)
-        if pid_is "$daemon_pid" 'kindlebridged'; then
+        if daemon_pid_is_owned "$daemon_pid"; then
             printf '%s\n' "$daemon_pid"
             return 0
         fi
-        pid_is "$launcher_pid" 'kindlebridge-launcher' || return 1
+        launcher_pid_is_owned "$launcher_pid" || return 1
         attempts=$((attempts - 1))
         test "$attempts" -eq 0 || sleep 1
     done
@@ -81,23 +138,39 @@ wait_for_active_daemon_ready() {
         launcher_pid=$(read_state launcher_pid '')
         daemon_pid=$(current_daemon_pid)
         instance=$(heartbeat_instance)
-        if pid_is "$daemon_pid" 'kindlebridged' &&
+        if daemon_pid_is_owned "$daemon_pid" &&
             test -n "$instance" && test "$instance" != "$previous_instance" &&
             test ! -f "$RUNTIME/launcher/pending-slot"; then
             printf '%s\n' "$daemon_pid" >"$STATE/daemon_pid"
             return 0
         fi
-        pid_is "$launcher_pid" 'kindlebridge-launcher' || return 1
+        launcher_pid_is_owned "$launcher_pid" || return 1
         attempts=$((attempts - 1))
         test "$attempts" -eq 0 || sleep 1
     done
     return 1
 }
 
+select_sync_root() {
+    SYNC_ROOT="$MNT_US_ROOT/kindlebridge-data"
+    # Recent Kindle firmware exposes user storage through the `fsp` FUSE
+    # daemon. Its 64 KiB max_write path is useful for stock content handling
+    # but needlessly CPU-bounds development transfers. Use the same storage's
+    # mounted ext4 backing directory when both sides of that layout are
+    # positively identified; older and future layouts keep the public path.
+    if test -d "$BASE_US_ROOT" &&
+        grep -Fqs " $MNT_US_ROOT fuse.fsp " "$MOUNTS_FILE" &&
+        grep -Fqs " $BASE_US_ROOT " "$MOUNTS_FILE"; then
+        SYNC_ROOT="$BASE_US_ROOT/kindlebridge-data"
+    fi
+}
+
 launch_supervised_daemon() {
     serial=$1
+    select_sync_root
     "$LAUNCHER" run --root "$RUNTIME" -- \
-        serve-usb --functionfs-dir "$MOUNT" --serial "$serial" >>"$LOG" 2>&1 &
+        serve-usb --functionfs-dir "$MOUNT" --serial "$serial" \
+        --sync-root "$SYNC_ROOT" >>"$LOG" 2>&1 &
     launcher_pid=$!
     printf '%s\n' "$launcher_pid" >"$STATE/launcher_pid"
     kill -0 "$launcher_pid" 2>/dev/null || return 1
@@ -305,6 +378,9 @@ unbind_bridge_gadget() {
         log "KindleBridge gadget still reports a bound UDC after unbind"
         return 1
     }
+    if test "${KINDLEBRIDGE_TEST_AFTER_UNBIND_DELAY:-0}" != 0; then
+        sleep "$KINDLEBRIDGE_TEST_AFTER_UNBIND_DELAY"
+    fi
 }
 
 bind_bridge_gadget() {
@@ -324,19 +400,20 @@ bind_bridge_gadget() {
 cleanup_bridge_payload() {
     launcher_pid=$(read_state launcher_pid '')
     daemon_pid=$(current_daemon_pid)
+    # Stop the supervisor before making FunctionFS inactive. Otherwise the
+    # daemon observes the intentional teardown as a crash and the still-live
+    # launcher can respawn it between our PID snapshot and cleanup.
+    terminate_owned_pid launcher "$launcher_pid" || return 1
+    daemon_pid=$(current_daemon_pid)
+    terminate_owned_pid daemon "$daemon_pid" || return 1
     if test -L "$LINK"; then
         unbind_bridge_gadget || return 1
     elif test -e "$LINK"; then
         log "refusing to remove unexpected non-symlink $LINK"
         return 1
     fi
-    if pid_is "$launcher_pid" 'kindlebridge-launcher'; then
-        kill "$launcher_pid" 2>/dev/null || true
-    fi
-    if pid_is "$daemon_pid" 'kindlebridged'; then
-        kill "$daemon_pid" 2>/dev/null || true
-    fi
     rm -f "$DAEMON_PID_FILE"
+    rm -f "$RUNTIME/run/heartbeat" "$RUNTIME/launcher/watchdog-state"
     rm -f "$LINK" 2>/dev/null || { log "failed to remove KindleBridge config link"; return 1; }
     if grep -q " $MOUNT " "$MOUNTS_FILE" 2>/dev/null; then
         umount "$MOUNT" 2>/dev/null || { log "failed to unmount $MOUNT"; return 1; }
@@ -411,6 +488,10 @@ start_bridge() {
         return 2
     fi
     test "$(id -u)" = 0 || { echo "must run as root" >&2; return 1; }
+    if test "$(status 2>/dev/null | sed -n '1p')" = active; then
+        echo "KindleBridge USB is already active"
+        return 0
+    fi
     test ! -e "$DISABLE" || { echo "disabled by $DISABLE" >&2; return 1; }
     test -x "$LAUNCHER" || { echo "missing launcher: $LAUNCHER" >&2; return 1; }
     test -f "$RUNTIME/current" || { echo "missing launcher slot pointer" >&2; return 1; }
@@ -424,6 +505,14 @@ start_bridge() {
     test -n "$udc" || udc=$DEFAULT_UDC
     test -d "$UDC_CLASS/$udc" || { echo "USB controller is unavailable: $udc" >&2; return 1; }
     require_unplugged "$udc" 'starting KindleBridge' || return 1
+
+    # A manual Start is an explicit retry boundary. A previous crash fuse must
+    # stop an unattended loop, not permanently block the next user-requested
+    # session after the transport has been repaired.
+    if test ! -d "$STATE"; then
+        rm -f "$RUNTIME/launcher/watchdog-state" "$DAEMON_PID_FILE" \
+            "$RUNTIME/run/heartbeat"
+    fi
 
     mkdir -p "$VAR_LOCAL_ROOT/kindlebridge"
     acquire_lock || { echo "another USB transition is active" >&2; return 1; }
@@ -439,8 +528,8 @@ start_bridge() {
             log "discarding KindleBridge state from an earlier boot"
             clear_state
         elif test "$(read_state mode '')" = active &&
-            pid_is "$launcher_pid" 'kindlebridge-launcher' &&
-            pid_is "$daemon_pid" 'kindlebridged'; then
+            launcher_pid_is_owned "$launcher_pid" &&
+            daemon_pid_is_owned "$daemon_pid"; then
             echo "KindleBridge USB is already active" >&2
             return 1
         else
@@ -493,6 +582,12 @@ start_bridge() {
 }
 
 stop_command() {
+    if test ! -d "$STATE"; then
+        rm -f "$RUNTIME/launcher/watchdog-state" "$DAEMON_PID_FILE" \
+            "$RUNTIME/run/heartbeat"
+        echo "KindleBridge USB is already inactive"
+        return 0
+    fi
     if test -d "$STATE"; then
         udc=$(read_state udc "$DEFAULT_UDC")
         require_unplugged "$udc" 'stopping KindleBridge' || return 1
@@ -515,8 +610,8 @@ status() {
         launcher_pid=$(read_state launcher_pid '')
         daemon_pid=$(current_daemon_pid)
         if test "$(read_state mode '')" = active &&
-            pid_is "$launcher_pid" 'kindlebridge-launcher' &&
-            pid_is "$daemon_pid" 'kindlebridged'; then
+            launcher_pid_is_owned "$launcher_pid" &&
+            daemon_pid_is_owned "$daemon_pid"; then
             udc=$(read_state udc "$DEFAULT_UDC")
             bound=$(cat "$GADGET/UDC" 2>/dev/null || true)
             if test "$bound" != "$udc"; then

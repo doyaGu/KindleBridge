@@ -1,11 +1,11 @@
 {
   "items": [
     {
-      "name": "KindleBridge (development)",
+      "name": "KindleBridge",
       "priority": -1,
       "items": [
         {
-          "name": "Start USB bridge",
+          "name": "Connect for development (USB Bridge)",
           "action": "./bin/kindlebridge.sh",
           "params": "start",
           "exitmenu": false,
@@ -13,7 +13,7 @@
           "status": false
         },
         {
-          "name": "Stop USB bridge / restore",
+          "name": "Use USB file transfer (MTP)",
           "action": "./bin/kindlebridge.sh",
           "params": "stop",
           "exitmenu": false,
@@ -21,7 +21,7 @@
           "status": false
         },
         {
-          "name": "Show USB bridge status",
+          "name": "Status / Help",
           "action": "./bin/kindlebridge.sh",
           "params": "status",
           "exitmenu": false,
@@ -29,7 +29,7 @@
           "status": false
         },
         {
-          "name": "Apply staged daemon update",
+          "name": "Advanced: Apply daemon update",
           "action": "./bin/kindlebridge.sh",
           "params": "apply-staged",
           "exitmenu": false,

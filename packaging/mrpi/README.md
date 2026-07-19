@@ -14,19 +14,27 @@ Bridge link/function, recreates the unplugged `g_ether` handoff state, and asks
 `volumd` to reclaim MTP. It never binds stock MTP directly and never resets the
 MTU3 controller.
 
-KUAL keeps the menu open for start, stop, and status, shows synchronous feedback
-in its message area, and starts the bridge without a time limit. Bounded
-timeouts remain available only for explicit laboratory manager calls.
-Start and stop require the USB cable to be unplugged; once active, the bridge
+Installation and upgrades use one user flow: unplug USB, run MRPI, and reconnect.
+The installer stops an existing Bridge, atomically replaces the program and KUAL
+files, starts the new Bridge, and rolls back to the previous version if startup
+fails. A connected cable aborts before replacement with an actionable message.
+
+KUAL keeps the menu open, uses task-oriented development/file-transfer labels,
+and shows synchronous next steps in its message area. Start and stop are
+idempotent and have no KUAL timeout. Bounded timeouts remain available only for
+explicit laboratory manager calls. USB ownership transitions require the cable
+to be unplugged; once active, the bridge
 supports normal host unplug/replug without another mode transition.
 The first development install may still be copied over a rescue network without
 coupling KindleBridge to its provider.
 
 The lifecycle is covered by `tests/usb-mode-lifecycle.sh`, including connected
 fail-closed behavior, both stock entry states, rollback, stale-state cleanup,
-and stock-MTP handback. The current rewrite is not yet revalidated on KT6
-hardware; keep `/mnt/us/KINDLEBRIDGE_DISABLE` in place until that test is
-started deliberately.
+and stock-MTP handback. The stock-MTP-to-Bridge path, discovery, repeated exec,
+unplug/replug reconnects, and large sync have now been exercised on KT6
+hardware. Bridge-to-MTP handback and re-entry, sleep/wake, crash recovery, and
+the full repeated-cycle gate remain outstanding. Keep
+`/mnt/us/KINDLEBRIDGE_DISABLE` for unattended startup until those gates pass.
 
 This is an internal KT6 development package, not a public release.
 

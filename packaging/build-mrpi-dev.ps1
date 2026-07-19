@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$KindleTool,
+    [string]$Version = '0.1.0-dev.3',
     [switch]$SkipDeviceBuild
 )
 
@@ -10,7 +11,9 @@ $WorkspaceRoot = Split-Path -Parent $RepositoryRoot
 $TargetRoot = Join-Path $RepositoryRoot 'target\mrpi-dev'
 $StageRoot = Join-Path $TargetRoot 'stage'
 $DistRoot = Join-Path $RepositoryRoot 'dist'
-$Version = '0.1.0-dev'
+if ($Version -notmatch '^[0-9A-Za-z][0-9A-Za-z.-]{0,63}$') {
+    throw "unsafe package version: $Version"
+}
 
 $GitBash = Join-Path $env:ProgramFiles 'Git\bin\bash.exe'
 if (-not (Test-Path -LiteralPath $GitBash -PathType Leaf)) {
@@ -43,6 +46,8 @@ $PayloadSource = Join-Path $PSScriptRoot 'mrpi\payload'
 Copy-Item -LiteralPath $PayloadSource -Destination (Join-Path $StageRoot 'payload') -Recurse
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'mrpi\install.sh') -Destination $StageRoot
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'mrpi\uninstall.sh') -Destination $StageRoot
+$PayloadVersion = Join-Path $StageRoot 'payload\kindlebridge\VERSION'
+[IO.File]::WriteAllText($PayloadVersion, "$Version`n", [Text.UTF8Encoding]::new($false))
 $DeviceBinary = Join-Path $RepositoryRoot 'target\armv7-unknown-linux-gnueabihf\release\kindlebridged'
 if (-not (Test-Path -LiteralPath $DeviceBinary -PathType Leaf)) {
     throw "kindlebridged not found: $DeviceBinary"

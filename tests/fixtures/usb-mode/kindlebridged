@@ -1,6 +1,21 @@
 #!/bin/sh
 
 trap 'exit 0' HUP INT TERM
-while :; do
-    /usr/bin/sleep 30
-done
+if test "${KINDLEBRIDGE_TEST_SUPERVISOR_RACE:-0}" = 1; then
+    gadget="$KINDLEBRIDGE_TEST_ROOT/sys/kernel/config/usb_gadget/mtpgadget"
+    state="$KINDLEBRIDGE_TEST_ROOT/mnt/us/kindlebridge/runtime/launcher/watchdog-state"
+    seen_bound=0
+    while :; do
+        bound=$(cat "$gadget/UDC" 2>/dev/null || true)
+        if test -L "$gadget/configs/c.1/ffs.kbp" && test -n "$bound"; then
+            seen_bound=1
+        elif test "$seen_bound" = 1 || test -f "$state"; then
+            exit 1
+        fi
+        /usr/bin/sleep 0.02
+    done
+else
+    while :; do
+        /usr/bin/sleep 30
+    done
+fi
