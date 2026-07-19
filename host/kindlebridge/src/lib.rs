@@ -35,6 +35,10 @@ pub struct Cli {
     )]
     pub server: String,
 
+    /// Use one private stdio server instead of the shared local service.
+    #[arg(long, global = true, hide = true)]
+    pub server_stdio: bool,
+
     /// Pass a development device inventory to the stdio server.
     #[arg(long, global = true, env = "KINDLEBRIDGE_DEVICES_FILE")]
     pub devices_file: Option<String>,
@@ -69,7 +73,7 @@ pub enum TopLevelCommand {
     Device(DeviceArgs),
     /// Run one non-interactive process on a device.
     Exec(ExecArgs),
-    /// Open a command shell. Without -c, the CLI starts a line-oriented REPL.
+    /// Open a persistent PTY/raw shell. Without -c, starts an interactive terminal.
     Shell(ShellArgs),
     /// Transfer files with resumable block checksums.
     Sync(SyncArgs),
@@ -117,9 +121,21 @@ pub struct ShellArgs {
     /// Execute one shell command instead of opening the REPL.
     #[arg(short = 'c', long)]
     pub command: Option<String>,
-    /// Per-command timeout in milliseconds.
-    #[arg(long, default_value_t = 30_000)]
-    pub timeout_ms: u64,
+    /// Request a PTY; repeat as -tt to force one for redirected stdin.
+    #[arg(short = 't', action = clap::ArgAction::Count, conflicts_with = "no_tty")]
+    pub tty: u8,
+    /// Disable PTY allocation.
+    #[arg(short = 'T', long)]
+    pub no_tty: bool,
+    /// Do not read local stdin.
+    #[arg(short = 'n', long)]
+    pub no_stdin: bool,
+    /// Line-leading local escape character, or `none`.
+    #[arg(short = 'e', default_value = "~")]
+    pub escape: String,
+    /// Emit one JSON object per stream event.
+    #[arg(long, conflicts_with = "json")]
+    pub ndjson: bool,
 }
 
 #[derive(Debug, Args)]
@@ -249,6 +265,10 @@ pub enum ServerCommand {
     Ping,
     /// Print server and API versions.
     Version,
+    /// Show the shared local server process.
+    Status,
+    /// Ask the shared local server to exit.
+    Stop,
 }
 
 #[derive(Debug, Args)]
@@ -322,13 +342,9 @@ pub fn execute_with_status<C: RpcCaller>(
     json_output: bool,
 ) -> Result<CommandOutput, CliError> {
     match command {
-        TopLevelCommand::Exec(args) => execute_exec(
-            caller,
-            &args.serial,
-            args.argv.clone(),
-            args.timeout_ms,
-            json_output,
-        ),
+        TopLevelCommand::Exec(args) => {
+            execute_exec(caller, &args.serial, args.argv.clone(), 30_000, json_output)
+        }
         TopLevelCommand::Shell(args) => execute_exec(
             caller,
             &args.serial,
@@ -337,7 +353,7 @@ pub fn execute_with_status<C: RpcCaller>(
                 "-lc".to_owned(),
                 args.command.clone().unwrap_or_default(),
             ],
-            args.timeout_ms,
+            30_000,
             json_output,
         ),
         _ => execute(caller, command, json_output).map(CommandOutput::success),
@@ -371,6 +387,25 @@ pub fn execute<C: RpcCaller>(
                         "{} {} (API {})",
                         version.name, version.version, version.api_version
                     ))
+                }
+            }
+            ServerCommand::Status => {
+                let result = caller.call(methods::SERVER_STATUS, None)?;
+                if json_output {
+                    pretty_json(&result)
+                } else {
+                    Ok(format!(
+                        "running (pid {})",
+                        result["pid"].as_u64().unwrap_or_default()
+                    ))
+                }
+            }
+            ServerCommand::Stop => {
+                let result = caller.call(methods::SERVER_STOP, None)?;
+                if json_output {
+                    pretty_json(&result)
+                } else {
+                    Ok("stopping".to_owned())
                 }
             }
         },
@@ -443,7 +478,7 @@ pub fn execute<C: RpcCaller>(
                 "-lc".to_owned(),
                 args.command.clone().unwrap_or_default(),
             ],
-            args.timeout_ms,
+            30_000,
             json_output,
         )
         .map(|result| result.output),
@@ -1153,7 +1188,11 @@ mod tests {
             &TopLevelCommand::Shell(ShellArgs {
                 serial: "KT6-TEST".to_owned(),
                 command: Some("printf shell-ok".to_owned()),
-                timeout_ms: 1000,
+                tty: 0,
+                no_tty: true,
+                no_stdin: true,
+                escape: "none".to_owned(),
+                ndjson: false,
             }),
             false,
         )

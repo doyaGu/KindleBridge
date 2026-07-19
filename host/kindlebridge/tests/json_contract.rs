@@ -1,5 +1,4 @@
-use std::io::{BufReader, Write};
-use std::net::TcpStream;
+use std::io::BufReader;
 use std::process::{Command, Output};
 
 use kindlebridge_schema::{
@@ -198,6 +197,7 @@ fn run_cli<const N: usize>(args: [&str; N]) -> Output {
 
 fn run_cli_with_server_mode<const N: usize>(args: [&str; N], mode: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_kindlebridge"))
+        .arg("--server-stdio")
         .args(args)
         .env(FAKE_SERVER_ENV, mode)
         .output()
@@ -218,12 +218,6 @@ fn current_executable() -> std::path::PathBuf {
 }
 
 fn serve_one_rpc_error() {
-    let address = argument_value("--parent-watchdog");
-    let mut watchdog = TcpStream::connect(address).expect("connect CLI watchdog");
-    watchdog
-        .write_all(&std::process::id().to_le_bytes())
-        .expect("announce fake server PID");
-
     let stdin = std::io::stdin();
     let Some(request) = read_json_frame(
         &mut BufReader::new(stdin.lock()),
@@ -243,12 +237,6 @@ fn serve_one_rpc_error() {
 }
 
 fn serve_one_exec_result(exit_code: i32) {
-    let address = argument_value("--parent-watchdog");
-    let mut watchdog = TcpStream::connect(address).expect("connect CLI watchdog");
-    watchdog
-        .write_all(&std::process::id().to_le_bytes())
-        .expect("announce fake server PID");
-
     let stdin = std::io::stdin();
     let request = read_json_frame(
         &mut BufReader::new(stdin.lock()),
@@ -269,14 +257,4 @@ fn serve_one_exec_result(exit_code: i32) {
     );
     let stdout = std::io::stdout();
     write_json_frame(&mut stdout.lock(), &response).expect("write fake RPC response");
-}
-
-fn argument_value(name: &str) -> String {
-    let mut arguments = std::env::args();
-    while let Some(argument) = arguments.next() {
-        if argument == name {
-            return arguments.next().expect("argument value");
-        }
-    }
-    panic!("missing {name}");
 }
