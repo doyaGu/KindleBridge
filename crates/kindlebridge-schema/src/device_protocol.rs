@@ -60,6 +60,15 @@ pub fn is_valid_session_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+#[must_use]
+pub fn is_valid_transfer_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceOpen {
@@ -177,6 +186,15 @@ mod tests {
         assert!(is_valid_session_id("000102030405060708090a0b0c0d0e0f"));
         assert!(!is_valid_session_id("000102030405060708090A0B0C0D0E0F"));
         assert!(!is_valid_session_id("short"));
+    }
+
+    #[test]
+    fn transfer_ids_are_bounded_filename_safe_tokens() {
+        assert!(is_valid_transfer_id("pull-0123456789abcdef_test"));
+        assert!(!is_valid_transfer_id(""));
+        assert!(!is_valid_transfer_id("hop/../escape"));
+        assert!(!is_valid_transfer_id("hop\\..\\escape"));
+        assert!(!is_valid_transfer_id(&"x".repeat(129)));
     }
 
     #[test]

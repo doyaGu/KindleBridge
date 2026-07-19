@@ -9,8 +9,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use kindlebridge_schema::device_protocol::{
-    is_valid_session_id, DeviceCall, DeviceHello, DeviceReply, HostHello, ServiceAccept,
-    ServiceOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE,
+    is_valid_session_id, is_valid_transfer_id, DeviceCall, DeviceHello, DeviceReply, HostHello,
+    ServiceAccept, ServiceOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE,
     APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE, APP_START_FEATURE, APP_STOP_FEATURE,
     APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, LOG_TAIL_FEATURE,
     MAX_HOST_TO_DEVICE_PAYLOAD, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION,
@@ -170,6 +170,7 @@ impl DeviceProvider for ConnectedDeviceProvider {
         let device = self.require_feature(&params.serial, SYNC_FEATURE)?;
         validate_host_path(&params.local_path)?;
         validate_block_size(params.block_size)?;
+        validate_requested_transfer_id(params.transfer_id.as_deref())?;
         let mut file = File::open(&params.local_path)
             .map_err(|error| host_file_error("read", &params.local_path, &error))?;
         if !file
@@ -196,6 +197,7 @@ impl DeviceProvider for ConnectedDeviceProvider {
         let device = self.require_feature(&params.serial, SYNC_FEATURE)?;
         validate_host_path(&params.local_path)?;
         validate_block_size(params.block_size)?;
+        validate_requested_transfer_id(params.transfer_id.as_deref())?;
         device
             .session
             .lock()
@@ -614,6 +616,9 @@ impl DeviceSession {
             SyncReply::Failure { error } => return Err(LinkError::Remote(error)),
             _ => return Err(LinkError::UnexpectedFrame("invalid sync push READY")),
         };
+        if !is_valid_transfer_id(&transfer_id) {
+            return Err(LinkError::UnexpectedFrame("invalid sync transfer ID"));
+        }
         if params
             .transfer_id
             .as_ref()
@@ -710,7 +715,8 @@ impl DeviceSession {
         let staging = params
             .transfer_id
             .as_deref()
-            .map(|id| staging_path(Path::new(&params.local_path), id));
+            .map(|id| staging_path(Path::new(&params.local_path), id))
+            .transpose()?;
         let offset = if let Some(path) = &staging {
             fs::metadata(path).map_or(0, |metadata| metadata.len())
         } else {
@@ -735,6 +741,9 @@ impl DeviceSession {
             SyncReply::Failure { error } => return Err(LinkError::Remote(error)),
             _ => return Err(LinkError::UnexpectedFrame("invalid sync pull READY")),
         };
+        if !is_valid_transfer_id(&transfer_id) {
+            return Err(LinkError::UnexpectedFrame("invalid sync transfer ID"));
+        }
         if params
             .transfer_id
             .as_ref()
@@ -744,8 +753,10 @@ impl DeviceSession {
         {
             return Err(LinkError::UnexpectedFrame("sync pull resume mismatch"));
         }
-        let staging =
-            staging.unwrap_or_else(|| staging_path(Path::new(&params.local_path), &transfer_id));
+        let staging = match staging {
+            Some(path) => path,
+            None => staging_path(Path::new(&params.local_path), &transfer_id)?,
+        };
         let mut output = open_staging(&staging, remote_offset)?;
         let mut hasher = hash_prefix(&mut output, remote_offset)?;
         output.seek(SeekFrom::Start(remote_offset))?;
@@ -1098,12 +1109,23 @@ fn hash_prefix(file: &mut File, length: u64) -> Result<blake3::Hasher, LinkError
     Ok(hasher)
 }
 
-fn staging_path(destination: &Path, transfer_id: &str) -> PathBuf {
-    PathBuf::from(format!(
+fn staging_path(destination: &Path, transfer_id: &str) -> Result<PathBuf, LinkError> {
+    if !is_valid_transfer_id(transfer_id) {
+        return Err(LinkError::UnexpectedFrame("invalid sync transfer ID"));
+    }
+    Ok(PathBuf::from(format!(
         "{}.kindlebridge-{}.part",
         destination.to_string_lossy(),
         transfer_id
-    ))
+    )))
+}
+
+fn validate_requested_transfer_id(transfer_id: Option<&str>) -> Result<(), RpcError> {
+    if transfer_id.is_some_and(|value| !is_valid_transfer_id(value)) {
+        Err(RpcError::invalid_params("invalid transfer_id"))
+    } else {
+        Ok(())
+    }
 }
 
 fn open_staging(path: &Path, offset: u64) -> Result<File, LinkError> {
@@ -1844,7 +1866,7 @@ mod tests {
             "kindlebridge-pull-checksum-reset-{}.bin",
             std::process::id()
         ));
-        let staging = staging_path(&destination, &transfer_id);
+        let staging = staging_path(&destination, &transfer_id).unwrap();
         let _ = fs::remove_file(&destination);
         let _ = fs::remove_file(&staging);
         let hello = DeviceHello {
@@ -1903,6 +1925,74 @@ mod tests {
         ));
         assert_eq!(fs::metadata(&staging).unwrap().len(), 0);
         fs::remove_file(staging).unwrap();
+    }
+
+    #[test]
+    fn sync_pull_rejects_a_device_transfer_id_before_constructing_a_host_path() {
+        let (limits, config) = session_transport_config();
+        let root = std::env::temp_dir().join(format!(
+            "kindlebridge-host-transfer-id-{}",
+            std::process::id()
+        ));
+        let destination = root.join("destination.bin");
+        let escaped = root.join("escaped.part");
+        let prefixed_directory = root.join("destination.bin.kindlebridge-hop");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&prefixed_directory).unwrap();
+
+        let hello = DeviceHello {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: TEST_SESSION_ID.to_owned(),
+            serial: "KT6-TRANSFER-ID".to_owned(),
+            model: "KT6".to_owned(),
+            firmware: "5.17.1.0.4".to_owned(),
+            target: "kindlehf".to_owned(),
+            features: vec![SYNC_FEATURE.to_owned()],
+            initial_connection_window: DEFAULT_CONNECTION_WINDOW,
+        };
+        let ready = SyncReply::Ready {
+            transfer_id: "hop/../escaped".to_owned(),
+            offset: 0,
+            total_size: 1,
+            file_hash: blake3::hash(b"x").to_hex().to_string(),
+        };
+        let mut incoming = Vec::new();
+        let mut append = |frame: Frame| {
+            incoming.extend_from_slice(&frame.encode(limits).unwrap());
+        };
+        append(frame(Command::Hello, 0, 0, encode(&hello).unwrap()).unwrap());
+        append(
+            frame(
+                Command::Accept,
+                1,
+                0,
+                encode(&ServiceAccept {
+                    initial_stream_window: DEFAULT_STREAM_WINDOW,
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        append(frame(Command::Data, 1, 1, encode(&ready).unwrap()).unwrap());
+
+        let stream = SplitFrameStream::new(Cursor::new(incoming), Vec::new(), config).unwrap();
+        let (mut session, _) =
+            DeviceSession::handshake_with_session_id(Box::new(stream), limits, TEST_SESSION_ID)
+                .unwrap();
+        let result = session.sync_pull(&SyncPullParams {
+            serial: "KT6-TRANSFER-ID".to_owned(),
+            remote_path: "payload.bin".to_owned(),
+            local_path: destination.to_string_lossy().into_owned(),
+            transfer_id: None,
+            block_size: 64 * 1024,
+        });
+
+        assert!(matches!(
+            result,
+            Err(LinkError::UnexpectedFrame("invalid sync transfer ID"))
+        ));
+        assert!(!escaped.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2084,6 +2174,25 @@ mod tests {
                 .unwrap()
                 .state,
             TransferState::Complete
+        );
+
+        // If the original COMPLETE reply was lost, the host retries with the
+        // same transfer ID. A completed push must acknowledge that retry
+        // without reopening a staging file or duplicating file data.
+        let replayed = provider
+            .sync_push(SyncPushParams {
+                serial: "KT6-SYNC".to_owned(),
+                local_path: source.to_string_lossy().into_owned(),
+                remote_path: "apps/demo/payload.bin".to_owned(),
+                transfer_id: Some(pushed.transfer_id.clone()),
+                block_size: kindlebridge_schema::DEFAULT_SYNC_BLOCK_SIZE,
+            })
+            .unwrap();
+        assert_eq!(replayed.transfer_id, pushed.transfer_id);
+        assert_eq!(replayed.accepted_offset, payload.len() as u64);
+        assert_eq!(
+            fs::read(root.join("apps/demo/payload.bin")).unwrap(),
+            payload
         );
 
         let pulled = provider

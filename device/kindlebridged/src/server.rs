@@ -804,6 +804,37 @@ fn serve_sync_push(
         request_length,
     )?;
 
+    if transfer.is_complete() {
+        let completion =
+            read_stream_data(stream, state, stream_id)?.ok_or(ServerError::Disconnected)?;
+        if !completion.payload.is_empty() || completion.header.flags & FLAG_END_STREAM == 0 {
+            return Err(ServerError::UnexpectedFrame(
+                "completed sync push must end with an empty DATA frame",
+            ));
+        }
+        let status = transfer.finish().map_err(ServerError::Sync)?;
+        let complete = SyncReply::Complete {
+            transfer_id: status.transfer_id,
+            next_offset: status.next_offset,
+            total_size: status.total_size,
+        };
+        send_data(
+            stream,
+            state,
+            stream_id,
+            send_sequence,
+            encode(&complete)?,
+            true,
+        )?;
+        send_sequence = next_sequence(send_sequence)?;
+        return send(
+            stream,
+            state,
+            frame(Command::Close, stream_id, send_sequence, Vec::new())?,
+            FrameContext::default(),
+        );
+    }
+
     let block_size = usize::try_from(block_size).map_err(|_| ServerError::InvalidConfig)?;
     let hash_state = transfer.hash_state();
     let mut context = PushReceiveContext {

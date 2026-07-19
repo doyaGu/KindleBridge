@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use std::cell::Cell;
 
+use kindlebridge_schema::device_protocol::is_valid_transfer_id;
 use kindlebridge_schema::{error_codes, RpcError, SyncStatus, TransferDirection, TransferState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -825,12 +826,7 @@ impl StoreError {
 }
 
 fn validate_transfer_id(value: &str) -> Result<(), StoreError> {
-    let valid = !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
-    if valid {
+    if is_valid_transfer_id(value) {
         Ok(())
     } else {
         Err(StoreError::InvalidTransferId)
