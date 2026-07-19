@@ -10,9 +10,11 @@ use std::time::{Duration, Instant};
 
 use kindlebridge_schema::device_protocol::{
     is_valid_session_id, DeviceCall, DeviceHello, DeviceReply, HostHello, ServiceAccept,
-    ServiceOpen, SyncReply, SyncRequest, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW,
-    MAX_HOST_TO_DEVICE_PAYLOAD, PROTOCOL_VERSION, SHELL_SERVICE, SYNC_CREDIT_BATCH_SIZE,
-    SYNC_FEATURE, SYNC_SERVICE,
+    ServiceOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE,
+    APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE, APP_START_FEATURE, APP_STOP_FEATURE,
+    APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, LOG_TAIL_FEATURE,
+    MAX_HOST_TO_DEVICE_PAYLOAD, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION,
+    SHELL_SERVICE, SYNC_CREDIT_BATCH_SIZE, SYNC_FEATURE, SYNC_SERVICE,
 };
 use kindlebridge_schema::{
     error_codes, AppInstallParams, AppList, AppSummary, AppTargetParams, DeviceFeatures,
@@ -42,7 +44,9 @@ const SESSION_IO_TIMEOUT: Duration = Duration::from_secs(10 * 60 + 30);
 // force the KT6 4.9 gadget stack into fragile high-order page allocations.
 const USB_TRANSFER_SIZE: usize = 16 * 1024;
 const USB_READ_QUEUE_DEPTH: usize = 4;
-const USB_WRITE_QUEUE_DEPTH: usize = 1;
+// Four order-2 requests keep 64 KiB in flight without asking the KT6 gadget
+// stack for larger, fragile high-order allocations.
+const USB_WRITE_QUEUE_DEPTH: usize = 4;
 const USB_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const USB_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const USB_RECOVERY_DRAIN_POLL: Duration = Duration::from_millis(250);
@@ -212,43 +216,93 @@ impl DeviceProvider for ConnectedDeviceProvider {
     }
 
     fn app_install(&self, params: AppInstallParams) -> Result<AppSummary, RpcError> {
-        Err(self.unavailable(&params.serial, "app.v1"))
+        self.remote_call(
+            &params.serial,
+            APP_INSTALL_FEATURE,
+            kindlebridge_schema::methods::APP_INSTALL,
+            &params,
+        )
     }
 
     fn app_start(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        Err(self.unavailable(&params.serial, "app.v1"))
+        self.remote_call(
+            &params.serial,
+            APP_START_FEATURE,
+            kindlebridge_schema::methods::APP_START,
+            params,
+        )
     }
 
     fn app_stop(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        Err(self.unavailable(&params.serial, "app.v1"))
+        self.remote_call(
+            &params.serial,
+            APP_STOP_FEATURE,
+            kindlebridge_schema::methods::APP_STOP,
+            params,
+        )
     }
 
     fn app_restart(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        Err(self.unavailable(&params.serial, "app.v1"))
+        self.remote_call(
+            &params.serial,
+            APP_RESTART_FEATURE,
+            kindlebridge_schema::methods::APP_RESTART,
+            params,
+        )
     }
 
     fn app_rollback(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        Err(self.unavailable(&params.serial, "app.v1"))
+        self.remote_call(
+            &params.serial,
+            APP_ROLLBACK_FEATURE,
+            kindlebridge_schema::methods::APP_ROLLBACK,
+            params,
+        )
     }
 
     fn app_uninstall(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        Err(self.unavailable(&params.serial, "app.v1"))
+        self.remote_call(
+            &params.serial,
+            APP_UNINSTALL_FEATURE,
+            kindlebridge_schema::methods::APP_UNINSTALL,
+            params,
+        )
     }
 
     fn app_list(&self, params: &SerialParams) -> Result<AppList, RpcError> {
-        Err(self.unavailable(&params.serial, "app.v1"))
+        self.remote_call(
+            &params.serial,
+            APP_LIST_FEATURE,
+            kindlebridge_schema::methods::APP_LIST,
+            params,
+        )
     }
 
     fn process_list(&self, params: &SerialParams) -> Result<ProcessList, RpcError> {
-        Err(self.unavailable(&params.serial, "process.v1"))
+        self.remote_call(
+            &params.serial,
+            PROCESS_LIST_FEATURE,
+            kindlebridge_schema::methods::PROCESS_LIST,
+            params,
+        )
     }
 
     fn process_signal(&self, params: &ProcessSignalParams) -> Result<ProcessSummary, RpcError> {
-        Err(self.unavailable(&params.serial, "process.v1"))
+        self.remote_call(
+            &params.serial,
+            PROCESS_SIGNAL_FEATURE,
+            kindlebridge_schema::methods::PROCESS_SIGNAL,
+            params,
+        )
     }
 
     fn log_tail(&self, params: &LogTailParams) -> Result<LogSnapshot, RpcError> {
-        Err(self.unavailable(&params.serial, "log.v1"))
+        self.remote_call(
+            &params.serial,
+            LOG_TAIL_FEATURE,
+            kindlebridge_schema::methods::LOG_TAIL,
+            params,
+        )
     }
 }
 
@@ -269,12 +323,21 @@ impl ConnectedDeviceProvider {
         }
     }
 
-    fn unavailable(&self, serial: &str, feature: &str) -> RpcError {
-        if self.find(serial).is_some() {
-            RpcError::feature_unavailable(serial, feature)
-        } else {
-            RpcError::device_not_found(serial)
-        }
+    fn remote_call<T: serde::de::DeserializeOwned>(
+        &self,
+        serial: &str,
+        feature: &str,
+        method: &str,
+        params: &impl Serialize,
+    ) -> Result<T, RpcError> {
+        let device = self.require_feature(serial, feature)?;
+        let value = device
+            .session
+            .lock()
+            .map_err(|_| RpcError::internal_error())?
+            .call(method, params)
+            .map_err(link_rpc_error)?;
+        serde_json::from_value(value).map_err(|_| RpcError::internal_error())
     }
 }
 
@@ -1376,7 +1439,10 @@ mod tests {
         let buffers = usb_buffer_config();
         assert_eq!(buffers.transfer_size, 16 * 1024);
         assert_eq!(buffers.read_queue_depth, 4);
-        assert_eq!(buffers.write_queue_depth, 1);
+        // Keep four order-2 requests in flight. A single 16 KiB request makes
+        // every host-to-device write wait for one USB completion and leaves
+        // most of the high-speed bus idle.
+        assert_eq!(buffers.write_queue_depth, 4);
         assert_eq!(buffers.read_timeout, USB_HANDSHAKE_TIMEOUT);
         assert_eq!(buffers.write_timeout, USB_HANDSHAKE_TIMEOUT);
         assert!(USB_RECOVERY_TIMEOUT > USB_HANDSHAKE_TIMEOUT);
@@ -1858,9 +1924,45 @@ mod tests {
         assert_eq!(
             provider.features("KT6-LINK").unwrap().unwrap().features,
             vec![
+                kindlebridge_schema::device_protocol::APP_LIST_FEATURE,
                 kindlebridge_schema::device_protocol::EXEC_FEATURE,
+                kindlebridge_schema::device_protocol::LOG_TAIL_FEATURE,
+                kindlebridge_schema::device_protocol::PROCESS_LIST_FEATURE,
                 kindlebridge_schema::device_protocol::SYNC_FEATURE,
             ]
+        );
+
+        assert!(provider
+            .app_list(&SerialParams {
+                serial: "KT6-LINK".to_owned(),
+            })
+            .unwrap()
+            .apps
+            .is_empty());
+        let _ = provider
+            .process_list(&SerialParams {
+                serial: "KT6-LINK".to_owned(),
+            })
+            .unwrap();
+        assert!(provider
+            .log_tail(&LogTailParams {
+                serial: "KT6-LINK".to_owned(),
+                cursor: None,
+                limit: Some(10),
+            })
+            .unwrap()
+            .entries
+            .is_empty());
+        let unsupported = provider
+            .app_start(&AppTargetParams {
+                serial: "KT6-LINK".to_owned(),
+                app_id: "org.example.reader".to_owned(),
+            })
+            .unwrap_err();
+        assert_eq!(unsupported.code, error_codes::FEATURE_UNAVAILABLE);
+        assert_eq!(
+            unsupported.data.as_ref().unwrap()["feature"],
+            kindlebridge_schema::device_protocol::APP_START_FEATURE
         );
 
         let executable = std::env::current_exe().unwrap();
