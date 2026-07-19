@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, VecDeque};
 use kindlebridge_wire::{Command, Frame};
 use thiserror::Error;
 
+pub mod actor;
+
 const CLASS_COUNT: usize = 5;
 const DEFAULT_QUANTA: [usize; CLASS_COUNT] = [65_536, 32_768, 16_384, 8_192, 4_096];
 

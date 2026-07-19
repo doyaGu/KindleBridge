@@ -579,7 +579,10 @@ dependencies = [
 name = "kindlebridge-transport"
 version = "0.1.0"
 dependencies = [
+ "kindlebridge-schema",
  "kindlebridge-wire",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
