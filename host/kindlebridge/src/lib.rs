@@ -301,6 +301,49 @@ const DEVICE_RUNTIME_ROOT: &str = "/mnt/us/kindlebridge/runtime";
 const DEVICE_SYNC_ROOT: &str = "/mnt/us/kindlebridge-data";
 const MAX_UPDATE_BINARY_SIZE: u64 = 32 * 1024 * 1024;
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct CommandOutput {
+    pub output: String,
+    pub exit_code: i32,
+}
+
+impl CommandOutput {
+    fn success(output: String) -> Self {
+        Self {
+            output,
+            exit_code: 0,
+        }
+    }
+}
+
+pub fn execute_with_status<C: RpcCaller>(
+    caller: &mut C,
+    command: &TopLevelCommand,
+    json_output: bool,
+) -> Result<CommandOutput, CliError> {
+    match command {
+        TopLevelCommand::Exec(args) => execute_exec(
+            caller,
+            &args.serial,
+            args.argv.clone(),
+            args.timeout_ms,
+            json_output,
+        ),
+        TopLevelCommand::Shell(args) => execute_exec(
+            caller,
+            &args.serial,
+            vec![
+                "/bin/sh".to_owned(),
+                "-lc".to_owned(),
+                args.command.clone().unwrap_or_default(),
+            ],
+            args.timeout_ms,
+            json_output,
+        ),
+        _ => execute(caller, command, json_output).map(CommandOutput::success),
+    }
+}
+
 pub fn execute<C: RpcCaller>(
     caller: &mut C,
     command: &TopLevelCommand,
@@ -390,7 +433,8 @@ pub fn execute<C: RpcCaller>(
             args.argv.clone(),
             args.timeout_ms,
             json_output,
-        ),
+        )
+        .map(|result| result.output),
         TopLevelCommand::Shell(args) => execute_exec(
             caller,
             &args.serial,
@@ -401,7 +445,8 @@ pub fn execute<C: RpcCaller>(
             ],
             args.timeout_ms,
             json_output,
-        ),
+        )
+        .map(|result| result.output),
         TopLevelCommand::Sync(args) => execute_sync(caller, &args.command, json_output),
         TopLevelCommand::Daemon(args) => execute_daemon(caller, &args.command, json_output),
         TopLevelCommand::App(args) => execute_app(caller, &args.command, json_output),
@@ -580,7 +625,7 @@ fn execute_exec<C: RpcCaller>(
     argv: Vec<String>,
     timeout_ms: u64,
     json_output: bool,
-) -> Result<String, CliError> {
+) -> Result<CommandOutput, CliError> {
     let result = caller.call(
         methods::EXEC_RUN,
         Some(
@@ -598,7 +643,8 @@ fn execute_exec<C: RpcCaller>(
     )?;
     let exec: ExecResult = serde_json::from_value(result.clone())
         .map_err(|_| CliError::InvalidResult { kind: "exec" })?;
-    if json_output {
+    let exit_code = exec.exit_code;
+    let output = if json_output {
         pretty_json(&result)
     } else {
         let mut output = exec.stdout;
@@ -609,7 +655,8 @@ fn execute_exec<C: RpcCaller>(
             output.push_str(&format!("[exit {}]\n", exec.exit_code));
         }
         Ok(output.trim_end_matches('\n').to_owned())
-    }
+    }?;
+    Ok(CommandOutput { output, exit_code })
 }
 
 fn execute_sync<C: RpcCaller>(

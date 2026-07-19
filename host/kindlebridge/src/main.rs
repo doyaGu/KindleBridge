@@ -5,7 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use kindlebridge::{execute, Cli, CliError, ShellArgs, TopLevelCommand};
+use kindlebridge::{
+    execute, execute_with_status, Cli, CliError, CommandOutput, ShellArgs, TopLevelCommand,
+};
 use kindlebridge_schema::{ClientError, RpcClient};
 use serde_json::{json, Value};
 
@@ -34,14 +36,18 @@ fn main() -> ExitCode {
     };
     match run(&cli) {
         Ok(output) => {
-            println!("{output}");
-            ExitCode::SUCCESS
+            println!("{}", output.output);
+            process_exit_code(output.exit_code)
         }
         Err(error) => {
             print_error(cli.json, &error);
             ExitCode::FAILURE
         }
     }
+}
+
+fn process_exit_code(exit_code: i32) -> ExitCode {
+    ExitCode::from(u8::try_from(exit_code).unwrap_or(1))
 }
 
 #[derive(Debug)]
@@ -69,7 +75,7 @@ impl From<String> for RunError {
     }
 }
 
-fn run(cli: &Cli) -> Result<String, RunError> {
+fn run(cli: &Cli) -> Result<CommandOutput, RunError> {
     let watchdog_listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| RunError::Startup(format!("could not create server watchdog: {error}")))?;
     watchdog_listener.set_nonblocking(true).map_err(|error| {
@@ -135,9 +141,16 @@ fn run(cli: &Cli) -> Result<String, RunError> {
         let mut client = RpcClient::new(BufReader::new(stdout), stdin);
         match &cli.command {
             TopLevelCommand::Shell(args) if args.command.is_none() => {
-                run_shell_repl(&mut client, args, cli.json).map_err(RunError::Message)
+                run_shell_repl(&mut client, args, cli.json)
+                    .map(|output| CommandOutput {
+                        output,
+                        exit_code: 0,
+                    })
+                    .map_err(RunError::Message)
             }
-            _ => execute(&mut client, &cli.command, cli.json).map_err(RunError::Command),
+            _ => {
+                execute_with_status(&mut client, &cli.command, cli.json).map_err(RunError::Command)
+            }
         }
     };
 

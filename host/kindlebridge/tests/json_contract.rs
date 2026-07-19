@@ -5,7 +5,7 @@ use std::process::{Command, Output};
 use kindlebridge_schema::{
     read_json_frame, write_json_frame, RequestId, RpcError, RpcResponse, DEFAULT_MAX_CONTENT_LENGTH,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const FAKE_SERVER_ENV: &str = "KINDLEBRIDGE_JSON_CONTRACT_FAKE_SERVER";
 
@@ -14,6 +14,9 @@ fn main() {
         if mode == "startup-error" {
             eprintln!("fake server startup diagnostic");
             std::process::exit(17);
+        } else if mode == "exec-exit-7" {
+            serve_one_exec_result(7);
+            return;
         } else {
             serve_one_rpc_error();
             return;
@@ -27,6 +30,28 @@ fn main() {
     command_validation_error_is_structured_json();
     non_json_errors_keep_the_human_readable_contract();
     server_stderr_does_not_corrupt_json_errors();
+    exec_preserves_the_remote_exit_code();
+}
+
+fn exec_preserves_the_remote_exit_code() {
+    let server = current_executable();
+    let output = run_cli_with_server_mode(
+        [
+            "--json",
+            "--server",
+            server.to_str().expect("UTF-8 test path"),
+            "exec",
+            "KT6-TEST",
+            "--",
+            "/bin/false",
+        ],
+        "exec-exit-7",
+    );
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(output.stderr.is_empty());
+    let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON stdout");
+    assert_eq!(document["exit_code"], 7);
 }
 
 fn server_stderr_does_not_corrupt_json_errors() {
@@ -212,6 +237,35 @@ fn serve_one_rpc_error() {
     let response = RpcResponse::failure(
         RequestId::Number(request["id"].as_i64().expect("numeric request ID")),
         RpcError::feature_unavailable("KT6-TEST", "process.v1"),
+    );
+    let stdout = std::io::stdout();
+    write_json_frame(&mut stdout.lock(), &response).expect("write fake RPC response");
+}
+
+fn serve_one_exec_result(exit_code: i32) {
+    let address = argument_value("--parent-watchdog");
+    let mut watchdog = TcpStream::connect(address).expect("connect CLI watchdog");
+    watchdog
+        .write_all(&std::process::id().to_le_bytes())
+        .expect("announce fake server PID");
+
+    let stdin = std::io::stdin();
+    let request = read_json_frame(
+        &mut BufReader::new(stdin.lock()),
+        DEFAULT_MAX_CONTENT_LENGTH,
+    )
+    .expect("read CLI RPC request")
+    .expect("exec RPC request");
+    assert_eq!(request["method"], "v1.exec.run");
+
+    let response = RpcResponse::success(
+        RequestId::Number(request["id"].as_i64().expect("numeric request ID")),
+        json!({
+            "exit_code": exit_code,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 1
+        }),
     );
     let stdout = std::io::stdout();
     write_json_frame(&mut stdout.lock(), &response).expect("write fake RPC response");
