@@ -619,7 +619,7 @@ impl PushTransfer {
         Ok(())
     }
 
-    fn write_chunk_without_hash(&mut self, data: &[u8]) -> Result<(), StoreError> {
+    pub(crate) fn write_chunk_without_hash(&mut self, data: &[u8]) -> Result<(), StoreError> {
         let length = u64::try_from(data.len()).map_err(|_| StoreError::SizeOverflow)?;
         let end = self
             .metadata
@@ -639,6 +639,10 @@ impl PushTransfer {
             self.next_checkpoint = end.saturating_add(CHECKPOINT_INTERVAL);
         }
         Ok(())
+    }
+
+    pub(crate) fn hash_state(&self) -> blake3::Hasher {
+        self.hasher.clone()
     }
 
     pub fn checkpoint(&mut self) -> Result<(), StoreError> {
@@ -674,7 +678,10 @@ impl PushTransfer {
         self.finish_with_digest(digest)
     }
 
-    fn finish_with_digest(mut self, digest: blake3::Hash) -> Result<SyncStatus, StoreError> {
+    pub(crate) fn finish_with_digest(
+        mut self,
+        digest: blake3::Hash,
+    ) -> Result<SyncStatus, StoreError> {
         if self.is_complete() {
             return self.store.status(&self.metadata.transfer_id);
         }

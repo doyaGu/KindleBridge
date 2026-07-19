@@ -17,7 +17,17 @@ pub const MAX_HOST_TO_DEVICE_PAYLOAD: u32 = 1024 * 1024;
 pub const SYNC_CREDIT_BATCH_SIZE: u32 = DEFAULT_STREAM_WINDOW / 2;
 pub const SHELL_SERVICE: &str = "shell.v1";
 pub const SYNC_SERVICE: &str = "sync.v1";
+pub const APP_INSTALL_FEATURE: &str = "app.install.v1";
+pub const APP_LIST_FEATURE: &str = "app.list.v1";
+pub const APP_RESTART_FEATURE: &str = "app.restart.v1";
+pub const APP_ROLLBACK_FEATURE: &str = "app.rollback.v1";
+pub const APP_START_FEATURE: &str = "app.start.v1";
+pub const APP_STOP_FEATURE: &str = "app.stop.v1";
+pub const APP_UNINSTALL_FEATURE: &str = "app.uninstall.v1";
 pub const EXEC_FEATURE: &str = "exec.v1";
+pub const LOG_TAIL_FEATURE: &str = "log.tail.v1";
+pub const PROCESS_LIST_FEATURE: &str = "process.list.v1";
+pub const PROCESS_SIGNAL_FEATURE: &str = "process.signal.v1";
 pub const SYNC_FEATURE: &str = "sync.v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -20,6 +20,7 @@ if (-not $ToolchainRoot) {
 
 $ToolchainRoot = (Resolve-Path -LiteralPath $ToolchainRoot).Path
 $Linker = Join-Path $ToolchainRoot 'bin\arm-kindlehf-linux-gnueabihf-gcc.exe'
+$Archiver = Join-Path $ToolchainRoot 'bin\arm-kindlehf-linux-gnueabihf-ar.exe'
 $ReadElf = Join-Path $ToolchainRoot 'bin\arm-kindlehf-linux-gnueabihf-readelf.exe'
 
 if (-not (Test-Path -LiteralPath $Linker -PathType Leaf)) {
@@ -27,6 +28,13 @@ if (-not (Test-Path -LiteralPath $Linker -PathType Leaf)) {
 }
 
 $env:CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER = $Linker
+# BLAKE3's ARMv7 NEON backend is compiled through cc-rs, which does not infer
+# Cargo's linker setting. Keep both Rust and C objects on the KindleHF
+# toolchain instead of falling back to a host or generic cross compiler.
+$env:CC_armv7_unknown_linux_gnueabihf = $Linker
+if (Test-Path -LiteralPath $Archiver -PathType Leaf) {
+    $env:AR_armv7_unknown_linux_gnueabihf = $Archiver
+}
 $CargoArguments = @(
     'build',
     '--target', 'armv7-unknown-linux-gnueabihf',

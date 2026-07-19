@@ -2,18 +2,23 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, TryRecvError, TrySendError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use kindlebridge_functionfs::{FunctionFsDevice, FunctionFsError, FunctionFsFrameStream};
 use kindlebridge_schema::device_protocol::{
     is_valid_session_id, DeviceCall, DeviceHello, DeviceReply, HostHello, ServiceAccept,
-    ServiceOpen, SyncReply, SyncRequest, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW,
-    EXEC_FEATURE, PROTOCOL_VERSION, SHELL_SERVICE, SYNC_CREDIT_BATCH_SIZE, SYNC_FEATURE,
-    SYNC_SERVICE,
+    ServiceOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE,
+    APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE, APP_START_FEATURE, APP_STOP_FEATURE,
+    APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, EXEC_FEATURE,
+    LOG_TAIL_FEATURE, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION,
+    SHELL_SERVICE, SYNC_CREDIT_BATCH_SIZE, SYNC_FEATURE, SYNC_SERVICE,
 };
 use kindlebridge_schema::{
-    error_codes, methods, ExecParams, RpcError, SyncStatusParams, MAX_SYNC_BLOCK_SIZE,
+    error_codes, methods, AppInstallParams, AppTargetParams, ExecParams, LogTailParams,
+    ProcessSignalParams, RpcError, SerialParams, SyncStatusParams, MAX_SYNC_BLOCK_SIZE,
 };
 use kindlebridge_transport_tcp::{
     ErrorClass, FrameIo, TcpFrameListener, TransportConfig, TransportError,
@@ -26,11 +31,167 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::exec::{self, ExecError};
+use crate::services;
 use crate::sync::{PullTransfer, PushTransfer, StoreError, SyncStore};
 use crate::DeviceInfo;
 
 const SESSION_IO_TIMEOUT: Duration = Duration::from_secs(10 * 60 + 30);
 const DEFAULT_SYNC_ROOT: &str = "/mnt/us/kindlebridge-data";
+const DEFAULT_ACTIVATION_ROOT: &str = "/var/local/kindlebridge/activations";
+const DEFAULT_PROC_ROOT: &str = "/proc";
+const DEFAULT_LOG_PATH: &str = "/var/local/kindlebridge/usb.log";
+const SYNC_PUSH_QUEUE_DEPTH: usize = 3;
+
+#[derive(Debug)]
+enum PipelineFailure<E> {
+    Stage(E),
+    WorkerStopped,
+    WorkerPanicked,
+}
+
+struct PipelineOutcome<A, E> {
+    result: Result<(), PipelineFailure<E>>,
+    last_written: Option<A>,
+}
+
+fn run_bounded_pipeline<C, T, A, E, Read, Write, Stored, MustDrain>(
+    context: &mut C,
+    mut read: Read,
+    mut write: Write,
+    mut stored: Stored,
+    mut must_drain: MustDrain,
+) -> PipelineOutcome<A, E>
+where
+    Read: FnMut(&mut C) -> Result<Option<T>, E>,
+    Write: FnMut(T) -> Result<A, E> + Send,
+    Stored: FnMut(&mut C, A) -> Result<(), E>,
+    MustDrain: FnMut(&C) -> bool,
+    T: Send,
+    A: Clone + Send,
+    E: Send,
+{
+    let (work_tx, work_rx) = mpsc::sync_channel::<T>(SYNC_PUSH_QUEUE_DEPTH);
+    let (ack_tx, ack_rx) = mpsc::sync_channel::<Result<A, E>>(SYNC_PUSH_QUEUE_DEPTH);
+
+    thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            let mut last_written = None;
+            while let Ok(item) = work_rx.recv() {
+                match write(item) {
+                    Ok(acknowledgement) => {
+                        last_written = Some(acknowledgement.clone());
+                        if ack_tx.send(Ok(acknowledgement)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = ack_tx.send(Err(error));
+                        break;
+                    }
+                }
+            }
+            last_written
+        });
+
+        let mut result = 'produce: loop {
+            loop {
+                match ack_rx.try_recv() {
+                    Ok(Ok(acknowledgement)) => {
+                        if let Err(error) = stored(context, acknowledgement) {
+                            break 'produce Err(PipelineFailure::Stage(error));
+                        }
+                    }
+                    Ok(Err(error)) => break 'produce Err(PipelineFailure::Stage(error)),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        break 'produce Err(PipelineFailure::WorkerStopped)
+                    }
+                }
+            }
+
+            let mut pending = match read(context) {
+                Ok(Some(item)) => item,
+                Ok(None) => break Ok(()),
+                Err(error) => break Err(PipelineFailure::Stage(error)),
+            };
+            loop {
+                match work_tx.try_send(pending) {
+                    Ok(()) => {
+                        while must_drain(context) {
+                            match ack_rx.recv() {
+                                Ok(Ok(acknowledgement)) => {
+                                    if let Err(error) = stored(context, acknowledgement) {
+                                        break 'produce Err(PipelineFailure::Stage(error));
+                                    }
+                                }
+                                Ok(Err(error)) => {
+                                    break 'produce Err(PipelineFailure::Stage(error))
+                                }
+                                Err(_) => break 'produce Err(PipelineFailure::WorkerStopped),
+                            }
+                        }
+                        break;
+                    }
+                    Err(TrySendError::Full(item)) => {
+                        pending = item;
+                        match ack_rx.recv() {
+                            Ok(Ok(acknowledgement)) => {
+                                if let Err(error) = stored(context, acknowledgement) {
+                                    break 'produce Err(PipelineFailure::Stage(error));
+                                }
+                            }
+                            Ok(Err(error)) => break 'produce Err(PipelineFailure::Stage(error)),
+                            Err(_) => break 'produce Err(PipelineFailure::WorkerStopped),
+                        }
+                    }
+                    Err(TrySendError::Disconnected(_)) => loop {
+                        match ack_rx.recv() {
+                            Ok(Ok(acknowledgement)) => {
+                                if let Err(error) = stored(context, acknowledgement) {
+                                    break 'produce Err(PipelineFailure::Stage(error));
+                                }
+                            }
+                            Ok(Err(error)) => break 'produce Err(PipelineFailure::Stage(error)),
+                            Err(_) => break 'produce Err(PipelineFailure::WorkerStopped),
+                        }
+                    },
+                }
+            }
+        };
+
+        drop(work_tx);
+        if result.is_ok() {
+            loop {
+                match ack_rx.recv() {
+                    Ok(Ok(acknowledgement)) => {
+                        if let Err(error) = stored(context, acknowledgement) {
+                            result = Err(PipelineFailure::Stage(error));
+                            break;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        result = Err(PipelineFailure::Stage(error));
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        drop(ack_rx);
+
+        match writer.join() {
+            Ok(last_written) => PipelineOutcome {
+                result,
+                last_written,
+            },
+            Err(_) => PipelineOutcome {
+                result: Err(PipelineFailure::WorkerPanicked),
+                last_written: None,
+            },
+        }
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub device: DeviceInfo,
@@ -38,6 +199,9 @@ pub struct ServerConfig {
     pub connection_window: u32,
     pub stream_window: u32,
     pub sync_root: PathBuf,
+    pub activation_root: PathBuf,
+    pub proc_root: PathBuf,
+    pub log_path: PathBuf,
 }
 
 impl ServerConfig {
@@ -49,6 +213,9 @@ impl ServerConfig {
             connection_window: DEFAULT_CONNECTION_WINDOW,
             stream_window: DEFAULT_STREAM_WINDOW,
             sync_root: PathBuf::from(DEFAULT_SYNC_ROOT),
+            activation_root: PathBuf::from(DEFAULT_ACTIVATION_ROOT),
+            proc_root: PathBuf::from(DEFAULT_PROC_ROOT),
+            log_path: PathBuf::from(DEFAULT_LOG_PATH),
         }
     }
 
@@ -61,6 +228,24 @@ impl ServerConfig {
     #[must_use]
     pub fn sync_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.sync_root = root.into();
+        self
+    }
+
+    #[must_use]
+    pub fn activation_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.activation_root = root.into();
+        self
+    }
+
+    #[must_use]
+    pub fn proc_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.proc_root = root.into();
+        self
+    }
+
+    #[must_use]
+    pub fn log_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.log_path = path.into();
         self
     }
 
@@ -225,7 +410,13 @@ fn serve_session(
             model: config.device.model.clone(),
             firmware: config.device.firmware.clone(),
             target: config.device.target.clone(),
-            features: vec![EXEC_FEATURE.to_owned(), SYNC_FEATURE.to_owned()],
+            features: vec![
+                APP_LIST_FEATURE.to_owned(),
+                EXEC_FEATURE.to_owned(),
+                LOG_TAIL_FEATURE.to_owned(),
+                PROCESS_LIST_FEATURE.to_owned(),
+                SYNC_FEATURE.to_owned(),
+            ],
             initial_connection_window: config.connection_window,
         };
         if let Err(error) = send(
@@ -431,7 +622,7 @@ fn serve_shell_stream(
     )?;
 
     let call: DeviceCall = decode(&request.payload, "device call")?;
-    let mut reply = dispatch(call, &config.device, sync_store);
+    let mut reply = dispatch(call, config, sync_store);
     let mut response_payload = encode(&reply)?;
     if response_payload.len() > usize::try_from(config.stream_window).unwrap_or(usize::MAX) {
         reply = DeviceReply::failure(RpcError::new(
@@ -553,6 +744,32 @@ fn serve_sync_stream(
     }
 }
 
+struct PushChunk {
+    payload: Arc<[u8]>,
+    payload_length: u32,
+    is_last: bool,
+}
+
+#[derive(Clone, Copy)]
+struct StoredPushChunk {
+    frame_start: u64,
+    payload_length: u32,
+    is_last: bool,
+}
+
+struct PushReceiveContext<'a> {
+    stream: &'a mut dyn FrameIo,
+    state: &'a mut SessionState,
+    control_sequence: &'a mut u32,
+    stream_id: u32,
+    send_sequence: u32,
+    received_batch: u64,
+    received_since_credit: u64,
+    credit_barrier: bool,
+    block_size: usize,
+    end_stream_received: bool,
+}
+
 fn serve_sync_push(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -588,70 +805,128 @@ fn serve_sync_push(
     )?;
 
     let block_size = usize::try_from(block_size).map_err(|_| ServerError::InvalidConfig)?;
-    let mut received_batch = 0_u64;
-    let mut last_frame_start = None;
-    let receive_result = loop {
-        let data = match read_stream_data(stream, state, stream_id) {
-            Ok(Some(frame)) => frame,
-            Ok(None) => break Err(ServerError::Disconnected),
-            Err(error) => break Err(error),
-        };
-        let payload_length = data.header.payload_length;
-        let is_last = data.header.flags & FLAG_END_STREAM != 0;
-        if data.payload.len() > block_size {
-            break Err(ServerError::UnexpectedFrame(
-                "sync DATA exceeds the negotiated block size",
-            ));
-        }
-        // Tie USB credit to bytes accepted by storage. The KT6 userstore is
-        // faster than the USB link, so an extra writer queue adds a second
-        // backpressure loop without increasing steady-state throughput.
-        let frame_start = transfer.offset();
-        if let Err(error) = transfer.write_chunk(&data.payload) {
-            break Err(ServerError::Sync(error));
-        }
-        last_frame_start = Some(frame_start);
-        let Some(next_received_batch) = received_batch.checked_add(u64::from(payload_length))
-        else {
-            break Err(ServerError::SequenceExhausted);
-        };
-        received_batch = next_received_batch;
-        if received_batch >= u64::from(SYNC_CREDIT_BATCH_SIZE) || is_last {
-            let delta = match u32::try_from(received_batch) {
-                Ok(delta) => delta,
-                Err(_) => {
-                    break Err(ServerError::UnexpectedFrame(
-                        "sync credit batch is too large",
-                    ))
-                }
-            };
-            if let Err(error) = restore_received_credit(
-                stream,
-                state,
-                stream_id,
-                &mut send_sequence,
-                control_sequence,
-                delta,
-            ) {
-                break Err(error);
+    let hash_state = transfer.hash_state();
+    let mut context = PushReceiveContext {
+        stream,
+        state,
+        control_sequence,
+        stream_id,
+        send_sequence,
+        received_batch: 0,
+        received_since_credit: 0,
+        credit_barrier: false,
+        block_size,
+        end_stream_received: false,
+    };
+    // Hashing receives the same reference as the storage worker through a
+    // zero-capacity handoff. This overlaps USB, BLAKE3 and storage without
+    // retaining another queued payload or weakening final verification.
+    let (pipeline, digest_result) = thread::scope(|scope| {
+        let (hash_tx, hash_rx) = mpsc::sync_channel::<Arc<[u8]>>(0);
+        let hash_worker = scope.spawn(move || {
+            let mut hasher = hash_state;
+            while let Ok(payload) = hash_rx.recv() {
+                hasher.update(&payload);
             }
-            received_batch = 0;
-        }
-        if is_last {
-            break Ok(());
+            hasher.finalize()
+        });
+        let pipeline = run_bounded_pipeline(
+            &mut context,
+            |context| {
+                if context.end_stream_received {
+                    return Ok(None);
+                }
+                let data = read_stream_data(context.stream, context.state, context.stream_id)?
+                    .ok_or(ServerError::Disconnected)?;
+                if data.payload.len() > context.block_size {
+                    return Err(ServerError::UnexpectedFrame(
+                        "sync DATA exceeds the negotiated block size",
+                    ));
+                }
+                let is_last = data.header.flags & FLAG_END_STREAM != 0;
+                context.end_stream_received = is_last;
+                context.received_since_credit = context
+                    .received_since_credit
+                    .checked_add(u64::from(data.header.payload_length))
+                    .ok_or(ServerError::SequenceExhausted)?;
+                if context.received_since_credit >= u64::from(SYNC_CREDIT_BATCH_SIZE) || is_last {
+                    context.credit_barrier = true;
+                }
+                Ok(Some(PushChunk {
+                    payload: Arc::from(data.payload),
+                    payload_length: data.header.payload_length,
+                    is_last,
+                }))
+            },
+            |chunk| {
+                hash_tx
+                    .send(Arc::clone(&chunk.payload))
+                    .map_err(|_| ServerError::UnexpectedFrame("sync hash worker stopped"))?;
+                let frame_start = transfer.offset();
+                transfer.write_chunk_without_hash(&chunk.payload)?;
+                Ok(StoredPushChunk {
+                    frame_start,
+                    payload_length: chunk.payload_length,
+                    is_last: chunk.is_last,
+                })
+            },
+            |context, stored| {
+                context.received_batch = context
+                    .received_batch
+                    .checked_add(u64::from(stored.payload_length))
+                    .ok_or(ServerError::SequenceExhausted)?;
+                if context.received_batch >= u64::from(SYNC_CREDIT_BATCH_SIZE) || stored.is_last {
+                    let delta = u32::try_from(context.received_batch).map_err(|_| {
+                        ServerError::UnexpectedFrame("sync credit batch is too large")
+                    })?;
+                    restore_received_credit(
+                        context.stream,
+                        context.state,
+                        context.stream_id,
+                        &mut context.send_sequence,
+                        context.control_sequence,
+                        delta,
+                    )?;
+                    context.received_batch = 0;
+                    context.received_since_credit = 0;
+                    context.credit_barrier = false;
+                }
+                Ok(())
+            },
+            |context| context.credit_barrier,
+        );
+        drop(hash_tx);
+        let digest = hash_worker
+            .join()
+            .map_err(|_| ServerError::UnexpectedFrame("sync hash worker panicked"));
+        (pipeline, digest)
+    });
+    send_sequence = context.send_sequence;
+    let last_frame_start = pipeline.last_written.map(|stored| stored.frame_start);
+    let receive_result = match pipeline.result {
+        Ok(()) => Ok(()),
+        Err(PipelineFailure::Stage(error)) => Err(error),
+        Err(PipelineFailure::WorkerStopped) => Err(ServerError::UnexpectedFrame(
+            "sync storage worker stopped before the transfer completed",
+        )),
+        Err(PipelineFailure::WorkerPanicked) => {
+            Err(ServerError::UnexpectedFrame("sync storage worker panicked"))
         }
     };
 
-    if let Err(receive_error) = receive_result {
-        if let Some(offset) = last_frame_start {
-            transfer.rollback_for_resume(offset)?;
-        } else {
-            transfer.checkpoint()?;
+    let digest = match receive_result.and(digest_result) {
+        Ok(digest) => digest,
+        Err(receive_error) => {
+            if let Some(offset) = last_frame_start {
+                transfer.rollback_for_resume(offset)?;
+            } else {
+                transfer.checkpoint()?;
+            }
+            return Err(receive_error);
         }
-        return Err(receive_error);
-    }
+    };
 
-    let status = match transfer.finish() {
+    let status = match transfer.finish_with_digest(digest) {
         Ok(status) => status,
         Err(error) => {
             return send_sync_failure(stream, state, stream_id, send_sequence, error.into_rpc())
@@ -769,61 +1044,168 @@ fn serve_sync_pull(
     )
 }
 
-fn dispatch(call: DeviceCall, device: &DeviceInfo, sync_store: &SyncStore) -> DeviceReply {
-    if call.method == methods::SYNC_STATUS {
-        let params = match serde_json::from_value::<SyncStatusParams>(call.params) {
-            Ok(params) => params,
-            Err(_) => {
-                return DeviceReply::failure(RpcError::invalid_params(
-                    "expected serial and transfer_id",
-                ))
-            }
-        };
-        if params.serial != device.serial {
-            return DeviceReply::failure(RpcError::device_not_found(&params.serial));
-        }
-        return match sync_store.status(&params.transfer_id) {
-            Ok(status) => match serde_json::to_value(status) {
-                Ok(value) => DeviceReply::success(value),
-                Err(_) => DeviceReply::failure(RpcError::internal_error()),
-            },
-            Err(error) => DeviceReply::failure(error.into_rpc()),
-        };
+fn dispatch(call: DeviceCall, config: &ServerConfig, sync_store: &SyncStore) -> DeviceReply {
+    match call.method.as_str() {
+        methods::SYNC_STATUS => reply(dispatch_sync_status(call.params, config, sync_store)),
+        methods::EXEC_RUN => reply(dispatch_exec(call.params, config)),
+        methods::APP_LIST => reply(dispatch_app_list(call.params, config)),
+        methods::PROCESS_LIST => reply(dispatch_process_list(call.params, config)),
+        methods::LOG_TAIL => reply(dispatch_log_tail(call.params, config)),
+        methods::APP_INSTALL => reply(unavailable_app_install(call.params, config)),
+        methods::APP_START => reply(unavailable_app_target(
+            call.params,
+            config,
+            APP_START_FEATURE,
+        )),
+        methods::APP_STOP => reply(unavailable_app_target(
+            call.params,
+            config,
+            APP_STOP_FEATURE,
+        )),
+        methods::APP_RESTART => reply(unavailable_app_target(
+            call.params,
+            config,
+            APP_RESTART_FEATURE,
+        )),
+        methods::APP_ROLLBACK => reply(unavailable_app_target(
+            call.params,
+            config,
+            APP_ROLLBACK_FEATURE,
+        )),
+        methods::APP_UNINSTALL => reply(unavailable_app_target(
+            call.params,
+            config,
+            APP_UNINSTALL_FEATURE,
+        )),
+        methods::PROCESS_SIGNAL => reply(unavailable_process_signal(call.params, config)),
+        _ => DeviceReply::failure(RpcError::method_not_found(&call.method)),
     }
-    if call.method != methods::EXEC_RUN {
-        return DeviceReply::failure(RpcError::method_not_found(&call.method));
+}
+
+fn reply<T: Serialize>(result: Result<T, RpcError>) -> DeviceReply {
+    match result
+        .and_then(|value| serde_json::to_value(value).map_err(|_| RpcError::internal_error()))
+    {
+        Ok(value) => DeviceReply::success(value),
+        Err(error) => DeviceReply::failure(error),
     }
-    let params = match serde_json::from_value::<ExecParams>(call.params) {
-        Ok(params) => params,
-        Err(_) => {
-            return DeviceReply::failure(RpcError::invalid_params(
-                "expected serial, argv, cwd, environment, and timeout_ms",
-            ))
-        }
-    };
-    if params.serial != device.serial {
-        return DeviceReply::failure(RpcError::device_not_found(&params.serial));
-    }
+}
+
+fn dispatch_sync_status(
+    params: serde_json::Value,
+    config: &ServerConfig,
+    sync_store: &SyncStore,
+) -> Result<impl Serialize, RpcError> {
+    let params = decode_params::<SyncStatusParams>(params, "expected serial and transfer_id")?;
+    require_serial(&params.serial, config)?;
+    sync_store
+        .status(&params.transfer_id)
+        .map_err(StoreError::into_rpc)
+}
+
+fn dispatch_exec(
+    params: serde_json::Value,
+    config: &ServerConfig,
+) -> Result<impl Serialize, RpcError> {
+    let params = decode_params::<ExecParams>(
+        params,
+        "expected serial, argv, cwd, environment, and timeout_ms",
+    )?;
+    require_serial(&params.serial, config)?;
     match exec::run(&params) {
-        Ok(result) => match serde_json::to_value(result) {
-            Ok(result) => DeviceReply::success(result),
-            Err(_) => DeviceReply::failure(RpcError::internal_error()),
-        },
+        Ok(result) => Ok(result),
         Err(ExecError::EmptyArgv | ExecError::InvalidTimeout) => {
-            DeviceReply::failure(RpcError::invalid_params("invalid exec bounds"))
+            Err(RpcError::invalid_params("invalid exec bounds"))
         }
-        Err(ExecError::Timeout(timeout)) => DeviceReply::failure(
-            RpcError::new(error_codes::EXEC_TIMEOUT, "Command timed out")
-                .with_data(serde_json::json!({ "timeout_ms": timeout })),
-        ),
-        Err(ExecError::OutputLimit) => DeviceReply::failure(RpcError::new(
+        Err(ExecError::Timeout(timeout)) => Err(RpcError::new(
+            error_codes::EXEC_TIMEOUT,
+            "Command timed out",
+        )
+        .with_data(serde_json::json!({ "timeout_ms": timeout }))),
+        Err(ExecError::OutputLimit) => Err(RpcError::new(
             error_codes::EXEC_OUTPUT_LIMIT,
             "Command output exceeds the device limit",
         )),
-        Err(_) => DeviceReply::failure(RpcError::new(
+        Err(_) => Err(RpcError::new(
             error_codes::EXEC_FAILED,
             "Command could not be executed",
         )),
+    }
+}
+
+fn dispatch_app_list(
+    params: serde_json::Value,
+    config: &ServerConfig,
+) -> Result<impl Serialize, RpcError> {
+    let params = decode_params::<SerialParams>(params, "expected serial")?;
+    require_serial(&params.serial, config)?;
+    services::app_list(&config.activation_root)
+}
+
+fn dispatch_process_list(
+    params: serde_json::Value,
+    config: &ServerConfig,
+) -> Result<impl Serialize, RpcError> {
+    let params = decode_params::<SerialParams>(params, "expected serial")?;
+    require_serial(&params.serial, config)?;
+    services::process_list(&config.proc_root)
+}
+
+fn dispatch_log_tail(
+    params: serde_json::Value,
+    config: &ServerConfig,
+) -> Result<impl Serialize, RpcError> {
+    let params = decode_params::<LogTailParams>(params, "expected serial, cursor, and limit")?;
+    require_serial(&params.serial, config)?;
+    services::log_tail(&config.log_path, &params)
+}
+
+fn unavailable_app_install(
+    params: serde_json::Value,
+    config: &ServerConfig,
+) -> Result<serde_json::Value, RpcError> {
+    let params = decode_params::<AppInstallParams>(params, "expected serial, app_id, and version")?;
+    require_serial(&params.serial, config)?;
+    Err(RpcError::feature_unavailable(
+        &params.serial,
+        APP_INSTALL_FEATURE,
+    ))
+}
+
+fn unavailable_app_target(
+    params: serde_json::Value,
+    config: &ServerConfig,
+    feature: &str,
+) -> Result<serde_json::Value, RpcError> {
+    let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
+    require_serial(&params.serial, config)?;
+    Err(RpcError::feature_unavailable(&params.serial, feature))
+}
+
+fn unavailable_process_signal(
+    params: serde_json::Value,
+    config: &ServerConfig,
+) -> Result<serde_json::Value, RpcError> {
+    let params = decode_params::<ProcessSignalParams>(params, "expected serial, pid, and signal")?;
+    require_serial(&params.serial, config)?;
+    Err(RpcError::feature_unavailable(
+        &params.serial,
+        PROCESS_SIGNAL_FEATURE,
+    ))
+}
+
+fn decode_params<T: serde::de::DeserializeOwned>(
+    params: serde_json::Value,
+    detail: &'static str,
+) -> Result<T, RpcError> {
+    serde_json::from_value(params).map_err(|_| RpcError::invalid_params(detail))
+}
+
+fn require_serial(serial: &str, config: &ServerConfig) -> Result<(), RpcError> {
+    if serial == config.device.serial {
+        Ok(())
+    } else {
+        Err(RpcError::device_not_found(serial))
     }
 }
 
@@ -1165,6 +1547,9 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::io::{self, Cursor};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
+    use std::time::Duration;
 
     use kindlebridge_transport_tcp::SplitFrameStream;
 
@@ -1192,6 +1577,155 @@ mod tests {
         fn flush(&mut self) -> Result<(), TransportError> {
             Ok(())
         }
+    }
+
+    struct TrackedChunk {
+        index: usize,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl TrackedChunk {
+        fn new(index: usize, live: Arc<AtomicUsize>, maximum: &AtomicUsize) -> Self {
+            let current = live.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(current, Ordering::SeqCst);
+            Self { index, live }
+        }
+    }
+
+    impl Drop for TrackedChunk {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn bounded_pipeline_overlaps_reads_with_slow_storage_without_unbounded_payloads() {
+        const CHUNK_COUNT: usize = 12;
+        let live = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let overlapped = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(AtomicUsize::new(0));
+        let write_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (writer_started_tx, writer_started_rx) = mpsc::sync_channel(1);
+        let mut next = 0;
+        let mut stored_count = 0;
+
+        let outcome: PipelineOutcome<usize, &'static str> = run_bounded_pipeline(
+            &mut stored_count,
+            {
+                let live = Arc::clone(&live);
+                let maximum = Arc::clone(&maximum);
+                let write_gate = Arc::clone(&write_gate);
+                move |_| {
+                    if next == 1 {
+                        writer_started_rx
+                            .recv_timeout(Duration::from_secs(1))
+                            .map_err(|_| "writer did not start")?;
+                        let (ready, condition) = &*write_gate;
+                        *ready.lock().map_err(|_| "write gate poisoned")? = true;
+                        condition.notify_one();
+                    }
+                    if next == CHUNK_COUNT {
+                        return Ok(None);
+                    }
+                    let chunk = TrackedChunk::new(next, Arc::clone(&live), &maximum);
+                    next += 1;
+                    Ok(Some(chunk))
+                }
+            },
+            {
+                let overlapped = Arc::clone(&overlapped);
+                let write_gate = Arc::clone(&write_gate);
+                let written = Arc::clone(&written);
+                move |chunk: TrackedChunk| {
+                    if chunk.index == 0 {
+                        writer_started_tx.send(()).map_err(|_| "reader stopped")?;
+                        let (ready, condition) = &*write_gate;
+                        let mut guard = ready.lock().map_err(|_| "write gate poisoned")?;
+                        if !*guard {
+                            (guard, _) = condition
+                                .wait_timeout(guard, Duration::from_millis(250))
+                                .map_err(|_| "write gate poisoned")?;
+                        }
+                        overlapped.store(*guard, Ordering::SeqCst);
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                    written.fetch_add(1, Ordering::SeqCst);
+                    Ok(chunk.index)
+                }
+            },
+            {
+                let written = Arc::clone(&written);
+                move |stored_count, _| {
+                    assert!(
+                        *stored_count < written.load(Ordering::SeqCst),
+                        "storage acknowledgement ran before the write completed"
+                    );
+                    *stored_count += 1;
+                    Ok(())
+                }
+            },
+            |_| false,
+        );
+
+        assert!(
+            outcome.result.is_ok(),
+            "pipeline failed: {:?}",
+            outcome.result
+        );
+        assert_eq!(stored_count, CHUNK_COUNT);
+        assert!(
+            overlapped.load(Ordering::SeqCst),
+            "the next USB read did not run while storage was blocked"
+        );
+        assert!(
+            maximum.load(Ordering::SeqCst) <= SYNC_PUSH_QUEUE_DEPTH + 2,
+            "payload ownership exceeded the queue, active writer, and producer slots"
+        );
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bounded_pipeline_stops_at_storage_error_and_discards_queued_payloads() {
+        let attempted = Arc::new(Mutex::new(Vec::new()));
+        let mut next = 0_usize;
+        let mut stored = Vec::new();
+        let outcome: PipelineOutcome<usize, &'static str> = run_bounded_pipeline(
+            &mut stored,
+            |_| {
+                if next == 12 {
+                    Ok(None)
+                } else {
+                    let item = next;
+                    next += 1;
+                    Ok(Some(item))
+                }
+            },
+            {
+                let attempted = Arc::clone(&attempted);
+                move |item| {
+                    attempted.lock().unwrap().push(item);
+                    if item == 2 {
+                        Err("simulated storage failure")
+                    } else {
+                        Ok(item)
+                    }
+                }
+            },
+            |stored, item| {
+                stored.push(item);
+                Ok(())
+            },
+            |_| false,
+        );
+
+        assert!(matches!(
+            outcome.result,
+            Err(PipelineFailure::Stage("simulated storage failure"))
+        ));
+        assert_eq!(outcome.last_written, Some(1));
+        assert_eq!(*attempted.lock().unwrap(), vec![0, 1, 2]);
+        assert_eq!(stored, vec![0, 1]);
     }
 
     #[test]
@@ -1326,7 +1860,12 @@ mod tests {
 
     #[test]
     fn fresh_hello_interrupting_an_active_usb_stream_is_not_lost() {
-        let config = ServerConfig::new(DeviceInfo::kt6("KT6-USB-RESTART"));
+        let root = std::env::temp_dir().join(format!(
+            "kindlebridge-usb-fresh-hello-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let config = ServerConfig::new(DeviceInfo::kt6("KT6-USB-RESTART")).sync_root(root.clone());
         let hello = || {
             frame(
                 Command::Hello,
@@ -1342,6 +1881,16 @@ mod tests {
             )
             .unwrap()
         };
+        let payload = vec![0x6b; 2 * 64 * 1024];
+        let request = SyncRequest::Push {
+            transfer_id: None,
+            remote_path: "fresh-hello/payload.bin".to_owned(),
+            total_size: payload.len() as u64,
+            file_hash: blake3::hash(&payload).to_hex().to_string(),
+            block_size: 64 * 1024,
+        };
+        let mut response_credit = Header::new(Command::Credit, 1, 1);
+        response_credit.credit_delta = DEFAULT_STREAM_WINDOW;
         let mut stream = ScriptedFrameIo {
             reads: VecDeque::from([
                 Ok(hello()),
@@ -1355,6 +1904,9 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap()),
+                Ok(Frame::new(response_credit, Vec::new()).unwrap()),
+                Ok(frame(Command::Data, 1, 2, encode(&request).unwrap()).unwrap()),
+                Ok(frame(Command::Data, 1, 3, payload[..64 * 1024].to_vec()).unwrap()),
                 Ok(hello()),
                 Ok(frame(Command::GoAway, 0, 1, Vec::new()).unwrap()),
             ]),
@@ -1376,6 +1928,18 @@ mod tests {
                 .count(),
             2
         );
+        let staging = root.join(".kindlebridge-sync");
+        let part = fs::read_dir(staging)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "part")
+            })
+            .unwrap();
+        assert_eq!(fs::metadata(part).unwrap().len(), 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1423,6 +1987,97 @@ mod tests {
         let device: DeviceHello = decode(&hello.payload, "device HELLO").unwrap();
         assert_eq!(device.serial, "KT6-USB-SERVER");
         assert_eq!(device.session_id, TEST_SESSION_ID);
+    }
+
+    #[test]
+    fn split_endpoints_serve_a_real_process_list_call() {
+        let proc_root = std::env::temp_dir().join(format!(
+            "kindlebridge-split-process-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&proc_root);
+        fs::create_dir_all(proc_root.join("42")).unwrap();
+        fs::write(proc_root.join("42/comm"), b"reader\n").unwrap();
+        let config =
+            ServerConfig::new(DeviceInfo::kt6("KT6-USB-PROCESS")).proc_root(proc_root.clone());
+        let host_hello = HostHello {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: TEST_SESSION_ID.to_owned(),
+            client_name: "usb-process-test".to_owned(),
+            initial_connection_window: DEFAULT_CONNECTION_WINDOW,
+        };
+        let mut incoming = Vec::new();
+        let mut append = |frame: Frame| {
+            incoming.extend_from_slice(&frame.encode(config.limits()).unwrap());
+        };
+        append(frame(Command::Hello, 0, 0, encode(&host_hello).unwrap()).unwrap());
+        append(
+            frame(
+                Command::Open,
+                1,
+                0,
+                encode(&ServiceOpen {
+                    service: SHELL_SERVICE.to_owned(),
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut response_credit = Header::new(Command::Credit, 1, 1);
+        response_credit.credit_delta = DEFAULT_STREAM_WINDOW;
+        append(Frame::new(response_credit, Vec::new()).unwrap());
+        let mut request = frame(
+            Command::Data,
+            1,
+            2,
+            encode(&DeviceCall {
+                method: methods::PROCESS_LIST.to_owned(),
+                params: serde_json::json!({ "serial": "KT6-USB-PROCESS" }),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        request.header.flags = FLAG_END_STREAM;
+        append(request);
+        append(frame(Command::GoAway, 0, 1, Vec::new()).unwrap());
+
+        let mut stream = SplitFrameStream::new(
+            Cursor::new(incoming),
+            Cursor::new(Vec::<u8>::new()),
+            transport_config(&config),
+        )
+        .unwrap();
+        serve_session(
+            &mut stream,
+            &config,
+            &SyncStore::new(config.sync_root.clone()),
+            false,
+        )
+        .unwrap();
+
+        let (_, output) = stream.into_inner();
+        let mut reader = kindlebridge_transport_tcp::FrameReader::new(
+            Cursor::new(output.into_inner()),
+            transport_config(&config),
+        )
+        .unwrap();
+        let mut process_reply = None;
+        while let Ok(frame) = reader.read_frame() {
+            if frame.header.command == Command::Data && frame.header.stream_id == 1 {
+                process_reply = Some(
+                    decode::<DeviceReply>(&frame.payload, "process reply")
+                        .unwrap()
+                        .into_result()
+                        .unwrap(),
+                );
+            }
+        }
+        let result: kindlebridge_schema::ProcessList =
+            serde_json::from_value(process_reply.unwrap()).unwrap();
+        assert_eq!(result.processes.len(), 1);
+        assert_eq!(result.processes[0].pid, 42);
+        assert_eq!(result.processes[0].name, "reader");
+        fs::remove_dir_all(proc_root).unwrap();
     }
 
     #[test]
@@ -1602,6 +2257,7 @@ mod tests {
 
     #[test]
     fn dispatch_exec_preserves_typed_result() {
+        let config = ServerConfig::new(DeviceInfo::kt6("KT6-LINK"));
         let executable = std::env::current_exe().unwrap();
         let params = ExecParams {
             serial: "KT6-LINK".to_owned(),
@@ -1618,7 +2274,7 @@ mod tests {
                 method: methods::EXEC_RUN.to_owned(),
                 params: serde_json::to_value(params).unwrap(),
             },
-            &DeviceInfo::kt6("KT6-LINK"),
+            &config,
             &SyncStore::new(std::env::temp_dir().join("kindlebridge-dispatch-test")),
         );
         let result = reply.into_result().unwrap();
@@ -1631,6 +2287,7 @@ mod tests {
 
     #[test]
     fn wrong_serial_is_a_stable_device_error() {
+        let config = ServerConfig::new(DeviceInfo::kt6("KT6-LINK"));
         let reply = dispatch(
             DeviceCall {
                 method: methods::EXEC_RUN.to_owned(),
@@ -1641,12 +2298,91 @@ mod tests {
                     "timeout_ms": 1
                 }),
             },
-            &DeviceInfo::kt6("KT6-LINK"),
+            &config,
             &SyncStore::new(std::env::temp_dir().join("kindlebridge-dispatch-test")),
         );
         assert_eq!(
             reply.into_result().unwrap_err().code,
             error_codes::DEVICE_NOT_FOUND
         );
+    }
+
+    #[test]
+    fn unsupported_mutations_report_the_exact_unadvertised_capability() {
+        let config = ServerConfig::new(DeviceInfo::kt6("KT6-LINK"));
+        let sync_store = SyncStore::new(std::env::temp_dir().join("kindlebridge-dispatch-test"));
+        for (method, params, feature) in [
+            (
+                methods::APP_INSTALL,
+                serde_json::json!({
+                    "serial": "KT6-LINK",
+                    "app_id": "org.example.reader",
+                    "version": "1.0.0"
+                }),
+                APP_INSTALL_FEATURE,
+            ),
+            (
+                methods::APP_START,
+                serde_json::json!({
+                    "serial": "KT6-LINK",
+                    "app_id": "org.example.reader"
+                }),
+                APP_START_FEATURE,
+            ),
+            (
+                methods::APP_STOP,
+                serde_json::json!({
+                    "serial": "KT6-LINK",
+                    "app_id": "org.example.reader"
+                }),
+                APP_STOP_FEATURE,
+            ),
+            (
+                methods::APP_RESTART,
+                serde_json::json!({
+                    "serial": "KT6-LINK",
+                    "app_id": "org.example.reader"
+                }),
+                APP_RESTART_FEATURE,
+            ),
+            (
+                methods::APP_ROLLBACK,
+                serde_json::json!({
+                    "serial": "KT6-LINK",
+                    "app_id": "org.example.reader"
+                }),
+                APP_ROLLBACK_FEATURE,
+            ),
+            (
+                methods::APP_UNINSTALL,
+                serde_json::json!({
+                    "serial": "KT6-LINK",
+                    "app_id": "org.example.reader"
+                }),
+                APP_UNINSTALL_FEATURE,
+            ),
+            (
+                methods::PROCESS_SIGNAL,
+                serde_json::json!({
+                    "serial": "KT6-LINK",
+                    "pid": 42,
+                    "signal": "TERM"
+                }),
+                PROCESS_SIGNAL_FEATURE,
+            ),
+        ] {
+            let error = dispatch(
+                DeviceCall {
+                    method: method.to_owned(),
+                    params,
+                },
+                &config,
+                &sync_store,
+            )
+            .into_result()
+            .unwrap_err();
+            assert_eq!(error.code, error_codes::FEATURE_UNAVAILABLE);
+            assert_eq!(error.data.unwrap()["feature"], feature);
+        }
     }
 }

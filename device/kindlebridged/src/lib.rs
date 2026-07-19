@@ -1,6 +1,9 @@
 //! Unprivileged KindleBridge device service catalog and admission policy.
 
 use kindlebridge_broker::{AuthenticatedSession, Grant, SUPPORTED_BUNDLE_PROFILE};
+use kindlebridge_schema::device_protocol::{
+    APP_LIST_FEATURE, LOG_TAIL_FEATURE, PROCESS_LIST_FEATURE,
+};
 use kindlebridge_wire::{PROTOCOL_MAJOR as KBP_MAJOR, PROTOCOL_MINOR as KBP_MINOR};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -9,6 +12,7 @@ pub mod app;
 pub mod exec;
 pub mod probe;
 pub mod server;
+mod services;
 pub mod sync;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -76,12 +80,12 @@ pub const SERVICES: &[ServiceDefinition] = &[
         available_on_kindlehf: true,
     },
     ServiceDefinition {
-        name: "app.v1",
-        required_grant: Grant::ProcessApp,
+        name: APP_LIST_FEATURE,
+        required_grant: Grant::DeviceRead,
         available_on_kindlehf: true,
     },
     ServiceDefinition {
-        name: "log.v1",
+        name: LOG_TAIL_FEATURE,
         required_grant: Grant::DeviceRead,
         available_on_kindlehf: true,
     },
@@ -91,8 +95,8 @@ pub const SERVICES: &[ServiceDefinition] = &[
         available_on_kindlehf: true,
     },
     ServiceDefinition {
-        name: "process.v1",
-        required_grant: Grant::ProcessApp,
+        name: PROCESS_LIST_FEATURE,
+        required_grant: Grant::DeviceRead,
         available_on_kindlehf: true,
     },
     ServiceDefinition {

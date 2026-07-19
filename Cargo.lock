@@ -585,6 +585,7 @@ dependencies = [
  "blake3",
  "clap",
  "kindlebridge-broker",
+ "kindlebridge-bundle",
  "kindlebridge-functionfs",
  "kindlebridge-launcher",
  "kindlebridge-schema",
