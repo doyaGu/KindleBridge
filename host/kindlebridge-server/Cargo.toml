@@ -6,10 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = "0.22"
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
 getrandom = "0.2"
+interprocess = "=2.4.2"
 kindlebridge-schema = { path = "../../crates/kindlebridge-schema" }
+kindlebridge-transport = { path = "../../crates/kindlebridge-transport" }
 kindlebridge-transport-tcp = { path = "../../crates/kindlebridge-transport-tcp" }
 kindlebridge-transport-usb = { path = "../../crates/kindlebridge-transport-usb" }
 kindlebridge-wire = { path = "../../crates/kindlebridge-wire" }

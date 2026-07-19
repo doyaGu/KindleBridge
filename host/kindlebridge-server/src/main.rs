@@ -3,12 +3,18 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
+use interprocess::local_socket::{
+    prelude::*, GenericFilePath, GenericNamespaced, ListenerNonblockingMode, ListenerOptions,
+};
 use kindlebridge_server::{
-    serve, ConnectedDeviceProvider, DeviceProvider, DeviceRecord, MemoryDeviceProvider,
+    reset_server_stop_requested, serve_streaming, server_stop_requested, ConnectedDeviceProvider,
+    DeviceProvider, DeviceRecord, MemoryDeviceProvider, ReconnectingUsbProvider,
 };
 use kindlebridge_transport_usb::UsbMatch;
 
@@ -52,6 +58,10 @@ struct Args {
         value_parser = parse_usb_id
     )]
     usb_product_id: u16,
+
+    /// Exit after this many idle seconds with no local clients.
+    #[arg(long, default_value_t = 600, hide = true)]
+    idle_timeout_secs: u64,
 }
 
 fn main() -> ExitCode {
@@ -65,9 +75,6 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Args) -> Result<(), String> {
-    if !args.stdio {
-        return Err("no transport selected; pass --stdio".to_owned());
-    }
     let selected = usize::from(args.devices_file.is_some())
         + usize::from(!args.tcp_device.is_empty())
         + usize::from(args.usb);
@@ -78,19 +85,16 @@ fn run(args: Args) -> Result<(), String> {
         return Err("--usb-serial requires --usb".to_owned());
     }
     let _parent_watchdog = start_parent_watchdog(args.parent_watchdog)?;
-    let provider: Box<dyn DeviceProvider> = if args.usb {
-        Box::new(
-            ConnectedDeviceProvider::connect_usb(&UsbMatch {
-                vendor_id: AMAZON_VENDOR_ID,
-                product_id: args.usb_product_id,
-                interface_subclass: KINDLEBRIDGE_USB_SUBCLASS,
-                interface_protocol: KINDLEBRIDGE_USB_PROTOCOL,
-                serial_number: args.usb_serial,
-            })
-            .map_err(|error| error.to_string())?,
-        )
+    let provider: Arc<dyn DeviceProvider> = if args.usb {
+        Arc::new(ReconnectingUsbProvider::new(UsbMatch {
+            vendor_id: AMAZON_VENDOR_ID,
+            product_id: args.usb_product_id,
+            interface_subclass: KINDLEBRIDGE_USB_SUBCLASS,
+            interface_protocol: KINDLEBRIDGE_USB_PROTOCOL,
+            serial_number: args.usb_serial,
+        }))
     } else if !args.tcp_device.is_empty() {
-        Box::new(
+        Arc::new(
             ConnectedDeviceProvider::connect(&args.tcp_device)
                 .map_err(|error| error.to_string())?,
         )
@@ -105,16 +109,140 @@ fn run(args: Args) -> Result<(), String> {
             }
             None => Vec::new(),
         };
-        Box::new(MemoryDeviceProvider::new(records))
+        Arc::new(MemoryDeviceProvider::new(records))
     };
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    serve(
-        &mut BufReader::new(stdin.lock()),
-        &mut BufWriter::new(stdout.lock()),
-        provider.as_ref(),
-    )
-    .map_err(|error| error.to_string())
+    if args.stdio {
+        serve_streaming(
+            &mut BufReader::new(io::stdin()),
+            BufWriter::new(io::stdout()),
+            provider,
+        )
+        .map_err(|error| error.to_string())
+    } else {
+        run_local_service(provider, Duration::from_secs(args.idle_timeout_secs))
+    }
+}
+
+fn run_local_service(
+    provider: Arc<dyn DeviceProvider>,
+    idle_timeout: Duration,
+) -> Result<(), String> {
+    reset_server_stop_requested();
+    let endpoint = local_endpoint();
+    let listener = if GenericNamespaced::is_supported() {
+        ListenerOptions::new()
+            .name(
+                endpoint
+                    .as_str()
+                    .to_ns_name::<GenericNamespaced>()
+                    .map_err(|error| format!("invalid local pipe name: {error}"))?,
+            )
+            .nonblocking(ListenerNonblockingMode::Accept)
+            .create_sync()
+    } else {
+        ListenerOptions::new()
+            .name(
+                endpoint
+                    .as_str()
+                    .to_fs_name::<GenericFilePath>()
+                    .map_err(|error| format!("invalid local socket path: {error}"))?,
+            )
+            .try_overwrite(true)
+            .nonblocking(ListenerNonblockingMode::Accept)
+            .create_sync()
+    }
+    .map_err(|error| format!("could not listen on {endpoint}: {error}"))?;
+    secure_unix_socket(&endpoint)?;
+
+    let active_clients = Arc::new(AtomicUsize::new(0));
+    let mut idle_since = Instant::now();
+    loop {
+        if server_stop_requested() {
+            return Ok(());
+        }
+        match listener.accept() {
+            Ok(connection) => {
+                active_clients.fetch_add(1, Ordering::AcqRel);
+                let provider = Arc::clone(&provider);
+                let active_clients = Arc::clone(&active_clients);
+                thread::Builder::new()
+                    .name("kindlebridge-local-client".to_owned())
+                    .spawn(move || {
+                        let _guard = ClientGuard(active_clients);
+                        let (reader, writer) = connection.split();
+                        let _ = serve_streaming(
+                            &mut BufReader::new(reader),
+                            BufWriter::new(writer),
+                            provider,
+                        );
+                    })
+                    .map_err(|error| format!("could not start local client worker: {error}"))?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if active_clients.load(Ordering::Acquire) == 0 {
+                    if idle_since.elapsed() >= idle_timeout {
+                        return Ok(());
+                    }
+                } else {
+                    idle_since = Instant::now();
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(format!("local server accept failed: {error}")),
+        }
+    }
+}
+
+struct ClientGuard(Arc<AtomicUsize>);
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn local_endpoint() -> String {
+    if GenericNamespaced::is_supported() {
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_owned());
+        format!("kindlebridge-{}", sanitize_endpoint_component(&user))
+    } else {
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let user = std::env::var("USER").unwrap_or_else(|_| "user".to_owned());
+        base.join(format!(
+            "kindlebridge-{}.sock",
+            sanitize_endpoint_component(&user)
+        ))
+        .to_string_lossy()
+        .into_owned()
+    }
+}
+
+fn sanitize_endpoint_component(value: &str) -> String {
+    let value: String = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .take(64)
+        .collect();
+    if value.is_empty() {
+        "user".to_owned()
+    } else {
+        value
+    }
+}
+
+#[cfg(unix)]
+fn secure_unix_socket(endpoint: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(endpoint, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("could not secure local socket {endpoint}: {error}"))
+}
+
+#[cfg(not(unix))]
+fn secure_unix_socket(_endpoint: &str) -> Result<(), String> {
+    Ok(())
 }
 
 struct ParentWatchdog {

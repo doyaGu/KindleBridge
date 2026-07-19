@@ -10,12 +10,15 @@ use std::time::{Duration, Instant};
 
 use kindlebridge_schema::device_protocol::{
     is_valid_session_id, is_valid_transfer_id, DeviceCall, DeviceHello, DeviceReply, HostHello,
-    ServiceAccept, ServiceOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE,
-    APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE, APP_START_FEATURE, APP_STOP_FEATURE,
-    APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, LEGACY_RPC_SERVICE,
-    LOG_TAIL_FEATURE, MAX_HOST_TO_DEVICE_PAYLOAD, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE,
-    PROTOCOL_VERSION, SYNC_CREDIT_BATCH_SIZE, SYNC_FEATURE, SYNC_SERVICE,
+    ShellOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE, APP_RESTART_FEATURE,
+    APP_ROLLBACK_FEATURE, APP_START_FEATURE, APP_STOP_FEATURE, APP_UNINSTALL_FEATURE,
+    DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, LEGACY_RPC_SERVICE, LOG_TAIL_FEATURE,
+    MAX_HOST_TO_DEVICE_PAYLOAD, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION,
+    SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE, SYNC_SERVICE,
 };
+#[cfg(test)]
+use kindlebridge_schema::device_protocol::{ServiceAccept, ServiceOpen, SYNC_CREDIT_BATCH_SIZE};
+use kindlebridge_schema::shell_protocol::{PacketSource, ShellPacket, ShellStreamState};
 use kindlebridge_schema::{
     error_codes, AppInstallParams, AppList, AppSummary, AppTargetParams, DeviceFeatures,
     DeviceState, DeviceSummary, ExecParams, ExecResult, LogSnapshot, LogTailParams, ProcessList,
@@ -23,11 +26,19 @@ use kindlebridge_schema::{
     SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams, TransferState,
     MAX_SYNC_BLOCK_SIZE,
 };
+use kindlebridge_transport::{
+    actor::{
+        Connection, ConnectionError, FrameSink as ActorFrameSink, FrameSource as ActorFrameSource,
+        Stream as ActorStream,
+    },
+    TrafficClass,
+};
 use kindlebridge_transport_tcp::{
-    ErrorClass, FrameIo, SplitFrameStream, TcpFrameStream, TransportConfig, TransportError,
+    ErrorClass, FrameIo, FrameReader, FrameWriter, ShutdownMode, SplitFrameStream, TcpFrameStream,
+    TransportConfig, TransportError,
 };
 use kindlebridge_transport_usb::{
-    BufferConfig, TransportError as UsbTransportError, UsbMatch, UsbReader,
+    BufferConfig, TransportError as UsbTransportError, UsbMatch, UsbReader, UsbWriter,
 };
 use kindlebridge_wire::{
     Command, DecodeLimits, EndpointRole, Frame, FrameContext, Header, ProtocolError, SessionConfig,
@@ -54,18 +65,23 @@ const USB_RECOVERY_DRAIN_POLL: Duration = Duration::from_millis(250);
 struct ConnectedDevice {
     summary: DeviceSummary,
     features: DeviceFeatures,
-    session: Mutex<DeviceSession>,
+    session: ActorDeviceSession,
 }
 
 pub struct ConnectedDeviceProvider {
     devices: Vec<ConnectedDevice>,
 }
 
+pub struct ReconnectingUsbProvider {
+    criteria: UsbMatch,
+    current: Mutex<Option<std::sync::Arc<ConnectedDeviceProvider>>>,
+}
+
 impl ConnectedDeviceProvider {
     pub fn connect(addresses: &[SocketAddr]) -> Result<Self, ProviderError> {
         let mut devices = Vec::with_capacity(addresses.len());
         for address in addresses {
-            let (session, hello) = DeviceSession::connect(*address)
+            let (session, hello) = ActorDeviceSession::connect(*address)
                 .map_err(|error| ProviderError::new(error.to_string()))?;
             if devices
                 .iter()
@@ -91,7 +107,7 @@ impl ConnectedDeviceProvider {
                     protocol_version: hello.protocol_version,
                     features,
                 },
-                session: Mutex::new(session),
+                session,
             });
         }
         devices.sort_by(|left, right| left.summary.serial.cmp(&right.summary.serial));
@@ -101,7 +117,7 @@ impl ConnectedDeviceProvider {
     /// Open the exact KindleBridge WinUSB interface and perform the normal KBP
     /// device handshake. MTP remains owned by its separate composite interface.
     pub fn connect_usb(criteria: &UsbMatch) -> Result<Self, ProviderError> {
-        let (session, hello) = match DeviceSession::connect_usb(criteria) {
+        let (session, hello) = match ActorDeviceSession::connect_usb(criteria) {
             Ok(link) => link,
             Err(LinkError::Usb(UsbTransportError::DeviceNotFound)) => {
                 return Ok(Self {
@@ -126,15 +142,157 @@ impl ConnectedDeviceProvider {
                     protocol_version: hello.protocol_version,
                     features,
                 },
-                session: Mutex::new(session),
+                session,
             }],
         })
+    }
+
+    /// Open a persistent `shell.v2` stream on one connected device.
+    pub fn shell_open(&self, serial: &str, open: ShellOpen) -> Result<DeviceShell, RpcError> {
+        let device = self.require_feature(serial, SHELL_V2_FEATURE)?;
+        device.session.open_shell(open).map_err(link_rpc_error)
     }
 
     fn find(&self, serial: &str) -> Option<&ConnectedDevice> {
         self.devices
             .iter()
             .find(|device| device.summary.serial == serial)
+    }
+
+    fn is_online(&self) -> bool {
+        !self.devices.is_empty()
+            && self
+                .devices
+                .iter()
+                .all(|device| device.session.connection.is_online())
+    }
+}
+
+impl ReconnectingUsbProvider {
+    #[must_use]
+    pub fn new(criteria: UsbMatch) -> Self {
+        Self {
+            criteria,
+            current: Mutex::new(None),
+        }
+    }
+
+    fn connected(&self) -> Result<std::sync::Arc<ConnectedDeviceProvider>, ProviderError> {
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| ProviderError::new("USB provider state is unavailable"))?;
+        if let Some(provider) = current.as_ref().filter(|provider| provider.is_online()) {
+            return Ok(std::sync::Arc::clone(provider));
+        }
+        *current = None;
+        let provider = std::sync::Arc::new(ConnectedDeviceProvider::connect_usb(&self.criteria)?);
+        if provider.is_online() {
+            *current = Some(std::sync::Arc::clone(&provider));
+        }
+        Ok(provider)
+    }
+
+    fn invalidate(&self, failed: &std::sync::Arc<ConnectedDeviceProvider>) {
+        if let Ok(mut current) = self.current.lock() {
+            if current
+                .as_ref()
+                .is_some_and(|provider| std::sync::Arc::ptr_eq(provider, failed))
+            {
+                *current = None;
+            }
+        }
+    }
+
+    fn rpc<T>(
+        &self,
+        operation: impl FnOnce(&ConnectedDeviceProvider) -> Result<T, RpcError>,
+    ) -> Result<T, RpcError> {
+        let provider = self.connected().map_err(|error| {
+            RpcError::new(error_codes::SERVER_NOT_READY, "Device link is unavailable")
+                .with_data(serde_json::json!({ "reason": error.to_string() }))
+        })?;
+        let result = operation(&provider);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code == error_codes::SERVER_NOT_READY)
+        {
+            self.invalidate(&provider);
+        }
+        result
+    }
+}
+
+impl DeviceProvider for ReconnectingUsbProvider {
+    fn list(&self) -> Result<Vec<DeviceSummary>, ProviderError> {
+        self.connected()?.list()
+    }
+
+    fn features(&self, serial: &str) -> Result<Option<DeviceFeatures>, ProviderError> {
+        self.connected()?.features(serial)
+    }
+
+    fn exec(&self, params: &ExecParams) -> Result<Option<ExecResult>, RpcError> {
+        self.rpc(|provider| provider.exec(params))
+    }
+
+    fn sync_push(&self, params: SyncPushParams) -> Result<SyncPushResult, RpcError> {
+        self.rpc(|provider| provider.sync_push(params))
+    }
+
+    fn sync_pull(&self, params: SyncPullParams) -> Result<SyncPullResult, RpcError> {
+        self.rpc(|provider| provider.sync_pull(params))
+    }
+
+    fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError> {
+        self.rpc(|provider| provider.sync_status(params))
+    }
+
+    fn app_install(&self, params: AppInstallParams) -> Result<AppSummary, RpcError> {
+        self.rpc(|provider| provider.app_install(params))
+    }
+
+    fn app_start(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
+        self.rpc(|provider| provider.app_start(params))
+    }
+
+    fn app_stop(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
+        self.rpc(|provider| provider.app_stop(params))
+    }
+
+    fn app_restart(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
+        self.rpc(|provider| provider.app_restart(params))
+    }
+
+    fn app_rollback(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
+        self.rpc(|provider| provider.app_rollback(params))
+    }
+
+    fn app_uninstall(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
+        self.rpc(|provider| provider.app_uninstall(params))
+    }
+
+    fn app_list(&self, params: &SerialParams) -> Result<AppList, RpcError> {
+        self.rpc(|provider| provider.app_list(params))
+    }
+
+    fn process_list(&self, params: &SerialParams) -> Result<ProcessList, RpcError> {
+        self.rpc(|provider| provider.process_list(params))
+    }
+
+    fn process_signal(&self, params: &ProcessSignalParams) -> Result<ProcessSummary, RpcError> {
+        self.rpc(|provider| provider.process_signal(params))
+    }
+
+    fn log_tail(&self, params: &LogTailParams) -> Result<LogSnapshot, RpcError> {
+        self.rpc(|provider| provider.log_tail(params))
+    }
+
+    fn shell_open(
+        &self,
+        params: &kindlebridge_schema::ShellOpenParams,
+    ) -> Result<std::sync::Arc<dyn crate::ShellStream>, RpcError> {
+        self.rpc(|provider| DeviceProvider::shell_open(provider, params))
     }
 }
 
@@ -157,8 +315,6 @@ impl DeviceProvider for ConnectedDeviceProvider {
         };
         let value = device
             .session
-            .lock()
-            .map_err(|_| RpcError::internal_error())?
             .call(kindlebridge_schema::methods::EXEC_RUN, params)
             .map_err(link_rpc_error)?;
         serde_json::from_value(value)
@@ -187,8 +343,6 @@ impl DeviceProvider for ConnectedDeviceProvider {
         let file_hash = hash_file(&mut file, total_size)?;
         device
             .session
-            .lock()
-            .map_err(|_| RpcError::internal_error())?
             .sync_push(&params, &mut file, total_size, &file_hash)
             .map_err(link_rpc_error)
     }
@@ -198,20 +352,13 @@ impl DeviceProvider for ConnectedDeviceProvider {
         validate_host_path(&params.local_path)?;
         validate_block_size(params.block_size)?;
         validate_requested_transfer_id(params.transfer_id.as_deref())?;
-        device
-            .session
-            .lock()
-            .map_err(|_| RpcError::internal_error())?
-            .sync_pull(&params)
-            .map_err(link_rpc_error)
+        device.session.sync_pull(&params).map_err(link_rpc_error)
     }
 
     fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError> {
         let device = self.require_feature(&params.serial, SYNC_FEATURE)?;
         let value = device
             .session
-            .lock()
-            .map_err(|_| RpcError::internal_error())?
             .call(kindlebridge_schema::methods::SYNC_STATUS, params)
             .map_err(link_rpc_error)?;
         serde_json::from_value(value).map_err(|_| RpcError::internal_error())
@@ -306,6 +453,14 @@ impl DeviceProvider for ConnectedDeviceProvider {
             params,
         )
     }
+
+    fn shell_open(
+        &self,
+        params: &kindlebridge_schema::ShellOpenParams,
+    ) -> Result<std::sync::Arc<dyn crate::ShellStream>, RpcError> {
+        ConnectedDeviceProvider::shell_open(self, &params.serial, params.open.clone())
+            .map(|shell| std::sync::Arc::new(shell) as std::sync::Arc<dyn crate::ShellStream>)
+    }
 }
 
 impl ConnectedDeviceProvider {
@@ -335,8 +490,6 @@ impl ConnectedDeviceProvider {
         let device = self.require_feature(serial, feature)?;
         let value = device
             .session
-            .lock()
-            .map_err(|_| RpcError::internal_error())?
             .call(method, params)
             .map_err(link_rpc_error)?;
         serde_json::from_value(value).map_err(|_| RpcError::internal_error())
@@ -350,6 +503,461 @@ fn link_rpc_error(error: LinkError) -> RpcError {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ActorDeviceSession {
+    connection: Connection,
+}
+
+impl ActorDeviceSession {
+    fn connect(address: SocketAddr) -> Result<(Self, DeviceHello), LinkError> {
+        let (limits, transport) = session_transport_config();
+        let mut sink = TcpFrameStream::connect(address, transport)?;
+        let source = sink.try_clone()?;
+        let session_id = new_session_id()?;
+        let (state, hello) = negotiate(&mut sink, limits, false, &session_id)?;
+        let (connection, _incoming) =
+            Connection::start(state, TcpActorSource(source), TcpActorSink(sink));
+        Ok((Self { connection }, hello))
+    }
+
+    fn connect_usb(criteria: &UsbMatch) -> Result<(Self, DeviceHello), LinkError> {
+        let initial_started = Instant::now();
+        match Self::connect_usb_attempt(criteria, false) {
+            Err(error) if error.allows_usb_handshake_recovery() => {
+                trace_usb_recovery(format_args!(
+                    "initial probe failed after {} ms: {error}",
+                    initial_started.elapsed().as_millis()
+                ));
+                Self::connect_usb_attempt(criteria, true)
+            }
+            result => result,
+        }
+    }
+
+    fn connect_usb_attempt(
+        criteria: &UsbMatch,
+        recover_abandoned_frame: bool,
+    ) -> Result<(Self, DeviceHello), LinkError> {
+        let (limits, transport_config) = session_transport_config();
+        let transport = kindlebridge_transport_usb::open(criteria, usb_buffer_config())?;
+        let (mut reader, mut writer) = transport.split();
+        if recover_abandoned_frame {
+            writer.set_write_timeout(USB_RECOVERY_TIMEOUT);
+            write_usb_recovery_exchange(&mut reader, &mut writer, limits)?;
+            reader.set_read_timeout(USB_RECOVERY_TIMEOUT);
+        }
+        let mut stream = SplitFrameStream::new(reader, writer, transport_config)?;
+        let session_id = new_session_id()?;
+        let (state, hello) = negotiate(&mut stream, limits, recover_abandoned_frame, &session_id)?;
+        stream.reader_mut().set_read_timeout(Duration::MAX);
+        stream.writer_mut().set_write_timeout(Duration::MAX);
+        let (reader, writer) = stream.into_inner();
+        let source = UsbActorSource(FrameReader::new(reader, transport_config)?);
+        let sink = UsbActorSink(FrameWriter::new(writer, transport_config)?);
+        let (connection, _incoming) = Connection::start(state, source, sink);
+        Ok((Self { connection }, hello))
+    }
+
+    fn call(&self, method: &str, params: &impl Serialize) -> Result<Value, LinkError> {
+        let mut stream = self.connection.open(
+            LEGACY_RPC_SERVICE,
+            DEFAULT_STREAM_WINDOW,
+            TrafficClass::Bulk,
+        )?;
+        let call = DeviceCall {
+            method: method.to_owned(),
+            params: serde_json::to_value(params)?,
+        };
+        stream.send_data(encode(&call)?, true)?;
+        let response = actor_data(&mut stream)?;
+        if response.header.flags & FLAG_END_STREAM == 0 {
+            return Err(LinkError::UnexpectedFrame(
+                "device reply did not end the stream",
+            ));
+        }
+        actor_close(&mut stream)?;
+        let reply: DeviceReply = decode(&response.payload, "device reply")?;
+        reply.into_result().map_err(LinkError::Remote)
+    }
+
+    fn open_shell(&self, open: ShellOpen) -> Result<DeviceShell, LinkError> {
+        let stream = self.connection.open(
+            SHELL_V2_SERVICE,
+            SHELL_STREAM_WINDOW,
+            TrafficClass::Interactive,
+        )?;
+        stream.send_data(encode(&open)?, false)?;
+        Ok(DeviceShell {
+            stream,
+            input_state: Mutex::new(ShellStreamState::new(open.mode)),
+            output_state: Mutex::new(ShellStreamState::new(open.mode)),
+        })
+    }
+
+    fn sync_push(
+        &self,
+        params: &SyncPushParams,
+        file: &mut File,
+        total_size: u64,
+        file_hash: &str,
+    ) -> Result<SyncPushResult, LinkError> {
+        let mut stream =
+            self.connection
+                .open(SYNC_SERVICE, DEFAULT_STREAM_WINDOW, TrafficClass::Bulk)?;
+        stream.send_data(
+            encode(&SyncRequest::Push {
+                transfer_id: params.transfer_id.clone(),
+                remote_path: params.remote_path.clone(),
+                total_size,
+                file_hash: file_hash.to_owned(),
+                block_size: params.block_size,
+            })?,
+            false,
+        )?;
+        let ready: SyncReply = decode(&actor_data(&mut stream)?.payload, "sync reply")?;
+        let (transfer_id, offset) = match ready {
+            SyncReply::Ready {
+                transfer_id,
+                offset,
+                total_size: remote_size,
+                file_hash: remote_hash,
+            } if remote_size == total_size && remote_hash == file_hash => (transfer_id, offset),
+            SyncReply::Failure { error } => return Err(LinkError::Remote(error)),
+            _ => return Err(LinkError::UnexpectedFrame("invalid sync push READY")),
+        };
+        if !is_valid_transfer_id(&transfer_id)
+            || params
+                .transfer_id
+                .as_ref()
+                .is_some_and(|expected| expected != &transfer_id)
+            || offset > total_size
+        {
+            return Err(LinkError::UnexpectedFrame("sync push resume mismatch"));
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buffer = vec![0_u8; params.block_size as usize];
+        let mut sent = offset;
+        if sent == total_size {
+            stream.send_data(Vec::new(), true)?;
+        } else {
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    return Err(LinkError::UnexpectedFrame(
+                        "local file ended before its declared size",
+                    ));
+                }
+                sent = sent
+                    .checked_add(count as u64)
+                    .ok_or(LinkError::SequenceExhausted)?;
+                if sent > total_size {
+                    return Err(LinkError::UnexpectedFrame("local file grew during sync"));
+                }
+                let last = sent == total_size;
+                stream.send_data(buffer[..count].to_vec(), last)?;
+                if last {
+                    break;
+                }
+            }
+        }
+        let completion: SyncReply = decode(&actor_data(&mut stream)?.payload, "sync completion")?;
+        let result = match completion {
+            SyncReply::Complete {
+                transfer_id: completed_id,
+                next_offset,
+                total_size: completed_size,
+            } if completed_id == transfer_id
+                && next_offset == total_size
+                && completed_size == total_size =>
+            {
+                SyncPushResult {
+                    transfer_id,
+                    accepted_offset: next_offset,
+                    state: TransferState::Complete,
+                }
+            }
+            SyncReply::Failure { error } => return Err(LinkError::Remote(error)),
+            _ => return Err(LinkError::UnexpectedFrame("invalid sync push completion")),
+        };
+        actor_close(&mut stream)?;
+        Ok(result)
+    }
+
+    fn sync_pull(&self, params: &SyncPullParams) -> Result<SyncPullResult, LinkError> {
+        let mut stream =
+            self.connection
+                .open(SYNC_SERVICE, DEFAULT_STREAM_WINDOW, TrafficClass::Bulk)?;
+        let staging = params
+            .transfer_id
+            .as_deref()
+            .map(|id| staging_path(Path::new(&params.local_path), id))
+            .transpose()?;
+        let offset = staging
+            .as_ref()
+            .and_then(|path| fs::metadata(path).ok())
+            .map_or(0, |metadata| metadata.len());
+        stream.send_data(
+            encode(&SyncRequest::Pull {
+                transfer_id: params.transfer_id.clone(),
+                remote_path: params.remote_path.clone(),
+                offset,
+                block_size: params.block_size,
+            })?,
+            true,
+        )?;
+        let ready: SyncReply = decode(&actor_data(&mut stream)?.payload, "sync reply")?;
+        let (transfer_id, remote_offset, total_size, file_hash) = match ready {
+            SyncReply::Ready {
+                transfer_id,
+                offset,
+                total_size,
+                file_hash,
+            } => (transfer_id, offset, total_size, file_hash),
+            SyncReply::Failure { error } => return Err(LinkError::Remote(error)),
+            _ => return Err(LinkError::UnexpectedFrame("invalid sync pull READY")),
+        };
+        if !is_valid_transfer_id(&transfer_id)
+            || params
+                .transfer_id
+                .as_ref()
+                .is_some_and(|expected| expected != &transfer_id)
+            || remote_offset != offset
+            || remote_offset > total_size
+        {
+            return Err(LinkError::UnexpectedFrame("sync pull resume mismatch"));
+        }
+        let staging = match staging {
+            Some(path) => path,
+            None => staging_path(Path::new(&params.local_path), &transfer_id)?,
+        };
+        let mut output = open_staging(&staging, remote_offset)?;
+        let mut hasher = hash_prefix(&mut output, remote_offset)?;
+        output.seek(SeekFrom::Start(remote_offset))?;
+        let mut received = remote_offset;
+        loop {
+            let data = actor_data(&mut stream)?;
+            output.write_all(&data.payload)?;
+            hasher.update(&data.payload);
+            received = received
+                .checked_add(data.payload.len() as u64)
+                .ok_or(LinkError::SequenceExhausted)?;
+            if received > total_size {
+                return Err(LinkError::UnexpectedFrame(
+                    "sync pull exceeded declared size",
+                ));
+            }
+            if data.header.flags & FLAG_END_STREAM != 0 {
+                break;
+            }
+        }
+        if received != total_size || hasher.finalize().to_hex().as_str() != file_hash {
+            output.set_len(0)?;
+            output.sync_all()?;
+            return Err(LinkError::Remote(RpcError::new(
+                error_codes::CHECKSUM_MISMATCH,
+                "Checksum mismatch",
+            )));
+        }
+        output.flush()?;
+        output.sync_all()?;
+        drop(output);
+        commit_host_file(&staging, Path::new(&params.local_path))?;
+        actor_close(&mut stream)?;
+        Ok(SyncPullResult {
+            transfer_id,
+            total_size,
+            received_size: received,
+            state: TransferState::Complete,
+        })
+    }
+}
+
+/// Concurrent host handle for one persistent device shell stream.
+#[derive(Debug)]
+pub struct DeviceShell {
+    stream: ActorStream,
+    input_state: Mutex<ShellStreamState>,
+    output_state: Mutex<ShellStreamState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeviceShellEvent {
+    Packet(ShellPacket),
+    Closed,
+}
+
+impl DeviceShell {
+    pub fn send(&self, packet: ShellPacket) -> Result<(), ProviderError> {
+        if !matches!(
+            packet,
+            ShellPacket::Stdin(_) | ShellPacket::CloseStdin | ShellPacket::Resize(_)
+        ) {
+            return Err(ProviderError::new("invalid host shell packet direction"));
+        }
+        if let Err(error) = self
+            .input_state
+            .lock()
+            .map_err(|_| ProviderError::new("shell input state is unavailable"))?
+            .accept(&packet)
+        {
+            let _ = self.stream.reset(error.to_string());
+            return Err(ProviderError::new(error.to_string()));
+        }
+        let encoded = packet
+            .encode()
+            .map_err(|error| ProviderError::new(error.to_string()))?;
+        self.stream
+            .send_data(encoded, false)
+            .map_err(|error| ProviderError::new(error.to_string()))
+    }
+
+    pub fn recv(&self) -> Result<DeviceShellEvent, ProviderError> {
+        let frame = self
+            .stream
+            .recv()
+            .map_err(|error| ProviderError::new(error.to_string()))?;
+        match frame.header.command {
+            Command::Data => {
+                let packet = match ShellPacket::decode(&frame.payload, PacketSource::Device) {
+                    Ok(packet) => packet,
+                    Err(error) => {
+                        let _ = self.stream.reset(error.to_string());
+                        return Err(ProviderError::new(error.to_string()));
+                    }
+                };
+                if let Err(error) = self
+                    .output_state
+                    .lock()
+                    .map_err(|_| ProviderError::new("shell output state is unavailable"))?
+                    .accept(&packet)
+                {
+                    let _ = self.stream.reset(error.to_string());
+                    return Err(ProviderError::new(error.to_string()));
+                }
+                Ok(DeviceShellEvent::Packet(packet))
+            }
+            Command::Close => Ok(DeviceShellEvent::Closed),
+            Command::Reset => Err(ProviderError::new(format!(
+                "device reset shell stream: {}",
+                String::from_utf8_lossy(&frame.payload)
+            ))),
+            _ => Err(ProviderError::new(format!(
+                "unexpected {:?} on shell stream",
+                frame.header.command
+            ))),
+        }
+    }
+
+    pub fn close(&self) -> Result<(), ProviderError> {
+        self.stream
+            .reset("host closed shell")
+            .map_err(|error| ProviderError::new(error.to_string()))
+    }
+}
+
+struct TcpActorSource(TcpFrameStream);
+
+impl ActorFrameSource for TcpActorSource {
+    fn read_frame(&mut self) -> Result<Frame, String> {
+        self.0.read_frame().map_err(|error| error.to_string())
+    }
+}
+
+struct TcpActorSink(TcpFrameStream);
+
+impl Drop for TcpActorSink {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(ShutdownMode::Both);
+    }
+}
+
+impl ActorFrameSink for TcpActorSink {
+    fn write_frame(&mut self, frame: &Frame) -> Result<(), String> {
+        self.0.write_frame(frame).map_err(|error| error.to_string())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        self.0.flush().map_err(|error| error.to_string())
+    }
+}
+
+struct UsbActorSource(FrameReader<UsbReader>);
+
+impl ActorFrameSource for UsbActorSource {
+    fn read_frame(&mut self) -> Result<Frame, String> {
+        self.0.read_frame().map_err(|error| error.to_string())
+    }
+}
+
+struct UsbActorSink(FrameWriter<UsbWriter>);
+
+impl ActorFrameSink for UsbActorSink {
+    fn write_frame(&mut self, frame: &Frame) -> Result<(), String> {
+        self.0.write_frame(frame).map_err(|error| error.to_string())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        self.0.flush().map_err(|error| error.to_string())
+    }
+}
+
+fn actor_data(stream: &mut ActorStream) -> Result<Frame, LinkError> {
+    let frame = stream.recv()?;
+    expect(&frame, Command::Data, stream.id())?;
+    Ok(frame)
+}
+
+fn actor_close(stream: &mut ActorStream) -> Result<(), LinkError> {
+    let frame = stream.recv()?;
+    expect(&frame, Command::Close, stream.id())
+}
+
+fn negotiate(
+    stream: &mut dyn FrameIo,
+    limits: DecodeLimits,
+    discard_stale_frames: bool,
+    session_id: &str,
+) -> Result<(SessionState, DeviceHello), LinkError> {
+    let mut state = SessionState::new(SessionConfig::new(EndpointRole::Host, limits));
+    let hello = HostHello {
+        protocol_version: PROTOCOL_VERSION,
+        session_id: session_id.to_owned(),
+        client_name: "kindlebridge-server".to_owned(),
+        initial_connection_window: DEFAULT_CONNECTION_WINDOW,
+    };
+    let hello_frame = frame(Command::Hello, 0, 0, encode(&hello)?)?;
+    state.process_outbound(
+        &hello_frame.header,
+        FrameContext::hello(DEFAULT_CONNECTION_WINDOW),
+    )?;
+    stream.write_frame(&hello_frame)?;
+    stream.flush()?;
+
+    let device_frame = loop {
+        let candidate = stream.read_frame()?;
+        if !discard_stale_frames {
+            break candidate;
+        }
+        if candidate.header.command == Command::Hello
+            && candidate.header.stream_id == 0
+            && decode::<DeviceHello>(&candidate.payload, "stale device HELLO")
+                .is_ok_and(|hello| hello.session_id == session_id)
+        {
+            break candidate;
+        }
+    };
+    expect(&device_frame, Command::Hello, 0)?;
+    let device: DeviceHello = decode(&device_frame.payload, "device HELLO")?;
+    validate_device_hello(&device, session_id)?;
+    state.process_inbound(
+        &device_frame.header,
+        FrameContext::hello(device.initial_connection_window),
+    )?;
+    Ok((state, device))
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 struct DeviceSession {
     stream: Box<dyn FrameIo>,
     state: SessionState,
@@ -357,6 +965,8 @@ struct DeviceSession {
     control_sequence: u32,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 impl DeviceSession {
     fn connect(address: SocketAddr) -> Result<(Self, DeviceHello), LinkError> {
         let (limits, transport) = session_transport_config();
@@ -417,8 +1027,7 @@ impl DeviceSession {
         let mut stream = SplitFrameStream::new(reader, writer, transport_config)?;
         let session_id = new_session_id()?;
         let negotiate_started = Instant::now();
-        let (state, device) =
-            Self::negotiate(&mut stream, limits, recover_abandoned_frame, &session_id)?;
+        let (state, device) = negotiate(&mut stream, limits, recover_abandoned_frame, &session_id)?;
         if recover_abandoned_frame {
             trace_usb_recovery(format_args!(
                 "recovery HELLO finished after {} ms",
@@ -455,7 +1064,7 @@ impl DeviceSession {
         limits: DecodeLimits,
         session_id: &str,
     ) -> Result<(Self, DeviceHello), LinkError> {
-        let (state, device) = Self::negotiate(stream.as_mut(), limits, false, session_id)?;
+        let (state, device) = negotiate(stream.as_mut(), limits, false, session_id)?;
         Ok((
             Self {
                 stream,
@@ -465,50 +1074,6 @@ impl DeviceSession {
             },
             device,
         ))
-    }
-
-    fn negotiate(
-        stream: &mut dyn FrameIo,
-        limits: DecodeLimits,
-        discard_stale_frames: bool,
-        session_id: &str,
-    ) -> Result<(SessionState, DeviceHello), LinkError> {
-        let mut state = SessionState::new(SessionConfig::new(EndpointRole::Host, limits));
-        let hello = HostHello {
-            protocol_version: PROTOCOL_VERSION,
-            session_id: session_id.to_owned(),
-            client_name: "kindlebridge-server".to_owned(),
-            initial_connection_window: DEFAULT_CONNECTION_WINDOW,
-        };
-        let hello_frame = frame(Command::Hello, 0, 0, encode(&hello)?)?;
-        state.process_outbound(
-            &hello_frame.header,
-            FrameContext::hello(DEFAULT_CONNECTION_WINDOW),
-        )?;
-        stream.write_frame(&hello_frame)?;
-        stream.flush()?;
-
-        let device_frame = loop {
-            let candidate = stream.read_frame()?;
-            if !discard_stale_frames {
-                break candidate;
-            }
-            if candidate.header.command == Command::Hello
-                && candidate.header.stream_id == 0
-                && decode::<DeviceHello>(&candidate.payload, "stale device HELLO")
-                    .is_ok_and(|hello| hello.session_id == session_id)
-            {
-                break candidate;
-            }
-        };
-        expect(&device_frame, Command::Hello, 0)?;
-        let device: DeviceHello = decode(&device_frame.payload, "device HELLO")?;
-        validate_device_hello(&device, session_id)?;
-        state.process_inbound(
-            &device_frame.header,
-            FrameContext::hello(device.initial_connection_window),
-        )?;
-        Ok((state, device))
     }
 
     fn call(&mut self, method: &str, params: &impl Serialize) -> Result<Value, LinkError> {
@@ -1043,6 +1608,7 @@ fn usb_buffer_config() -> BufferConfig {
     }
 }
 
+#[cfg(test)]
 impl Drop for DeviceSession {
     fn drop(&mut self) {
         let sequence = self.control_sequence;
@@ -1170,6 +1736,7 @@ fn host_file_error(operation: &str, path: &str, error: &std::io::Error) -> RpcEr
     )
 }
 
+#[cfg(test)]
 fn next_sequence(sequence: u32) -> Result<u32, LinkError> {
     sequence.checked_add(1).ok_or(LinkError::SequenceExhausted)
 }
@@ -1378,6 +1945,8 @@ fn drain_usb_recovery_inbound(
 #[derive(Debug, Error)]
 enum LinkError {
     #[error(transparent)]
+    Connection(#[from] ConnectionError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Transport(#[from] TransportError),
@@ -1385,6 +1954,7 @@ enum LinkError {
     Protocol(#[from] ProtocolError),
     #[error(transparent)]
     Wire(#[from] WireError),
+    #[cfg(test)]
     #[error("host frame payload is {actual} bytes; maximum is {maximum}")]
     OutboundFrameTooLarge { actual: u32, maximum: u32 },
     #[error(
@@ -1409,8 +1979,10 @@ enum LinkError {
     InvalidHello,
     #[error("a USB session identifier could not be generated")]
     SessionIdUnavailable,
+    #[cfg(test)]
     #[error("device rejected the service: {0}")]
     Rejected(String),
+    #[cfg(test)]
     #[error("device link disconnected")]
     Disconnected,
     #[error("{0}")]
@@ -1445,7 +2017,7 @@ mod tests {
     use std::io::{self, Cursor, Read, Write};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex as StdMutex};
+    use std::sync::{Arc, Barrier, Condvar, Mutex as StdMutex};
     use std::thread;
 
     use kindlebridged::server::{ServerConfig, TcpServer};
@@ -1610,68 +2182,18 @@ mod tests {
         assert_eq!(reader.timeouts, vec![USB_RECOVERY_DRAIN_POLL]);
     }
 
-    struct FlushCountingFrameIo {
-        inner: Box<dyn FrameIo>,
+    struct FlushCountingActorSink {
+        inner: TcpActorSink,
         flushes: Arc<AtomicUsize>,
     }
 
-    impl FrameIo for FlushCountingFrameIo {
-        fn read_frame(&mut self) -> Result<Frame, TransportError> {
-            self.inner.read_frame()
-        }
-
-        fn write_frame(&mut self, frame: &Frame) -> Result<(), TransportError> {
+    impl ActorFrameSink for FlushCountingActorSink {
+        fn write_frame(&mut self, frame: &Frame) -> Result<(), String> {
             self.inner.write_frame(frame)
         }
 
-        fn flush(&mut self) -> Result<(), TransportError> {
+        fn flush(&mut self) -> Result<(), String> {
             self.flushes.fetch_add(1, Ordering::Relaxed);
-            self.inner.flush()
-        }
-    }
-
-    struct RequireBatchCreditDrainFrameIo {
-        inner: Box<dyn FrameIo>,
-        ready_seen: bool,
-        sent_since_drain: u64,
-        stream_credit_seen: bool,
-        connection_credit_seen: bool,
-    }
-
-    impl FrameIo for RequireBatchCreditDrainFrameIo {
-        fn read_frame(&mut self) -> Result<Frame, TransportError> {
-            let frame = self.inner.read_frame()?;
-            if frame.header.command == Command::Data {
-                self.ready_seen = true;
-            } else if self.ready_seen
-                && frame.header.command == Command::Credit
-                && frame.header.credit_delta >= SYNC_CREDIT_BATCH_SIZE
-            {
-                if frame.header.stream_id == 0 {
-                    self.connection_credit_seen = true;
-                } else {
-                    self.stream_credit_seen = true;
-                }
-                if self.stream_credit_seen && self.connection_credit_seen {
-                    self.sent_since_drain = 0;
-                    self.stream_credit_seen = false;
-                    self.connection_credit_seen = false;
-                }
-            }
-            Ok(frame)
-        }
-
-        fn write_frame(&mut self, frame: &Frame) -> Result<(), TransportError> {
-            if self.ready_seen && frame.header.command == Command::Data {
-                if self.sent_since_drain >= u64::from(SYNC_CREDIT_BATCH_SIZE) {
-                    return Err(TransportError::EndOfStream);
-                }
-                self.sent_since_drain += u64::from(frame.header.payload_length);
-            }
-            self.inner.write_frame(frame)
-        }
-
-        fn flush(&mut self) -> Result<(), TransportError> {
             self.inner.flush()
         }
     }
@@ -1762,8 +2284,7 @@ mod tests {
         let output = SharedWriter::default();
         let mut stream = SplitFrameStream::new(Cursor::new(incoming), output, config).unwrap();
 
-        let (_, received) =
-            DeviceSession::negotiate(&mut stream, limits, true, TEST_SESSION_ID).unwrap();
+        let (_, received) = negotiate(&mut stream, limits, true, TEST_SESSION_ID).unwrap();
         assert_eq!(received.serial, "KT6-USB-RECOVERED");
         assert_eq!(received.session_id, TEST_SESSION_ID);
     }
@@ -2018,6 +2539,7 @@ mod tests {
                 kindlebridge_schema::device_protocol::EXEC_FEATURE,
                 kindlebridge_schema::device_protocol::LOG_TAIL_FEATURE,
                 kindlebridge_schema::device_protocol::PROCESS_LIST_FEATURE,
+                kindlebridge_schema::device_protocol::SHELL_V2_FEATURE,
                 kindlebridge_schema::device_protocol::SYNC_FEATURE,
             ]
         );
@@ -2110,6 +2632,322 @@ mod tests {
 
         drop(provider);
         worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn shell_v2_raw_stream_preserves_binary_channels_and_exit_status() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let server = TcpServer::bind(
+            SocketAddr::new(loopback, 0),
+            ServerConfig::new(DeviceInfo::kt6("KT6-SHELL")).allow_peer(loopback),
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let worker = thread::spawn(move || server.serve_once());
+        let provider = ConnectedDeviceProvider::connect(&[address]).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let shell = provider
+            .shell_open(
+                "KT6-SHELL",
+                ShellOpen {
+                    mode: kindlebridge_schema::device_protocol::ShellMode::Raw,
+                    argv: vec![
+                        executable.to_string_lossy().into_owned(),
+                        "--exact".to_owned(),
+                        "device_session::tests::shell_raw_child_helper".to_owned(),
+                        "--ignored".to_owned(),
+                        "--nocapture".to_owned(),
+                    ],
+                    terminal_size: None,
+                    cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+                    term: "linux".to_owned(),
+                },
+            )
+            .unwrap();
+        shell.send(ShellPacket::Stdin(vec![0, 1, 2, 255])).unwrap();
+        shell.send(ShellPacket::CloseStdin).unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = loop {
+            match shell.recv().unwrap() {
+                DeviceShellEvent::Packet(ShellPacket::Stdout(bytes)) => stdout.extend(bytes),
+                DeviceShellEvent::Packet(ShellPacket::Stderr(bytes)) => stderr.extend(bytes),
+                DeviceShellEvent::Packet(ShellPacket::Exit(status)) => break status,
+                DeviceShellEvent::Packet(packet) => panic!("unexpected packet {packet:?}"),
+                DeviceShellEvent::Closed => panic!("shell closed before exit"),
+            }
+        };
+        assert!(stdout.windows(4).any(|window| window == [0, 1, 2, 255]));
+        assert!(stderr.windows(4).any(|window| window == b"ERR\0"));
+        assert_eq!(exit.exit_code, 37);
+        assert_eq!(exit.signal, 0);
+        assert_eq!(shell.recv().unwrap(), DeviceShellEvent::Closed);
+
+        drop(shell);
+        drop(provider);
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn malformed_shell_packet_resets_only_its_stream() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let server = TcpServer::bind(
+            SocketAddr::new(loopback, 0),
+            ServerConfig::new(DeviceInfo::kt6("KT6-SHELL-RESET")).allow_peer(loopback),
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let worker = thread::spawn(move || server.serve_once());
+        let provider = ConnectedDeviceProvider::connect(&[address]).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let stream = provider.devices[0]
+            .session
+            .connection
+            .open(
+                SHELL_V2_SERVICE,
+                SHELL_STREAM_WINDOW,
+                TrafficClass::Interactive,
+            )
+            .unwrap();
+        stream
+            .send_data(
+                encode(&ShellOpen {
+                    mode: kindlebridge_schema::device_protocol::ShellMode::Raw,
+                    argv: vec![
+                        executable.to_string_lossy().into_owned(),
+                        "--exact".to_owned(),
+                        "device_session::tests::shell_raw_child_helper".to_owned(),
+                        "--ignored".to_owned(),
+                        "--nocapture".to_owned(),
+                    ],
+                    terminal_size: None,
+                    cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+                    term: "linux".to_owned(),
+                })
+                .unwrap(),
+                false,
+            )
+            .unwrap();
+        // Unknown shell packet kind. The device must RESET this stream and
+        // keep the shared KBP connection usable by unrelated RPCs.
+        stream.send_data(vec![0xff, 0, 0, 0, 0], false).unwrap();
+        loop {
+            let frame = stream.recv().unwrap();
+            if frame.header.command == Command::Reset {
+                break;
+            }
+            assert_eq!(frame.header.command, Command::Data);
+        }
+
+        let result = provider
+            .exec(&ExecParams {
+                serial: "KT6-SHELL-RESET".to_owned(),
+                argv: vec![
+                    executable.to_string_lossy().into_owned(),
+                    "--exact".to_owned(),
+                    "device_session::tests::child_sleep_helper".to_owned(),
+                ],
+                cwd: None,
+                environment: BTreeMap::new(),
+                timeout_ms: 10_000,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+
+        drop(stream);
+        drop(provider);
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn two_shells_stay_responsive_during_sync_and_log_traffic() {
+        const SYNC_BYTES: usize = 16 * 1024 * 1024;
+        const ECHO_ROUNDS: usize = 40;
+
+        let unique = format!("{}-shell-fairness", std::process::id());
+        let root = std::env::temp_dir().join(format!("kindlebridge-device-{unique}"));
+        let source = std::env::temp_dir().join(format!("kindlebridge-source-{unique}.bin"));
+        let log = std::env::temp_dir().join(format!("kindlebridge-log-{unique}.txt"));
+        let mut source_file = File::create(&source).unwrap();
+        let block = vec![0x5a; 1024 * 1024];
+        for _ in 0..(SYNC_BYTES / block.len()) {
+            source_file.write_all(&block).unwrap();
+        }
+        source_file.sync_all().unwrap();
+        fs::write(&log, b"kindlebridge test log\n").unwrap();
+
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let server = TcpServer::bind(
+            SocketAddr::new(loopback, 0),
+            ServerConfig::new(DeviceInfo::kt6("KT6-FAIR"))
+                .allow_peer(loopback)
+                .sync_root(&root)
+                .log_path(&log),
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let worker = thread::spawn(move || server.serve_once());
+        let provider = Arc::new(ConnectedDeviceProvider::connect(&[address]).unwrap());
+        let executable = std::env::current_exe().unwrap();
+        let shell_open = || {
+            provider
+                .shell_open(
+                    "KT6-FAIR",
+                    ShellOpen {
+                        mode: kindlebridge_schema::device_protocol::ShellMode::Raw,
+                        argv: vec![
+                            executable.to_string_lossy().into_owned(),
+                            "--exact".to_owned(),
+                            "device_session::tests::shell_echo_child_helper".to_owned(),
+                            "--ignored".to_owned(),
+                            "--nocapture".to_owned(),
+                        ],
+                        terminal_size: None,
+                        cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+                        term: "linux".to_owned(),
+                    },
+                )
+                .unwrap()
+        };
+        let shell_a = shell_open();
+        let shell_b = shell_open();
+        let start = Arc::new(Barrier::new(4));
+
+        let echo_a_start = Arc::clone(&start);
+        let echo_a =
+            thread::spawn(move || shell_echo_latencies(shell_a, "a", ECHO_ROUNDS, echo_a_start));
+        let echo_b_start = Arc::clone(&start);
+        let echo_b =
+            thread::spawn(move || shell_echo_latencies(shell_b, "b", ECHO_ROUNDS, echo_b_start));
+
+        let sync_provider = Arc::clone(&provider);
+        let sync_start = Arc::clone(&start);
+        let sync_source = source.to_string_lossy().into_owned();
+        let sync_worker = thread::spawn(move || {
+            sync_start.wait();
+            sync_provider
+                .sync_push(SyncPushParams {
+                    serial: "KT6-FAIR".to_owned(),
+                    local_path: sync_source,
+                    remote_path: "fairness/payload.bin".to_owned(),
+                    transfer_id: None,
+                    block_size: kindlebridge_schema::DEFAULT_SYNC_BLOCK_SIZE,
+                })
+                .unwrap()
+        });
+
+        let log_provider = Arc::clone(&provider);
+        let log_start = Arc::clone(&start);
+        let log_worker = thread::spawn(move || {
+            log_start.wait();
+            for _ in 0..64 {
+                log_provider
+                    .log_tail(&LogTailParams {
+                        serial: "KT6-FAIR".to_owned(),
+                        cursor: Some(0),
+                        limit: Some(16),
+                    })
+                    .unwrap();
+            }
+        });
+
+        let mut latencies = echo_a.join().unwrap();
+        latencies.extend(echo_b.join().unwrap());
+        sync_worker.join().unwrap();
+        log_worker.join().unwrap();
+        latencies.sort_unstable();
+        let p95 = latencies[(latencies.len() * 95).div_ceil(100) - 1];
+        assert!(
+            p95 <= Duration::from_millis(50),
+            "shell echo P95 was {p95:?}"
+        );
+        assert_eq!(
+            fs::metadata(root.join("fairness/payload.bin"))
+                .unwrap()
+                .len(),
+            SYNC_BYTES as u64
+        );
+
+        drop(provider);
+        worker.join().unwrap().unwrap();
+        fs::remove_file(source).unwrap();
+        fs::remove_file(log).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "runs only as a child process for shell_v2_raw_stream"]
+    fn shell_raw_child_helper() {
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input).unwrap();
+        std::io::stdout().write_all(&input).unwrap();
+        std::io::stdout().flush().unwrap();
+        std::io::stderr().write_all(b"ERR\0").unwrap();
+        std::io::stderr().flush().unwrap();
+        std::process::exit(37);
+    }
+
+    #[test]
+    #[ignore = "runs only as a child process for the shell fairness test"]
+    fn shell_echo_child_helper() {
+        let mut input = std::io::stdin();
+        let mut output = std::io::stdout();
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let count = input.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            output.write_all(&buffer[..count]).unwrap();
+            output.flush().unwrap();
+        }
+    }
+
+    fn shell_echo_latencies(
+        shell: DeviceShell,
+        label: &str,
+        rounds: usize,
+        start: Arc<Barrier>,
+    ) -> Vec<Duration> {
+        start.wait();
+        let mut latencies = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let token = format!("kb-{label}-{round:04}\n");
+            let started = Instant::now();
+            shell
+                .send(ShellPacket::Stdin(token.as_bytes().to_vec()))
+                .unwrap();
+            let mut received = Vec::new();
+            loop {
+                match shell.recv().unwrap() {
+                    DeviceShellEvent::Packet(ShellPacket::Stdout(bytes)) => {
+                        received.extend(bytes);
+                        if received
+                            .windows(token.len())
+                            .any(|window| window == token.as_bytes())
+                        {
+                            break;
+                        }
+                    }
+                    DeviceShellEvent::Packet(ShellPacket::Stderr(_)) => {}
+                    event => panic!("shell exited during echo test: {event:?}"),
+                }
+            }
+            latencies.push(started.elapsed());
+        }
+        shell.send(ShellPacket::CloseStdin).unwrap();
+        loop {
+            match shell.recv().unwrap() {
+                DeviceShellEvent::Packet(ShellPacket::Exit(status)) => {
+                    assert_eq!(status.exit_code, 0);
+                }
+                DeviceShellEvent::Closed => break,
+                _ => {}
+            }
+        }
+        latencies
     }
 
     #[test]
@@ -2233,20 +3071,18 @@ mod tests {
         let address = server.local_addr().unwrap();
         let worker = thread::spawn(move || server.serve_once());
         let (limits, transport) = session_transport_config();
-        let raw = TcpFrameStream::connect(address, transport).unwrap();
+        let mut sink = TcpFrameStream::connect(address, transport).unwrap();
+        let actor_source = sink.try_clone().unwrap();
+        let session_id = new_session_id().unwrap();
+        let (state, _) = negotiate(&mut sink, limits, false, &session_id).unwrap();
         let flushes = Arc::new(AtomicUsize::new(0));
-        let counted = FlushCountingFrameIo {
-            inner: Box::new(raw),
+        let counted = FlushCountingActorSink {
+            inner: TcpActorSink(sink),
             flushes: Arc::clone(&flushes),
         };
-        let guarded = RequireBatchCreditDrainFrameIo {
-            inner: Box::new(counted),
-            ready_seen: false,
-            sent_since_drain: 0,
-            stream_credit_seen: false,
-            connection_credit_seen: false,
-        };
-        let (mut session, _) = DeviceSession::handshake(Box::new(guarded), limits).unwrap();
+        let (connection, _incoming) =
+            Connection::start(state, TcpActorSource(actor_source), counted);
+        let session = ActorDeviceSession { connection };
         let before = flushes.load(Ordering::Relaxed);
         let mut file = File::open(&source).unwrap();
         session
@@ -2297,12 +3133,15 @@ mod tests {
         .unwrap();
         let address = server.local_addr().unwrap();
         let worker = thread::spawn(move || {
-            assert!(server.serve_once().is_err());
+            server.serve_once()?;
             server.serve_once()
         });
 
-        let (mut interrupted, _) = DeviceSession::connect(address).unwrap();
-        let (stream_id, _) = interrupted.open_service(SYNC_SERVICE).unwrap();
+        let (interrupted, _) = ActorDeviceSession::connect(address).unwrap();
+        let mut stream = interrupted
+            .connection
+            .open(SYNC_SERVICE, DEFAULT_STREAM_WINDOW, TrafficClass::Bulk)
+            .unwrap();
         let request = SyncRequest::Push {
             transfer_id: None,
             remote_path: "resume/payload.bin".to_owned(),
@@ -2310,13 +3149,9 @@ mod tests {
             file_hash: file_hash.clone(),
             block_size: 256 * 1024,
         };
-        interrupted
-            .send_data(stream_id, 2, encode(&request).unwrap(), false)
-            .unwrap();
-        let mut send_sequence = 3;
-        let ready = interrupted
-            .read_sync_reply(stream_id, &mut send_sequence)
-            .unwrap();
+        stream.send_data(encode(&request).unwrap(), false).unwrap();
+        let ready: SyncReply =
+            decode(&actor_data(&mut stream).unwrap().payload, "sync READY").unwrap();
         let transfer_id = match ready {
             SyncReply::Ready {
                 transfer_id,
@@ -2327,11 +3162,9 @@ mod tests {
         };
         let split = 1024 * 1024;
         for chunk in payload[..split].chunks(256 * 1024) {
-            interrupted
-                .send_data(stream_id, send_sequence, chunk.to_vec(), false)
-                .unwrap();
-            send_sequence = next_sequence(send_sequence).unwrap();
+            stream.send_data(chunk.to_vec(), false).unwrap();
         }
+        drop(stream);
         drop(interrupted);
 
         let provider = ConnectedDeviceProvider::connect(&[address]).unwrap();

@@ -18,6 +18,8 @@ pub const DEFAULT_MAX_CONTENT_LENGTH: usize = 8 * 1024 * 1024;
 pub mod methods {
     pub const SERVER_PING: &str = "v1.server.ping";
     pub const SERVER_VERSION: &str = "v1.server.version";
+    pub const SERVER_STATUS: &str = "v1.server.status";
+    pub const SERVER_STOP: &str = "v1.server.stop";
     pub const DEVICE_LIST: &str = "v1.device.list";
     pub const DEVICE_FEATURES: &str = "v1.device.features";
     pub const EXEC_RUN: &str = "v1.exec.run";
@@ -34,6 +36,15 @@ pub mod methods {
     pub const PROCESS_LIST: &str = "v1.process.list";
     pub const PROCESS_SIGNAL: &str = "v1.process.signal";
     pub const LOG_TAIL: &str = "v1.log.tail";
+    pub const SHELL_OPEN: &str = "v1.shell.open";
+    pub const STREAM_WRITE: &str = "v1.stream.write";
+    pub const STREAM_RESIZE: &str = "v1.stream.resize";
+    pub const STREAM_CLOSE_INPUT: &str = "v1.stream.close_input";
+    pub const STREAM_CLOSE: &str = "v1.stream.close";
+    pub const STREAM_DATA: &str = "v1.stream.data";
+    pub const STREAM_CREDIT: &str = "v1.stream.credit";
+    pub const STREAM_EXIT: &str = "v1.stream.exit";
+    pub const STREAM_CLOSED: &str = "v1.stream.closed";
 }
 
 /// Stable JSON-RPC error codes exposed by the v1 API.
@@ -194,6 +205,47 @@ impl fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
+#[cfg(test)]
+mod shell_api_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::device_protocol::{ShellMode, ShellOpen};
+
+    #[test]
+    fn shell_open_api_is_flat_and_carries_symmetric_credit() {
+        let params = ShellOpenParams {
+            serial: "KT6".to_owned(),
+            open: ShellOpen::command("printf hello"),
+        };
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["serial"], "KT6");
+        assert_eq!(value["mode"], "raw");
+        assert_eq!(value["argv"], json!(["/bin/sh", "-lc", "printf hello"]));
+        assert_eq!(
+            serde_json::from_value::<ShellOpenParams>(value)
+                .unwrap()
+                .open
+                .mode,
+            ShellMode::Raw
+        );
+
+        let result = ShellOpenResult {
+            stream_id: "opaque".to_owned(),
+            send_credit: device_protocol::SHELL_STREAM_WINDOW,
+            receive_credit: device_protocol::SHELL_STREAM_WINDOW,
+        };
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!({
+                "stream_id": "opaque",
+                "send_credit": 262_144,
+                "receive_credit": 262_144
+            })
+        );
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RpcResponse {
     pub jsonrpc: String,
@@ -239,6 +291,83 @@ pub struct ServerVersion {
     pub name: String,
     pub version: String,
     pub api_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellOpenParams {
+    pub serial: String,
+    #[serde(flatten)]
+    pub open: device_protocol::ShellOpen,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellOpenResult {
+    pub stream_id: String,
+    pub send_credit: u32,
+    pub receive_credit: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamWriteParams {
+    pub stream_id: String,
+    /// Base64-encoded bytes.
+    pub data: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamResizeParams {
+    pub stream_id: String,
+    #[serde(flatten)]
+    pub size: device_protocol::TerminalSize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamIdParams {
+    pub stream_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamChannel {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamDataParams {
+    pub stream_id: String,
+    pub channel: StreamChannel,
+    /// Base64-encoded bytes.
+    pub data: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamCreditParams {
+    pub stream_id: String,
+    pub bytes: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamExitParams {
+    pub stream_id: String,
+    pub exit_code: i32,
+    pub signal: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamClosedParams {
+    pub stream_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
