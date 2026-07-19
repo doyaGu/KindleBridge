@@ -6,18 +6,23 @@
 //! repository metadata are outside this crate's accepted profile.
 
 mod activation;
+#[cfg(feature = "full")]
 mod builder;
 mod cbor;
 mod error;
+#[cfg(feature = "full")]
 mod header;
 mod install;
 mod model;
 mod path;
+#[cfg(feature = "full")]
 mod verify;
 
 pub use activation::{ActivationEntry, ActivationGeneration, GenerationId};
+#[cfg(feature = "full")]
 pub use builder::{BuildConfig, BundleBuilder, CompressionPolicy};
 pub use error::{Error, ErrorCode, Result};
+#[cfg(feature = "full")]
 pub use header::{Header, FORMAT_MAJOR, FORMAT_MINOR, HEADER_SIZE, MAGIC};
 pub use install::{
     BlockStatus, CommitOutcome, InstallStore, RecoveryAction, RecoveryReport, StagedGeneration,
@@ -28,6 +33,7 @@ pub use model::{
     RotationProofSignedData, SignatureEntry, SignaturePolicy, Tree, Variant,
 };
 pub use path::{validate_bundle_path, validate_symlink_target};
+#[cfg(feature = "full")]
 pub use verify::{
     inspect, inspect_bytes, verify, verify_bytes, Inspection, VerifiedBundle, VerifyOptions,
 };
