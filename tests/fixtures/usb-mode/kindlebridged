@@ -1,0 +1,6 @@
+#!/bin/sh
+
+trap 'exit 0' HUP INT TERM
+while :; do
+    /usr/bin/sleep 30
+done

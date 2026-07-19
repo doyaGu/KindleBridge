@@ -1,0 +1,24 @@
+[package]
+name = "kindlebridge-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3 = "1.8"
+clap = { version = "4.5", features = ["derive"] }
+getrandom = "0.2"
+kindlebridge-schema = { path = "../../crates/kindlebridge-schema" }
+kindlebridge-transport-tcp = { path = "../../crates/kindlebridge-transport-tcp" }
+kindlebridge-transport-usb = { path = "../../crates/kindlebridge-transport-usb" }
+kindlebridge-wire = { path = "../../crates/kindlebridge-wire" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[dev-dependencies]
+kindlebridged = { path = "../../device/kindlebridged" }
+
+[lints]
+workspace = true

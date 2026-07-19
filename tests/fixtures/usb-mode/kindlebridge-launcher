@@ -1,0 +1,38 @@
+#!/bin/sh
+
+command=${1:-}
+shift || true
+test "${1:-}" = --root || exit 2
+root=$2
+shift 2
+
+if test "$command" = select-staged; then
+    test "$#" -eq 0 || exit 2
+    test ! -f "$root/run/daemon.pid" || exit 1
+    slot=$(cat "$root/next")
+    mkdir -p "$root/launcher"
+    printf 'test pending slot %s\n' "$slot" >"$root/launcher/pending-slot"
+    printf '%s\n' "$slot" >"$root/current"
+    rm -f "$root/next"
+    printf 'selected staged slot %s\n' "$slot"
+    exit 0
+fi
+
+test "$command" = run || exit 2
+test "${1:-}" = -- || exit 2
+shift
+
+slot=$(cat "$root/current")
+daemon="$root/slots/$slot/bin/kindlebridged"
+mkdir -p "$root/run"
+"$daemon" "$@" &
+child=$!
+rm -f "$root/run/heartbeat"
+if test "${KINDLEBRIDGE_TEST_NO_HEARTBEAT:-0}" != 1; then
+    printf 'KINDLEBRIDGE_HEARTBEAT_V1\ninstance=test-%s-%s\ntimestamp_ms=0\n' "$$" "$child" \
+        >"$root/run/heartbeat"
+    rm -f "$root/launcher/pending-slot"
+fi
+printf '%s\n' "$child" >"$root/run/daemon.pid"
+trap 'kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 0' HUP INT TERM
+wait "$child"

@@ -1,0 +1,21 @@
+kind = "application"
+id = "org.kindlebridge.hello"
+version = "0.1.0"
+release = 1
+channel = "dev"
+target = "kindlehf"
+firmware_min = [5, 16, 3]
+entrypoints = { main = "bin/hello.sh" }
+publisher_name = "KindleBridge development fixture"
+
+[permissions]
+requested = ["device.read"]
+optional = []
+
+[process]
+restart = "never"
+stop_timeout_ms = 3000
+
+[data]
+policy = "ephemeral"
+schema = 1

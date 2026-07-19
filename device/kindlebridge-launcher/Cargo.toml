@@ -1,0 +1,24 @@
+[package]
+name = "kindlebridge-launcher"
+description = "Root-confined A/B launcher and watchdog core for KindleBridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+blake3 = "1.8"
+clap = { version = "4.5", features = ["derive"] }
+
+[lib]
+name = "kindlebridge_launcher"
+
+[[bin]]
+name = "kindlebridge-launcher"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

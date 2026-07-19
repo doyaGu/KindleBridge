@@ -1,0 +1,17 @@
+[package]
+name = "kindlebridge-fake-device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kindlebridge-schema = { path = "../../crates/kindlebridge-schema" }
+kindlebridge-server = { path = "../../host/kindlebridge-server" }
+serde_json = "1.0"
+
+[dev-dependencies]
+kindlebridge = { path = "../../host/kindlebridge" }
+
+[lints]
+workspace = true

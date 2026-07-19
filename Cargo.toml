@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kindlebridge-wire",
+    "crates/kindlebridge-schema",
+    "crates/kindlebridge-transport",
+    "crates/kindlebridge-transport-tcp",
+    "crates/kindlebridge-transport-usb",
+    "crates/kindlebridge-bundle",
+    "host/kindlebridge",
+    "host/kindlebridge-server",
+    "device/kindlebridged",
+    "device/kindlebridge-broker",
+    "device/kindlebridge-device-bench",
+    "device/kindlebridge-functionfs",
+    "device/kindlebridge-launcher",
+    "tests/fake-device",
+    "tools/kindlebridge-tcp-probe",
+    "tools/kindlebridge-usb-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/doyaGu/KindleBridge"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

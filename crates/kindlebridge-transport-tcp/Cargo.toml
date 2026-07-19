@@ -1,0 +1,13 @@
+[package]
+name = "kindlebridge-transport-tcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kindlebridge-wire = { path = "../kindlebridge-wire" }
+
+[lints]
+workspace = true

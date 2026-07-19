@@ -1,0 +1,10 @@
+KINDLEBRIDGE_SLOT_V1
+slot=A
+executable=bin/kindlebridged
+heartbeat=run/heartbeat
+startup_timeout_ms=10000
+heartbeat_timeout_ms=1500
+healthy_after_ms=3000
+max_crashes=3
+backoff_initial_ms=100
+backoff_max_ms=1000

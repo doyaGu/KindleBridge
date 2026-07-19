@@ -1,0 +1,575 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::fs;
+use std::path::Path;
+
+use kindlebridge_schema::{
+    error_codes, AppInstallParams, AppList, AppState, AppSummary, AppTargetParams, LogEntry,
+    LogSnapshot, LogTailParams, ProcessList, ProcessSignalParams, ProcessState, ProcessSummary,
+    RpcError, SerialParams, SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult,
+    SyncStatus, SyncStatusParams, TransferDirection, TransferState,
+};
+use serde_json::json;
+
+const MAX_LOG_ENTRIES: usize = 1024;
+const MAX_LOG_SNAPSHOT: u32 = 1000;
+
+#[derive(Debug)]
+struct Transfer {
+    serial: String,
+    direction: TransferDirection,
+    remote_path: String,
+    total_size: u64,
+    next_offset: u64,
+    state: TransferState,
+    data: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct AppRuntime {
+    version: String,
+    history: Vec<String>,
+    state: AppState,
+    pid: Option<u32>,
+}
+
+impl AppRuntime {
+    fn summary(&self, app_id: String) -> AppSummary {
+        AppSummary {
+            app_id,
+            version: self.version.clone(),
+            state: self.state.clone(),
+            rollback_available: !self.history.is_empty(),
+            pid: self.pid,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeState {
+    next_transfer: u64,
+    next_pid: u32,
+    files: BTreeMap<(String, String), Vec<u8>>,
+    transfers: BTreeMap<String, Transfer>,
+    apps: BTreeMap<(String, String), AppRuntime>,
+    processes: BTreeMap<(String, u32), ProcessSummary>,
+    logs: BTreeMap<String, VecDeque<LogEntry>>,
+    next_log_cursor: BTreeMap<String, u64>,
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            next_transfer: 1,
+            next_pid: 2000,
+            files: BTreeMap::new(),
+            transfers: BTreeMap::new(),
+            apps: BTreeMap::new(),
+            processes: BTreeMap::new(),
+            logs: BTreeMap::new(),
+            next_log_cursor: BTreeMap::new(),
+        }
+    }
+}
+
+impl RuntimeState {
+    pub(crate) fn device_connected(&mut self, serial: &str) {
+        self.log(serial, "info", "bridge", "device connected");
+    }
+
+    pub(crate) fn sync_push(&mut self, params: SyncPushParams) -> Result<SyncPushResult, RpcError> {
+        validate_path(&params.remote_path)?;
+        validate_host_path(&params.local_path)?;
+        validate_block_size(params.block_size)?;
+        let data = fs::read(&params.local_path)
+            .map_err(|error| host_file_error("read", &params.local_path, &error))?;
+        let total_size = u64::try_from(data.len()).map_err(|_| RpcError::internal_error())?;
+
+        let transfer_id = if let Some(transfer_id) = params.transfer_id.clone() {
+            transfer_id
+        } else {
+            let transfer_id = self.allocate_transfer_id("push");
+            self.transfers.insert(
+                transfer_id.clone(),
+                Transfer {
+                    serial: params.serial.clone(),
+                    direction: TransferDirection::Push,
+                    remote_path: params.remote_path.clone(),
+                    total_size,
+                    next_offset: total_size,
+                    state: TransferState::Complete,
+                    data: data.clone(),
+                },
+            );
+            transfer_id
+        };
+        let transfer = self
+            .transfers
+            .get(&transfer_id)
+            .ok_or_else(|| transfer_not_found(&transfer_id))?;
+        validate_transfer(
+            transfer,
+            &params.serial,
+            &params.remote_path,
+            total_size,
+            TransferDirection::Push,
+        )?;
+        if transfer.data != data {
+            return Err(invalid_state("resume source does not match accepted data"));
+        }
+        self.files
+            .insert((params.serial.clone(), params.remote_path.clone()), data);
+        self.log(
+            &params.serial,
+            "info",
+            "sync",
+            &format!("pushed {total_size} bytes to {}", params.remote_path),
+        );
+        let transfer = &self.transfers[&transfer_id];
+        Ok(SyncPushResult {
+            transfer_id,
+            accepted_offset: transfer.next_offset,
+            state: transfer.state.clone(),
+        })
+    }
+
+    pub(crate) fn sync_pull(&mut self, params: SyncPullParams) -> Result<SyncPullResult, RpcError> {
+        validate_path(&params.remote_path)?;
+        validate_host_path(&params.local_path)?;
+        validate_block_size(params.block_size)?;
+        let transfer_id = if let Some(transfer_id) = params.transfer_id.clone() {
+            transfer_id
+        } else {
+            let data = self
+                .files
+                .get(&(params.serial.clone(), params.remote_path.clone()))
+                .cloned()
+                .ok_or_else(|| file_not_found(&params.remote_path))?;
+            let total_size = u64::try_from(data.len()).map_err(|_| RpcError::internal_error())?;
+            let transfer_id = self.allocate_transfer_id("pull");
+            self.transfers.insert(
+                transfer_id.clone(),
+                Transfer {
+                    serial: params.serial.clone(),
+                    direction: TransferDirection::Pull,
+                    remote_path: params.remote_path.clone(),
+                    total_size,
+                    next_offset: total_size,
+                    state: TransferState::Complete,
+                    data,
+                },
+            );
+            transfer_id
+        };
+
+        let transfer = self
+            .transfers
+            .get(&transfer_id)
+            .ok_or_else(|| transfer_not_found(&transfer_id))?;
+        validate_transfer(
+            transfer,
+            &params.serial,
+            &params.remote_path,
+            transfer.total_size,
+            TransferDirection::Pull,
+        )?;
+        write_host_file(&params.local_path, &transfer.data)?;
+        Ok(SyncPullResult {
+            transfer_id,
+            total_size: transfer.total_size,
+            received_size: transfer.total_size,
+            state: transfer.state.clone(),
+        })
+    }
+
+    pub(crate) fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError> {
+        let transfer = self
+            .transfers
+            .get(&params.transfer_id)
+            .ok_or_else(|| transfer_not_found(&params.transfer_id))?;
+        if transfer.serial != params.serial {
+            return Err(transfer_not_found(&params.transfer_id));
+        }
+        Ok(SyncStatus {
+            transfer_id: params.transfer_id.clone(),
+            direction: transfer.direction.clone(),
+            remote_path: transfer.remote_path.clone(),
+            next_offset: transfer.next_offset,
+            total_size: transfer.total_size,
+            state: transfer.state.clone(),
+        })
+    }
+
+    pub(crate) fn app_install(&mut self, params: AppInstallParams) -> Result<AppSummary, RpcError> {
+        validate_app_id(&params.app_id)?;
+        if params.version.is_empty() {
+            return Err(RpcError::invalid_params("version must not be empty"));
+        }
+        let key = (params.serial.clone(), params.app_id.clone());
+        let mut app = self.apps.remove(&key).unwrap_or(AppRuntime {
+            version: params.version.clone(),
+            history: Vec::new(),
+            state: AppState::Stopped,
+            pid: None,
+        });
+        if app.version != params.version {
+            app.history.push(app.version.clone());
+            if let Some(pid) = app.pid.take() {
+                self.processes.remove(&(params.serial.clone(), pid));
+            }
+            app.version = params.version;
+            app.state = AppState::Stopped;
+        }
+        let summary = app.summary(params.app_id.clone());
+        self.apps.insert(key, app);
+        self.log(
+            &params.serial,
+            "info",
+            &params.app_id,
+            &format!("installed {}", summary.version),
+        );
+        Ok(summary)
+    }
+
+    pub(crate) fn app_start(&mut self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
+        let key = (params.serial.clone(), params.app_id.clone());
+        let mut app = self
+            .apps
+            .remove(&key)
+            .ok_or_else(|| app_not_found(&params.app_id))?;
+        if app.state == AppState::Stopped {
+            let pid = self.allocate_pid();
+            app.pid = Some(pid);
+            app.state = AppState::Running;
+            self.processes.insert(
+                (params.serial.clone(), pid),
+                ProcessSummary {
+                    pid,
+                    name: params.app_id.clone(),
+                    app_id: Some(params.app_id.clone()),
+                    state: ProcessState::Running,
+                },
+            );
+            self.log(&params.serial, "info", &params.app_id, "started");
+        }
+        let summary = app.summary(params.app_id.clone());
+        self.apps.insert(key, app);
+        Ok(summary)
+    }
+
+    pub(crate) fn app_stop(&mut self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
+        let key = (params.serial.clone(), params.app_id.clone());
+        let mut app = self
+            .apps
+            .remove(&key)
+            .ok_or_else(|| app_not_found(&params.app_id))?;
+        if let Some(pid) = app.pid.take() {
+            self.processes.remove(&(params.serial.clone(), pid));
+        }
+        app.state = AppState::Stopped;
+        let summary = app.summary(params.app_id.clone());
+        self.apps.insert(key, app);
+        self.log(&params.serial, "info", &params.app_id, "stopped");
+        Ok(summary)
+    }
+
+    pub(crate) fn app_restart(&mut self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
+        self.app_stop(params)?;
+        self.app_start(params)
+    }
+
+    pub(crate) fn app_rollback(
+        &mut self,
+        params: &AppTargetParams,
+    ) -> Result<AppSummary, RpcError> {
+        let key = (params.serial.clone(), params.app_id.clone());
+        let mut app = self
+            .apps
+            .remove(&key)
+            .ok_or_else(|| app_not_found(&params.app_id))?;
+        let Some(version) = app.history.pop() else {
+            self.apps.insert(key, app);
+            return Err(stable_error(
+                error_codes::NO_ROLLBACK_AVAILABLE,
+                "No rollback available",
+                json!({ "app_id": params.app_id }),
+            ));
+        };
+        if let Some(pid) = app.pid.take() {
+            self.processes.remove(&(params.serial.clone(), pid));
+        }
+        app.version = version;
+        app.state = AppState::Stopped;
+        let summary = app.summary(params.app_id.clone());
+        self.apps.insert(key, app);
+        self.log(&params.serial, "info", &params.app_id, "rolled back");
+        Ok(summary)
+    }
+
+    pub(crate) fn app_uninstall(
+        &mut self,
+        params: &AppTargetParams,
+    ) -> Result<AppSummary, RpcError> {
+        let key = (params.serial.clone(), params.app_id.clone());
+        let app = self
+            .apps
+            .remove(&key)
+            .ok_or_else(|| app_not_found(&params.app_id))?;
+        if let Some(pid) = app.pid {
+            self.processes.remove(&(params.serial.clone(), pid));
+        }
+        let summary = app.summary(params.app_id.clone());
+        self.log(&params.serial, "info", &params.app_id, "uninstalled");
+        Ok(summary)
+    }
+
+    pub(crate) fn app_list(&self, params: &SerialParams) -> AppList {
+        let apps = self
+            .apps
+            .iter()
+            .filter(|((serial, _), _)| serial == &params.serial)
+            .map(|((_, app_id), app)| app.summary(app_id.clone()))
+            .collect();
+        AppList { apps }
+    }
+
+    pub(crate) fn process_list(&self, params: &SerialParams) -> ProcessList {
+        let processes = self
+            .processes
+            .iter()
+            .filter(|((serial, _), _)| serial == &params.serial)
+            .map(|(_, process)| process.clone())
+            .collect();
+        ProcessList { processes }
+    }
+
+    pub(crate) fn process_signal(
+        &mut self,
+        params: &ProcessSignalParams,
+    ) -> Result<ProcessSummary, RpcError> {
+        let signal = params.signal.to_ascii_uppercase();
+        if !matches!(signal.as_str(), "TERM" | "KILL" | "HUP" | "INT") {
+            return Err(stable_error(
+                error_codes::INVALID_SIGNAL,
+                "Invalid signal",
+                json!({ "signal": params.signal }),
+            ));
+        }
+        let key = (params.serial.clone(), params.pid);
+        let process = self
+            .processes
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| process_not_found(params.pid))?;
+        if matches!(signal.as_str(), "TERM" | "KILL") {
+            self.processes.remove(&key);
+            if let Some(app_id) = &process.app_id {
+                if let Some(app) = self.apps.get_mut(&(params.serial.clone(), app_id.clone())) {
+                    app.state = AppState::Stopped;
+                    app.pid = None;
+                }
+            }
+        }
+        self.log(
+            &params.serial,
+            "info",
+            &process.name,
+            &format!("signal {signal} sent to {}", params.pid),
+        );
+        Ok(process)
+    }
+
+    pub(crate) fn log_tail(&self, params: &LogTailParams) -> Result<LogSnapshot, RpcError> {
+        let limit = params.limit.unwrap_or(100);
+        if limit == 0 || limit > MAX_LOG_SNAPSHOT {
+            return Err(RpcError::invalid_params("limit must be between 1 and 1000"));
+        }
+        let empty = VecDeque::new();
+        let logs = self.logs.get(&params.serial).unwrap_or(&empty);
+        let first = logs.front().map_or(1, |entry| entry.cursor);
+        if params.cursor.is_some_and(|cursor| cursor < first) {
+            return Err(stable_error(
+                error_codes::LOG_CURSOR_EXPIRED,
+                "Log cursor expired",
+                json!({ "oldest_cursor": first }),
+            ));
+        }
+        let start = params.cursor.unwrap_or_else(|| {
+            logs.back()
+                .map_or(1, |entry| entry.cursor.saturating_add(1))
+                .saturating_sub(u64::from(limit))
+                .max(first)
+        });
+        let mut matching = logs.iter().filter(|entry| entry.cursor >= start);
+        let entries: Vec<_> = matching
+            .by_ref()
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .cloned()
+            .collect();
+        let has_more = matching.next().is_some();
+        let next_cursor = entries
+            .last()
+            .map_or(start, |entry| entry.cursor.saturating_add(1));
+        Ok(LogSnapshot {
+            entries,
+            next_cursor,
+            has_more,
+        })
+    }
+
+    fn allocate_transfer_id(&mut self, prefix: &str) -> String {
+        let id = format!("{prefix}-{}", self.next_transfer);
+        self.next_transfer = self.next_transfer.saturating_add(1);
+        id
+    }
+
+    fn allocate_pid(&mut self) -> u32 {
+        let pid = self.next_pid;
+        self.next_pid = self.next_pid.saturating_add(1);
+        pid
+    }
+
+    fn log(&mut self, serial: &str, level: &str, source: &str, message: &str) {
+        let cursor = self.next_log_cursor.entry(serial.to_owned()).or_insert(1);
+        let entry = LogEntry {
+            cursor: *cursor,
+            level: level.to_owned(),
+            source: source.to_owned(),
+            message: message.to_owned(),
+        };
+        *cursor = cursor.saturating_add(1);
+        let logs = self.logs.entry(serial.to_owned()).or_default();
+        logs.push_back(entry);
+        if logs.len() > MAX_LOG_ENTRIES {
+            logs.pop_front();
+        }
+    }
+}
+
+fn validate_transfer(
+    transfer: &Transfer,
+    serial: &str,
+    path: &str,
+    total_size: u64,
+    direction: TransferDirection,
+) -> Result<(), RpcError> {
+    if transfer.serial != serial
+        || transfer.remote_path != path
+        || transfer.total_size != total_size
+        || transfer.direction != direction
+    {
+        return Err(invalid_state("transfer metadata does not match"));
+    }
+    Ok(())
+}
+
+fn validate_path(path: &str) -> Result<(), RpcError> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(RpcError::invalid_params(
+            "remote_path must be a normalized relative logical path",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_host_path(path: &str) -> Result<(), RpcError> {
+    if Path::new(path).is_absolute() {
+        Ok(())
+    } else {
+        Err(RpcError::invalid_params("local_path must be absolute"))
+    }
+}
+
+fn validate_block_size(block_size: u32) -> Result<(), RpcError> {
+    if (1..=kindlebridge_schema::MAX_SYNC_BLOCK_SIZE).contains(&block_size) {
+        Ok(())
+    } else {
+        Err(RpcError::invalid_params(
+            "block_size must be between 1 and 1048576",
+        ))
+    }
+}
+
+fn write_host_file(path: &str, data: &[u8]) -> Result<(), RpcError> {
+    let path = Path::new(path);
+    let parent = path
+        .parent()
+        .ok_or_else(|| RpcError::invalid_params("local_path has no parent"))?;
+    fs::create_dir_all(parent).map_err(|error| host_file_error("create", path, &error))?;
+    let temporary = path.with_extension("kindlebridge-part");
+    fs::write(&temporary, data).map_err(|error| host_file_error("write", &temporary, &error))?;
+    if path.exists() {
+        fs::remove_file(path).map_err(|error| host_file_error("replace", path, &error))?;
+    }
+    fs::rename(&temporary, path).map_err(|error| host_file_error("commit", path, &error))
+}
+
+fn host_file_error(operation: &str, path: impl AsRef<Path>, error: &std::io::Error) -> RpcError {
+    RpcError::new(error_codes::INVALID_STATE, "Host file operation failed").with_data(json!({
+        "operation": operation,
+        "path": path.as_ref().to_string_lossy(),
+        "kind": format!("{:?}", error.kind())
+    }))
+}
+
+fn validate_app_id(app_id: &str) -> Result<(), RpcError> {
+    let valid = !app_id.is_empty()
+        && app_id.len() <= 128
+        && app_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(RpcError::invalid_params("invalid app_id"))
+    }
+}
+
+fn stable_error(code: i64, message: &str, data: serde_json::Value) -> RpcError {
+    RpcError::new(code, message).with_data(data)
+}
+
+fn invalid_state(detail: &str) -> RpcError {
+    stable_error(
+        error_codes::INVALID_STATE,
+        "Invalid state",
+        json!({ "detail": detail }),
+    )
+}
+
+fn transfer_not_found(transfer_id: &str) -> RpcError {
+    stable_error(
+        error_codes::TRANSFER_NOT_FOUND,
+        "Transfer not found",
+        json!({ "transfer_id": transfer_id }),
+    )
+}
+
+fn file_not_found(path: &str) -> RpcError {
+    stable_error(
+        error_codes::FILE_NOT_FOUND,
+        "File not found",
+        json!({ "remote_path": path }),
+    )
+}
+
+fn app_not_found(app_id: &str) -> RpcError {
+    stable_error(
+        error_codes::APP_NOT_FOUND,
+        "App not found",
+        json!({ "app_id": app_id }),
+    )
+}
+
+fn process_not_found(pid: u32) -> RpcError {
+    stable_error(
+        error_codes::PROCESS_NOT_FOUND,
+        "Process not found",
+        json!({ "pid": pid }),
+    )
+}

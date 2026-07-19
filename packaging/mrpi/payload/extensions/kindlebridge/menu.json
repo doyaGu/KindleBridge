@@ -1,0 +1,42 @@
+{
+  "items": [
+    {
+      "name": "KindleBridge (development)",
+      "priority": -1,
+      "items": [
+        {
+          "name": "Start USB bridge",
+          "action": "./bin/kindlebridge.sh",
+          "params": "start",
+          "exitmenu": false,
+          "refresh": false,
+          "status": false
+        },
+        {
+          "name": "Stop USB bridge / restore",
+          "action": "./bin/kindlebridge.sh",
+          "params": "stop",
+          "exitmenu": false,
+          "refresh": false,
+          "status": false
+        },
+        {
+          "name": "Show USB bridge status",
+          "action": "./bin/kindlebridge.sh",
+          "params": "status",
+          "exitmenu": false,
+          "refresh": false,
+          "status": false
+        },
+        {
+          "name": "Apply staged daemon update",
+          "action": "./bin/kindlebridge.sh",
+          "params": "apply-staged",
+          "exitmenu": false,
+          "refresh": false,
+          "status": false
+        }
+      ]
+    }
+  ]
+}
