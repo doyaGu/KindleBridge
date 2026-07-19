@@ -70,14 +70,18 @@ run_installer() {
     : >"$trace"
     if (
         cd "$case_root/package"
-        KINDLEBRIDGE_MNT_US_ROOT="$case_root/mnt/us" \
-        KINDLEBRIDGE_VAR_LOCAL_ROOT="$case_root/var/local" \
-        KINDLEBRIDGE_INSTALL_TRACE="$trace" \
-        KINDLEBRIDGE_TEST_STATUS="$test_status" \
-        KINDLEBRIDGE_TEST_STOP_RC="$test_stop_rc" \
-        KINDLEBRIDGE_TEST_START_RC="$test_start_rc" \
-        KINDLEBRIDGE_TEST_STOP_MESSAGE="$test_stop_message" \
-        KINDLEBRIDGE_TEST_START_MESSAGE="$test_start_message" \
+        KINDLEBRIDGE_MNT_US_ROOT="$case_root/mnt/us"
+        KINDLEBRIDGE_VAR_LOCAL_ROOT="$case_root/var/local"
+        KINDLEBRIDGE_INSTALL_TRACE="$trace"
+        KINDLEBRIDGE_TEST_STATUS="$test_status"
+        KINDLEBRIDGE_TEST_STOP_RC="$test_stop_rc"
+        KINDLEBRIDGE_TEST_START_RC="$test_start_rc"
+        KINDLEBRIDGE_TEST_STOP_MESSAGE="$test_stop_message"
+        KINDLEBRIDGE_TEST_START_MESSAGE="$test_start_message"
+        export KINDLEBRIDGE_MNT_US_ROOT KINDLEBRIDGE_VAR_LOCAL_ROOT \
+            KINDLEBRIDGE_INSTALL_TRACE KINDLEBRIDGE_TEST_STATUS \
+            KINDLEBRIDGE_TEST_STOP_RC KINDLEBRIDGE_TEST_START_RC \
+            KINDLEBRIDGE_TEST_STOP_MESSAGE KINDLEBRIDGE_TEST_START_MESSAGE
         . "$INSTALLER"
     ) >"$case_root/output" 2>&1; then
         INSTALL_RC=0
