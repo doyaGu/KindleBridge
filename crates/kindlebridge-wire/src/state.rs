@@ -510,6 +510,16 @@ impl SessionState {
                 // per-stream race into a connection-wide protocol failure.
                 Ok(())
             }
+            Command::Data
+                if direction == Direction::Inbound
+                    && matches!(phase, StreamPhase::Closed | StreamPhase::Reset) =>
+            {
+                // The initiator can queue input immediately before it observes
+                // the responder's CLOSE in the opposite direction. Account for
+                // those already-authorized bytes at the connection level, but
+                // do not reopen the stream or grant it more stream credit.
+                self.apply_discarded_inbound_data(header)
+            }
             Command::Data | Command::Credit | Command::Close | Command::Reset => {
                 if phase != StreamPhase::Accepted {
                     return Err(ProtocolError::StreamNotAccepted(header.stream_id));
@@ -619,6 +629,30 @@ impl SessionState {
                 stream.peer_end_stream = true;
             }
         }
+        Ok(())
+    }
+
+    fn apply_discarded_inbound_data(&mut self, header: &Header) -> Result<(), ProtocolError> {
+        let length = header.payload_length;
+        let stream = self
+            .streams
+            .get_mut(&header.stream_id)
+            .expect("stream existence checked");
+        if length > stream.receive_credit {
+            return Err(ProtocolError::ReceiveCreditExceeded {
+                stream_id: header.stream_id,
+                needed: length,
+                available: stream.receive_credit,
+            });
+        }
+        if length > self.connection_receive_credit {
+            return Err(ProtocolError::ConnectionReceiveCreditExceeded {
+                needed: length,
+                available: self.connection_receive_credit,
+            });
+        }
+        stream.receive_credit -= length;
+        self.connection_receive_credit -= length;
         Ok(())
     }
 

@@ -1,6 +1,7 @@
 //! Single-owner KBP connection state with independently blocking frame input.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
@@ -63,6 +64,7 @@ pub struct Connection {
 struct ConnectionInner {
     commands: SyncSender<ActorCommand>,
     terminal_error: Mutex<Option<ConnectionError>>,
+    generation: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -70,10 +72,19 @@ pub struct IncomingStreams {
     receiver: Receiver<Result<IncomingStream, ConnectionError>>,
 }
 
+/// A fresh, fully negotiated session that can replace an abandoned session
+/// without releasing the underlying transport endpoints.
+#[derive(Debug)]
+pub struct RestartedSession {
+    pub state: SessionState,
+    pub hello_response: Frame,
+}
+
 #[derive(Clone, Debug)]
 pub struct Stream {
     id: u32,
     connection: Connection,
+    generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +100,37 @@ impl Connection {
         R: FrameSource,
         W: FrameSink,
     {
+        Self::start_inner(state, source, sink, None)
+    }
+
+    /// Start a connection that can accept a new peer HELLO on the same
+    /// transport. FunctionFS keeps its endpoint pair configured when a host
+    /// process releases and reclaims WinUSB, so USB users must restart the KBP
+    /// session in place instead of closing and reopening ep1/ep2.
+    pub fn start_restartable<R, W, Restart>(
+        state: SessionState,
+        source: R,
+        sink: W,
+        restart: Restart,
+    ) -> (Self, IncomingStreams)
+    where
+        R: FrameSource,
+        W: FrameSink,
+        Restart: FnMut(Frame) -> Result<RestartedSession, ConnectionError> + Send + 'static,
+    {
+        Self::start_inner(state, source, sink, Some(Box::new(restart)))
+    }
+
+    fn start_inner<R, W>(
+        state: SessionState,
+        source: R,
+        sink: W,
+        restart: Option<Box<RestartHandler>>,
+    ) -> (Self, IncomingStreams)
+    where
+        R: FrameSource,
+        W: FrameSink,
+    {
         let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_DEPTH);
         let (inbound_tx, inbound_rx) = mpsc::sync_channel(INBOUND_QUEUE_DEPTH);
         let (incoming_tx, incoming_rx) = mpsc::sync_channel(INCOMING_STREAM_DEPTH);
@@ -96,6 +138,7 @@ impl Connection {
             inner: Arc::new(ConnectionInner {
                 commands: command_tx.clone(),
                 terminal_error: Mutex::new(None),
+                generation: AtomicU64::new(0),
             }),
         };
         let actor_connection = Arc::downgrade(&connection.inner);
@@ -106,7 +149,8 @@ impl Connection {
         thread::Builder::new()
             .name("kbp-connection".to_owned())
             .spawn(move || {
-                Actor::new(state, sink, actor_connection, incoming_tx).run(command_rx, inbound_rx);
+                Actor::new(state, sink, actor_connection, incoming_tx, restart)
+                    .run(command_rx, inbound_rx);
             })
             .expect("could not start KBP connection actor");
         (
@@ -123,7 +167,9 @@ impl Connection {
         receive_window: u32,
         class: TrafficClass,
     ) -> Result<Stream, ConnectionError> {
+        let generation = self.inner.generation.load(Ordering::Acquire);
         let stream_id = self.request(|response| ActorCommand::Open {
+            generation,
             service: service.into(),
             receive_window,
             class,
@@ -132,6 +178,7 @@ impl Connection {
         Ok(Stream {
             id: stream_id,
             connection: self.clone(),
+            generation,
         })
     }
 
@@ -169,6 +216,9 @@ impl Connection {
     }
 }
 
+type RestartHandler =
+    dyn FnMut(Frame) -> Result<RestartedSession, ConnectionError> + Send + 'static;
+
 impl IncomingStreams {
     pub fn recv(&self) -> Result<IncomingStream, ConnectionError> {
         self.receiver
@@ -186,6 +236,7 @@ impl IncomingStream {
         self.stream
             .connection
             .request(|response| ActorCommand::Accept {
+                generation: self.stream.generation,
                 stream_id: self.stream.id,
                 receive_window,
                 class,
@@ -198,6 +249,7 @@ impl IncomingStream {
         self.stream
             .connection
             .request(|response| ActorCommand::Reject {
+                generation: self.stream.generation,
                 stream_id: self.stream.id,
                 reason: reason.into(),
                 response,
@@ -213,6 +265,7 @@ impl Stream {
 
     pub fn send_data(&self, payload: Vec<u8>, end_stream: bool) -> Result<(), ConnectionError> {
         self.connection.request(|response| ActorCommand::SendData {
+            generation: self.generation,
             stream_id: self.id,
             payload,
             end_stream,
@@ -222,6 +275,7 @@ impl Stream {
 
     pub fn recv(&self) -> Result<Frame, ConnectionError> {
         self.connection.request(|response| ActorCommand::Receive {
+            generation: self.generation,
             stream_id: self.id,
             response,
         })
@@ -229,6 +283,7 @@ impl Stream {
 
     pub fn close(&self) -> Result<(), ConnectionError> {
         self.connection.request(|response| ActorCommand::Close {
+            generation: self.generation,
             stream_id: self.id,
             response,
         })
@@ -236,6 +291,7 @@ impl Stream {
 
     pub fn reset(&self, reason: impl Into<Vec<u8>>) -> Result<(), ConnectionError> {
         self.connection.request(|response| ActorCommand::Reset {
+            generation: self.generation,
             stream_id: self.id,
             reason: reason.into(),
             response,
@@ -245,6 +301,7 @@ impl Stream {
     pub fn cancel_receive(&self) -> Result<(), ConnectionError> {
         self.connection
             .request(|response| ActorCommand::CancelReceive {
+                generation: self.generation,
                 stream_id: self.id,
                 response,
             })
@@ -259,46 +316,90 @@ enum InboundEvent {
 #[derive(Debug)]
 enum ActorCommand {
     Open {
+        generation: u64,
         service: String,
         receive_window: u32,
         class: TrafficClass,
         response: SyncSender<Result<u32, ConnectionError>>,
     },
     Accept {
+        generation: u64,
         stream_id: u32,
         receive_window: u32,
         class: TrafficClass,
         response: SyncSender<Result<(), ConnectionError>>,
     },
     Reject {
+        generation: u64,
         stream_id: u32,
         reason: String,
         response: SyncSender<Result<(), ConnectionError>>,
     },
     SendData {
+        generation: u64,
         stream_id: u32,
         payload: Vec<u8>,
         end_stream: bool,
         response: SyncSender<Result<(), ConnectionError>>,
     },
     Receive {
+        generation: u64,
         stream_id: u32,
         response: SyncSender<Result<Frame, ConnectionError>>,
     },
     Close {
+        generation: u64,
         stream_id: u32,
         response: SyncSender<Result<(), ConnectionError>>,
     },
     Reset {
+        generation: u64,
         stream_id: u32,
         reason: Vec<u8>,
         response: SyncSender<Result<(), ConnectionError>>,
     },
     CancelReceive {
+        generation: u64,
         stream_id: u32,
         response: SyncSender<Result<(), ConnectionError>>,
     },
     Shutdown,
+}
+
+impl ActorCommand {
+    const fn generation(&self) -> Option<u64> {
+        match self {
+            Self::Open { generation, .. }
+            | Self::Accept { generation, .. }
+            | Self::Reject { generation, .. }
+            | Self::SendData { generation, .. }
+            | Self::Receive { generation, .. }
+            | Self::Close { generation, .. }
+            | Self::Reset { generation, .. }
+            | Self::CancelReceive { generation, .. } => Some(*generation),
+            Self::Shutdown => None,
+        }
+    }
+
+    fn respond_error(self, error: ConnectionError) {
+        match self {
+            Self::Open { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::Accept { response, .. }
+            | Self::Reject { response, .. }
+            | Self::SendData { response, .. }
+            | Self::Close { response, .. }
+            | Self::Reset { response, .. }
+            | Self::CancelReceive { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::Receive { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            Self::Shutdown => {}
+        }
+    }
 }
 
 struct PendingSend {
@@ -338,8 +439,12 @@ struct Actor<W> {
     incoming: SyncSender<Result<IncomingStream, ConnectionError>>,
     streams: HashMap<u32, StreamEntry>,
     sequences: HashMap<u32, u32>,
+    write_waiters: HashMap<(u32, u32), SyncSender<Result<(), ConnectionError>>>,
     control_sequence: u32,
     scheduler: FrameScheduler,
+    restart: Option<Box<RestartHandler>>,
+    awaiting_restart: bool,
+    generation: u64,
 }
 
 impl<W: FrameSink> Actor<W> {
@@ -348,6 +453,7 @@ impl<W: FrameSink> Actor<W> {
         sink: W,
         commands: Weak<ConnectionInner>,
         incoming: SyncSender<Result<IncomingStream, ConnectionError>>,
+        restart: Option<Box<RestartHandler>>,
     ) -> Self {
         Self {
             state,
@@ -356,9 +462,28 @@ impl<W: FrameSink> Actor<W> {
             incoming,
             streams: HashMap::new(),
             sequences: HashMap::new(),
+            write_waiters: HashMap::new(),
             control_sequence: 1,
             scheduler: FrameScheduler::new(MAX_SCHEDULED_BYTES),
+            restart,
+            awaiting_restart: false,
+            generation: 0,
         }
+    }
+
+    fn handle_current_command(&mut self, command: ActorCommand) -> Result<(), ConnectionError> {
+        if self.awaiting_restart && !matches!(&command, ActorCommand::Shutdown) {
+            command.respond_error(ConnectionError::Disconnected);
+            return Ok(());
+        }
+        if command
+            .generation()
+            .is_some_and(|generation| generation != self.generation)
+        {
+            command.respond_error(ConnectionError::Disconnected);
+            return Ok(());
+        }
+        self.handle_command(command)
     }
 
     fn run(mut self, commands: Receiver<ActorCommand>, inbound: Receiver<InboundEvent>) {
@@ -368,9 +493,11 @@ impl<W: FrameSink> Actor<W> {
                 Ok(ActorCommand::Shutdown) | Err(TryRecvError::Disconnected) => break,
                 Ok(command) => {
                     progressed = true;
-                    if let Err(error) = self.handle_command(command) {
-                        self.fail_all(error);
-                        break;
+                    if let Err(error) = self.handle_current_command(command) {
+                        if !self.begin_restart(error.clone()) {
+                            self.fail_all(error);
+                            break;
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => {}
@@ -379,8 +506,10 @@ impl<W: FrameSink> Actor<W> {
                 Ok(InboundEvent::Frame(frame)) => {
                     progressed = true;
                     if let Err(error) = self.handle_inbound(frame) {
-                        self.fail_all(error);
-                        break;
+                        if !self.begin_restart(error.clone()) {
+                            self.fail_all(error);
+                            break;
+                        }
                     }
                 }
                 Ok(InboundEvent::Failed(error)) => {
@@ -393,27 +522,40 @@ impl<W: FrameSink> Actor<W> {
                 }
                 Err(TryRecvError::Empty) => {}
             }
+            // Do not block for another command while an outbound frame is
+            // already queued. More importantly, a command received by the
+            // blocking idle path must reach the scheduler before the next
+            // command is considered. Otherwise a worker can enqueue CLOSE
+            // immediately after DATA and make the terminal command visible to
+            // the actor before DATA has even been submitted to the sink.
+            if !progressed && self.scheduler.is_empty() {
+                match commands.recv_timeout(IDLE_POLL) {
+                    Ok(ActorCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Ok(command) => {
+                        if let Err(error) = self.handle_current_command(command) {
+                            if !self.begin_restart(error.clone()) {
+                                self.fail_all(error);
+                                break;
+                            }
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
             if let Some(item) = self.scheduler.dequeue() {
-                progressed = true;
+                let key = (item.frame.header.stream_id, item.frame.header.sequence);
                 if let Err(error) = self
                     .sink
                     .write_frame(&item.frame)
                     .and_then(|()| self.sink.flush())
                 {
-                    self.fail_all(ConnectionError::Transport(error));
-                    break;
-                }
-            }
-            if !progressed {
-                match commands.recv_timeout(IDLE_POLL) {
-                    Ok(ActorCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    Ok(command) => {
-                        if let Err(error) = self.handle_command(command) {
-                            self.fail_all(error);
-                            break;
-                        }
+                    let error = ConnectionError::Transport(error);
+                    if !self.begin_restart(error.clone()) {
+                        self.fail_all(error);
+                        break;
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                } else if let Some(response) = self.write_waiters.remove(&key) {
+                    let _ = response.send(Ok(()));
                 }
             }
         }
@@ -423,6 +565,7 @@ impl<W: FrameSink> Actor<W> {
     fn handle_command(&mut self, command: ActorCommand) -> Result<(), ConnectionError> {
         match command {
             ActorCommand::Open {
+                generation: _,
                 service,
                 receive_window,
                 class,
@@ -444,15 +587,20 @@ impl<W: FrameSink> Actor<W> {
                 )
             }
             ActorCommand::Accept {
+                generation: _,
                 stream_id,
                 receive_window,
                 class,
                 response,
             } => {
+                if !self.streams.contains_key(&stream_id) {
+                    let _ = response.send(Err(ConnectionError::Disconnected));
+                    return Ok(());
+                }
                 let entry = self
                     .streams
                     .get_mut(&stream_id)
-                    .ok_or(ConnectionError::UnknownStream(stream_id))?;
+                    .expect("stream existence was checked");
                 entry.class = class;
                 entry.receive_window = receive_window;
                 let payload = serde_json::to_vec(&ServiceAccept {
@@ -471,10 +619,15 @@ impl<W: FrameSink> Actor<W> {
                 result
             }
             ActorCommand::Reject {
+                generation: _,
                 stream_id,
                 reason,
                 response,
             } => {
+                if !self.streams.contains_key(&stream_id) {
+                    let _ = response.send(Err(ConnectionError::Disconnected));
+                    return Ok(());
+                }
                 let result = self.queue_frame(
                     Command::Reject,
                     stream_id,
@@ -487,19 +640,38 @@ impl<W: FrameSink> Actor<W> {
                 result
             }
             ActorCommand::SendData {
+                generation: _,
                 stream_id,
                 payload,
                 end_stream,
                 response,
-            } => self.send_or_wait(stream_id, payload, end_stream, response),
+            } => {
+                if !self.streams.contains_key(&stream_id) {
+                    let _ = response.send(Err(ConnectionError::Disconnected));
+                    return Ok(());
+                }
+                self.send_or_wait(stream_id, payload, end_stream, response)
+            }
             ActorCommand::Receive {
-                stream_id,
-                response,
-            } => self.receive_or_wait(stream_id, response),
-            ActorCommand::Close {
+                generation: _,
                 stream_id,
                 response,
             } => {
+                if !self.streams.contains_key(&stream_id) {
+                    let _ = response.send(Err(ConnectionError::Disconnected));
+                    return Ok(());
+                }
+                self.receive_or_wait(stream_id, response)
+            }
+            ActorCommand::Close {
+                generation: _,
+                stream_id,
+                response,
+            } => {
+                if !self.streams.contains_key(&stream_id) {
+                    let _ = response.send(Err(ConnectionError::Disconnected));
+                    return Ok(());
+                }
                 let result = self.queue_frame(
                     Command::Close,
                     stream_id,
@@ -512,10 +684,15 @@ impl<W: FrameSink> Actor<W> {
                 result
             }
             ActorCommand::Reset {
+                generation: _,
                 stream_id,
                 reason,
                 response,
             } => {
+                if !self.streams.contains_key(&stream_id) {
+                    let _ = response.send(Err(ConnectionError::Disconnected));
+                    return Ok(());
+                }
                 let result = self.queue_frame(
                     Command::Reset,
                     stream_id,
@@ -528,13 +705,18 @@ impl<W: FrameSink> Actor<W> {
                 result
             }
             ActorCommand::CancelReceive {
+                generation: _,
                 stream_id,
                 response,
             } => {
+                if !self.streams.contains_key(&stream_id) {
+                    let _ = response.send(Err(ConnectionError::Disconnected));
+                    return Ok(());
+                }
                 let entry = self
                     .streams
                     .get_mut(&stream_id)
-                    .ok_or(ConnectionError::UnknownStream(stream_id))?;
+                    .expect("stream existence was checked");
                 if let Some(receiver) = entry.receiver.take() {
                     let _ = receiver.send(Err(ConnectionError::Disconnected));
                 }
@@ -546,6 +728,23 @@ impl<W: FrameSink> Actor<W> {
     }
 
     fn handle_inbound(&mut self, frame: Frame) -> Result<(), ConnectionError> {
+        if frame.header.command == Command::Hello && frame.header.stream_id == 0 {
+            if self.restart.is_some() {
+                return self.restart_session(frame);
+            }
+        } else if self.awaiting_restart {
+            // A cancelled WinUSB transfer can leave complete frames from the
+            // abandoned session queued ahead of the new HELLO.
+            return Ok(());
+        }
+
+        let discard_terminal_data = frame.header.command == Command::Data
+            && self
+                .state
+                .stream(frame.header.stream_id)
+                .is_some_and(|stream| {
+                    matches!(stream.phase, StreamPhase::Closed | StreamPhase::Reset)
+                });
         let context = if frame.header.command == Command::Accept {
             let accept: ServiceAccept = serde_json::from_slice(&frame.payload)
                 .map_err(|error| ConnectionError::InvalidService(error.to_string()))?;
@@ -561,6 +760,13 @@ impl<W: FrameSink> Actor<W> {
                     frame.header.command, frame.header.stream_id
                 ))
             })?;
+
+        if discard_terminal_data {
+            // The wire state charged these in-flight bytes against connection
+            // credit. Consume them here without exposing terminal-stream input
+            // to a worker that has already been torn down.
+            return self.restore_consumed_credit(&frame);
+        }
 
         match frame.header.command {
             Command::Open => self.accept_incoming_open(frame),
@@ -602,6 +808,7 @@ impl<W: FrameSink> Actor<W> {
                 stream: Stream {
                     id: stream_id,
                     connection,
+                    generation: self.generation,
                 },
             }))
             .map_err(|_| ConnectionError::Disconnected)
@@ -650,7 +857,12 @@ impl<W: FrameSink> Actor<W> {
                 .streams
                 .get(&stream_id)
                 .ok_or(ConnectionError::UnknownStream(stream_id))?;
-            if entry.pending_send.is_some() {
+            if entry.pending_send.is_some()
+                || self
+                    .write_waiters
+                    .keys()
+                    .any(|(pending_stream_id, _)| *pending_stream_id == stream_id)
+            {
                 let error = ConnectionError::SendPending(stream_id);
                 let _ = response.send(Err(error.clone()));
                 return Err(error);
@@ -660,6 +872,7 @@ impl<W: FrameSink> Actor<W> {
         let needed = u32::try_from(payload.len())
             .map_err(|_| ConnectionError::Protocol("DATA payload is too large".to_owned()))?;
         if self.has_send_credit(stream_id, needed) {
+            let sequence = self.next_sequence_for(stream_id);
             let result = self.queue_frame(
                 Command::Data,
                 stream_id,
@@ -668,8 +881,16 @@ impl<W: FrameSink> Actor<W> {
                 class,
                 FrameContext::default(),
             );
-            let _ = response.send(result.clone());
-            result
+            match result {
+                Ok(()) => {
+                    self.write_waiters.insert((stream_id, sequence), response);
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = response.send(Err(error.clone()));
+                    Err(error)
+                }
+            }
         } else {
             self.streams
                 .get_mut(&stream_id)
@@ -708,6 +929,7 @@ impl<W: FrameSink> Actor<W> {
             return Ok(());
         }
         let class = self.streams[&stream_id].class;
+        let sequence = self.next_sequence_for(stream_id);
         let result = self.queue_frame(
             Command::Data,
             stream_id,
@@ -716,8 +938,17 @@ impl<W: FrameSink> Actor<W> {
             class,
             FrameContext::default(),
         );
-        let _ = pending.response.send(result.clone());
-        result
+        match result {
+            Ok(()) => {
+                self.write_waiters
+                    .insert((stream_id, sequence), pending.response);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = pending.response.send(Err(error.clone()));
+                Err(error)
+            }
+        }
     }
 
     fn has_send_credit(&self, stream_id: u32, needed: u32) -> bool {
@@ -859,6 +1090,14 @@ impl<W: FrameSink> Actor<W> {
         Ok(current)
     }
 
+    fn next_sequence_for(&self, stream_id: u32) -> u32 {
+        if stream_id == 0 {
+            self.control_sequence
+        } else {
+            self.sequences.get(&stream_id).copied().unwrap_or(0)
+        }
+    }
+
     fn fail_all(&mut self, error: ConnectionError) {
         if let Some(connection) = self.own_connection.upgrade() {
             if let Ok(mut terminal_error) = connection.terminal_error.lock() {
@@ -878,7 +1117,68 @@ impl<W: FrameSink> Actor<W> {
                 let _ = pending.response.send(Err(error.clone()));
             }
         }
+        for (_, response) in self.write_waiters.drain() {
+            let _ = response.send(Err(error.clone()));
+        }
         let _ = self.incoming.try_send(Err(error));
+    }
+
+    fn begin_restart(&mut self, error: ConnectionError) -> bool {
+        if self.restart.is_none() {
+            return false;
+        }
+        self.fail_streams(error);
+        self.awaiting_restart = true;
+        true
+    }
+
+    fn restart_session(&mut self, hello: Frame) -> Result<(), ConnectionError> {
+        let restarted = self.restart.as_mut().expect("restart handler was checked")(hello)?;
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| ConnectionError::Protocol("session generation exhausted".to_owned()))?;
+        if let Some(connection) = self.own_connection.upgrade() {
+            connection
+                .generation
+                .store(self.generation, Ordering::Release);
+        }
+        self.fail_streams(ConnectionError::Disconnected);
+        self.state = restarted.state;
+        self.awaiting_restart = false;
+        match self
+            .sink
+            .write_frame(&restarted.hello_response)
+            .and_then(|()| self.sink.flush())
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.awaiting_restart = true;
+                self.fail_streams(ConnectionError::Transport(error));
+                Ok(())
+            }
+        }
+    }
+
+    fn fail_streams(&mut self, error: ConnectionError) {
+        for entry in self.streams.values_mut() {
+            if let Some(opener) = entry.opener.take() {
+                let _ = opener.send(Err(error.clone()));
+            }
+            if let Some(receiver) = entry.receiver.take() {
+                let _ = receiver.send(Err(error.clone()));
+            }
+            if let Some(pending) = entry.pending_send.take() {
+                let _ = pending.response.send(Err(error.clone()));
+            }
+        }
+        self.streams.clear();
+        self.sequences.clear();
+        for (_, response) in self.write_waiters.drain() {
+            let _ = response.send(Err(error.clone()));
+        }
+        self.control_sequence = 1;
+        self.scheduler = FrameScheduler::new(MAX_SCHEDULED_BYTES);
     }
 }
 

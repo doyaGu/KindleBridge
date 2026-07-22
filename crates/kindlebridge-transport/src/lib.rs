@@ -137,7 +137,8 @@ impl FrameScheduler {
                 .stream_classes
                 .get_mut(&stream_id)
                 .expect("enqueued frame has stream ordering metadata");
-            debug_assert_eq!(classes.pop_front(), Some(index));
+            let scheduled_class = classes.pop_front();
+            debug_assert_eq!(scheduled_class, Some(index));
             if classes.is_empty() {
                 self.stream_classes.remove(&stream_id);
             }
