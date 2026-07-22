@@ -4,14 +4,15 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU8, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc, Condvar, Mutex,
     },
+    thread,
 };
 
 #[cfg(unix)]
 use rustix::{
-    event::{poll, PollFd, PollFlags},
+    event::{poll, PollFd, PollFlags, Timespec},
     fs::{open, Mode, OFlags},
 };
 
@@ -33,6 +34,11 @@ pub const MAX_FRAME_COUNT: u64 = 100_000;
 // 63 KiB requests become order-4 allocations and fail once normal uptime has
 // fragmented memory, even when tens of MiB remain free.
 pub const MAX_FUNCTIONFS_IO: usize = 16 * 1024;
+#[cfg(unix)]
+const CONTROL_POLL_SLICE: Timespec = Timespec {
+    tv_sec: 0,
+    tv_nsec: 10_000_000,
+};
 const MAX_ROUNDS: u32 = 99_998;
 pub(crate) const MAX_RESYNCHRONIZE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -313,13 +319,14 @@ impl Read for FunctionFsReadEndpoint {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         #[cfg(unix)]
         {
-            loop {
-                wait_until_ready(&self.file, &self.control, PollFlags::IN)?;
-                match self.file.read(buffer) {
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    outcome => return outcome,
-                }
-            }
+            retry_after_would_block(
+                &mut self.file,
+                |file| {
+                    ensure_control_active(&self.control)?;
+                    file.read(buffer)
+                },
+                |file| wait_until_ready(file, &self.control, PollFlags::IN),
+            )
         }
         #[cfg(not(unix))]
         self.file.read(buffer)
@@ -337,13 +344,14 @@ impl Write for FunctionFsWriteEndpoint {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         #[cfg(unix)]
         {
-            loop {
-                wait_until_ready(&self.file, &self.control, PollFlags::OUT)?;
-                match self.file.write(buffer) {
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    outcome => return outcome,
-                }
-            }
+            retry_after_would_block(
+                &mut self.file,
+                |file| {
+                    ensure_control_active(&self.control)?;
+                    file.write(buffer)
+                },
+                |file| wait_until_ready(file, &self.control, PollFlags::OUT),
+            )
         }
         #[cfg(not(unix))]
         self.file.write(buffer)
@@ -354,6 +362,29 @@ impl Write for FunctionFsWriteEndpoint {
     }
 }
 
+#[cfg(any(unix, test))]
+pub(crate) fn retry_after_would_block<Resource, Output>(
+    resource: &mut Resource,
+    mut operation: impl FnMut(&mut Resource) -> std::io::Result<Output>,
+    mut wait: impl FnMut(&Resource) -> std::io::Result<()>,
+) -> std::io::Result<Output> {
+    loop {
+        match operation(resource) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => wait(resource)?,
+            outcome => return outcome,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn ensure_control_active(control: &Arc<FunctionFsControl>) -> std::io::Result<()> {
+    match control.state() {
+        ControlState::Active => Ok(()),
+        ControlState::Inactive => Err(lifecycle_abort("FunctionFS became inactive")),
+        ControlState::Disconnected => Err(lifecycle_abort("FunctionFS was unbound")),
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn wait_until_ready(
     file: &File,
@@ -361,34 +392,17 @@ pub(crate) fn wait_until_ready(
     expected: PollFlags,
 ) -> std::io::Result<()> {
     loop {
-        let mut ep0 = control.lock()?;
-        let poll_result = {
-            let mut fds = [
-                PollFd::new(file, expected),
-                PollFd::new(&*ep0, PollFlags::IN),
-            ];
-            match poll(&mut fds, None) {
-                Ok(count) => Ok((count, fds[0].revents(), fds[1].revents())),
-                Err(error) => Err(error),
-            }
-        };
+        ensure_control_active(control)?;
+        // ep0 has one dedicated event owner. Bulk readers and writers must
+        // never contend for its mutex: the Kindle's pthread mutex is not fair,
+        // so an OUT reader that repeatedly polls ep0 can starve an IN writer
+        // even while the host has a pending read request.
+        let mut fds = [PollFd::new(file, expected)];
+        let poll_result =
+            poll(&mut fds, Some(&CONTROL_POLL_SLICE)).map(|count| (count, fds[0].revents()));
         match poll_result {
-            Ok((0, _, _)) => continue,
-            Ok((_, ready, control_ready)) => {
-                if !control_ready.is_empty() {
-                    match control
-                        .consume_event(&mut ep0)
-                        .map_err(std::io::Error::other)?
-                    {
-                        ControlTransition::NoChange | ControlTransition::Active => continue,
-                        ControlTransition::Inactive => {
-                            return Err(lifecycle_abort("FunctionFS became inactive"));
-                        }
-                        ControlTransition::Disconnected => {
-                            return Err(lifecycle_abort("FunctionFS was unbound"));
-                        }
-                    }
-                }
+            Ok((0, _)) => continue,
+            Ok((_, ready)) => {
                 if ready.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
                     return Err(lifecycle_abort("FunctionFS endpoint disconnected"));
                 }
@@ -448,6 +462,9 @@ pub(crate) fn classify_control_event(event: Event) -> ControlAction {
 pub(crate) struct FunctionFsControl {
     ep0: Mutex<File>,
     state: AtomicU8,
+    monitor_started: AtomicBool,
+    state_wait: Mutex<()>,
+    state_changed: Condvar,
 }
 
 impl FunctionFsControl {
@@ -455,6 +472,9 @@ impl FunctionFsControl {
         Self {
             ep0: Mutex::new(ep0),
             state: AtomicU8::new(ControlState::Inactive as u8),
+            monitor_started: AtomicBool::new(false),
+            state_wait: Mutex::new(()),
+            state_changed: Condvar::new(),
         }
     }
 
@@ -472,6 +492,19 @@ impl FunctionFsControl {
         }
     }
 
+    fn set_state(&self, state: ControlState) {
+        // Serialize the state update with Condvar::wait so a transition cannot
+        // be lost between the accept loop's state check and sleeping.
+        if let Ok(_guard) = self.state_wait.lock() {
+            self.state.store(state as u8, Ordering::Release);
+            self.state_changed.notify_all();
+        } else {
+            self.state
+                .store(ControlState::Disconnected as u8, Ordering::Release);
+            self.state_changed.notify_all();
+        }
+    }
+
     fn consume_event(&self, ep0: &mut File) -> Result<ControlTransition, EventError> {
         let Some(event) = read_event(ep0)? else {
             self.state
@@ -480,18 +513,15 @@ impl FunctionFsControl {
         };
         let transition = match classify_control_event(event) {
             ControlAction::Active => {
-                self.state
-                    .store(ControlState::Active as u8, Ordering::Release);
+                self.set_state(ControlState::Active);
                 ControlTransition::Active
             }
             ControlAction::Inactive => {
-                self.state
-                    .store(ControlState::Inactive as u8, Ordering::Release);
+                self.set_state(ControlState::Inactive);
                 ControlTransition::Inactive
             }
             ControlAction::Disconnected => {
-                self.state
-                    .store(ControlState::Disconnected as u8, Ordering::Release);
+                self.set_state(ControlState::Disconnected);
                 ControlTransition::Disconnected
             }
             ControlAction::Stall(setup) => {
@@ -504,6 +534,26 @@ impl FunctionFsControl {
     }
 
     fn wait_for_active(&self) -> Result<WaitOutcome, EventError> {
+        if self.monitor_started.load(Ordering::Acquire) {
+            let mut guard = self.state_wait.lock().map_err(|_| {
+                EventError::Io(std::io::Error::other(
+                    "FunctionFS state wait lock was poisoned",
+                ))
+            })?;
+            loop {
+                match self.state() {
+                    ControlState::Active => return Ok(WaitOutcome::Active),
+                    ControlState::Disconnected => return Ok(WaitOutcome::Disconnected),
+                    ControlState::Inactive => {
+                        guard = self.state_changed.wait(guard).map_err(|_| {
+                            EventError::Io(std::io::Error::other(
+                                "FunctionFS state wait lock was poisoned",
+                            ))
+                        })?;
+                    }
+                }
+            }
+        }
         match self.state() {
             ControlState::Active => return Ok(WaitOutcome::Active),
             ControlState::Disconnected => return Ok(WaitOutcome::Disconnected),
@@ -518,6 +568,33 @@ impl FunctionFsControl {
             }
         }
         Err(EventError::EventLimit(MAX_EVENTS_BEFORE_ACTIVE))
+    }
+
+    fn start_monitor(self: &Arc<Self>) {
+        if self.monitor_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let control = Arc::clone(self);
+        thread::Builder::new()
+            .name("functionfs-control".to_owned())
+            .spawn(move || loop {
+                let transition = match control.lock() {
+                    Ok(mut ep0) => control.consume_event(&mut ep0),
+                    Err(error) => Err(EventError::Io(error)),
+                };
+                match transition {
+                    Ok(ControlTransition::Disconnected) | Err(_) => {
+                        control.set_state(ControlState::Disconnected);
+                        break;
+                    }
+                    Ok(
+                        ControlTransition::NoChange
+                        | ControlTransition::Active
+                        | ControlTransition::Inactive,
+                    ) => {}
+                }
+            })
+            .expect("could not start FunctionFS control monitor");
     }
 }
 
@@ -535,6 +612,42 @@ mod control_state_tests {
             .store(ControlState::Active as u8, Ordering::Release);
 
         assert_eq!(control.wait_for_active().unwrap(), WaitOutcome::Active);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ready_bulk_writer_does_not_depend_on_the_control_lock() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (ep0, _ep0_peer) = UnixStream::pair().unwrap();
+        let control = Arc::new(FunctionFsControl::new(File::from(OwnedFd::from(ep0))));
+        control
+            .state
+            .store(ControlState::Active as u8, Ordering::Release);
+
+        // The control endpoint has one owner. Bulk endpoint readiness must not
+        // depend on acquiring its lock: otherwise a blocked OUT reader can
+        // repeatedly reacquire ep0 and starve the IN writer indefinitely on
+        // kernels whose pthread mutex is not fair.
+        let ep0_owner = control.lock().unwrap();
+        let (ready, _ready_peer) = UnixStream::pair().unwrap();
+        let ready = File::from(OwnedFd::from(ready));
+        let ready_control = Arc::clone(&control);
+        let (writer_tx, writer_rx) = mpsc::sync_channel(1);
+        let writer_worker = thread::spawn(move || {
+            let _ = writer_tx.send(wait_until_ready(&ready, &ready_control, PollFlags::OUT));
+        });
+
+        let writer_result = writer_rx.recv_timeout(Duration::from_millis(100));
+        drop(ep0_owner);
+        writer_worker.join().unwrap();
+        writer_result
+            .expect("ready bulk writer waited for the unrelated control lock")
+            .unwrap();
     }
 }
 
@@ -596,6 +709,7 @@ impl FunctionFsDevice {
         if self.control.wait_for_active()? == WaitOutcome::Disconnected {
             return Ok(None);
         }
+        self.control.start_monitor();
         Ok(Some(FunctionFsEndpoints {
             bulk_out: FunctionFsIo::new(buffer_functionfs_reader(open_read_endpoint(
                 &self.functionfs_dir.join("ep1"),

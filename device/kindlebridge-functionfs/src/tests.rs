@@ -13,8 +13,8 @@ use crate::{
     descriptor_bytes,
     event::{wait_for_active_bounded, EventError},
     probe::{
-        buffer_functionfs_reader, receive_expected, write_control_block, ResynchronizingReader,
-        MAX_RESYNCHRONIZE_BYTES,
+        buffer_functionfs_reader, receive_expected, retry_after_would_block, write_control_block,
+        ResynchronizingReader, MAX_RESYNCHRONIZE_BYTES,
     },
     run_probe_session, string_bytes, Event, EventKind, FunctionFsError, SessionOutcome,
     SetupPacket, WaitOutcome, DESCRIPTOR_LENGTH, EVENT_SIZE, MAX_FRAME_COUNT, MAX_FUNCTIONFS_IO,
@@ -22,6 +22,51 @@ use crate::{
 };
 
 use crate::probe::{classify_control_event, ControlAction};
+
+#[test]
+fn functionfs_io_attempts_nonblocking_io_before_waiting() {
+    let attempts = AtomicUsize::new(0);
+    let waits = AtomicUsize::new(0);
+    let mut resource = ();
+    let result = retry_after_would_block(
+        &mut resource,
+        |_| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            } else {
+                Ok(37)
+            }
+        },
+        |_| {
+            waits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(result, 37);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(waits.load(Ordering::SeqCst), 1);
+
+    attempts.store(0, Ordering::SeqCst);
+    waits.store(0, Ordering::SeqCst);
+    let result = retry_after_would_block(
+        &mut resource,
+        |_| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(41)
+        },
+        |_| {
+            waits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(result, 41);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(waits.load(Ordering::SeqCst), 0);
+}
 
 const GOLDEN_DESCRIPTORS: [u8; DESCRIPTOR_LENGTH] = [
     0x03, 0x00, 0x00, 0x00, // magic v2
