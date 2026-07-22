@@ -510,6 +510,13 @@ impl SessionState {
                 // per-stream race into a connection-wide protocol failure.
                 Ok(())
             }
+            Command::Reset if matches!(phase, StreamPhase::Closed | StreamPhase::Reset) => {
+                // The initiator can reset a stream at the same time the
+                // responder closes it, or before observing a peer reset. The
+                // first terminal transition already completed the stream, so
+                // a late duplicate reset is idempotent.
+                Ok(())
+            }
             Command::Data
                 if direction == Direction::Inbound
                     && matches!(phase, StreamPhase::Closed | StreamPhase::Reset) =>
