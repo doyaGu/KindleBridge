@@ -12,8 +12,9 @@ and protocol versions do not force repository-wide renames.
 - KBB means KindleBridge Bundle. `KBB1`, `.kbb`, and
   `kindlebridge.bundle.v1` identify the versioned bundle format and profile.
 
-These names are compatibility surfaces. A future major version gets a new
-wire/format identifier and a versioned decoder; it does not rename the product.
+The repository implements one negotiated protocol and schema revision at a
+time. A future public major version gets a new wire/format identifier without
+renaming the product.
 
 ## Code names
 

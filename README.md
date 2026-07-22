@@ -7,8 +7,9 @@ on Kindle firmware 5.16.3 and later.
 
 The current tree is an internal development candidate. It is not a public 1.0 release.
 The MRPI development package installs only under `/mnt/us` and `/var/local`,
-starts the USB bridge automatically, and returns ownership to stock MTP through
-Kindle's `volumd`/HAL lifecycle. See
+leaves the USB bridge inactive until the user explicitly enables development
+mode in KUAL, and returns ownership to stock MTP through Kindle's `volumd`/HAL
+lifecycle. See
 [`STATUS.md`](STATUS.md) for the release gates and current gaps.
 
 ## Workspace
@@ -75,12 +76,12 @@ must not be exposed beyond a trusted development link. The production profile
 still requires authenticated pairing and session encryption.
 
 The primary USB path uses that same KBP session, exec, and sync implementation.
-The old hardware-lab RNDIS recovery script is retired: it directly manipulated the
-USB controller and is retained only as historical test evidence. The MRPI
+The archived hardware-lab RNDIS recovery script directly manipulated the USB
+controller and is retained only as historical test evidence. The MRPI
 manager is the supported development entry point. With the cable unplugged:
 
 ```sh
-/mnt/us/kindlebridge/bin/usb-gadget-manager.sh start 0
+/var/local/kindlebridge/control/bin/usb-gadget-manager.sh start 0
 ```
 
 Host commands then discover USB automatically:
@@ -107,10 +108,14 @@ to close stdin immediately, and `-e none` to disable the default line-leading
 `~.` local escape. `shell -c COMMAND` streams without the structured `exec`
 output limit and returns the remote exit status; use `exec` when stdout/stderr
 capture or `--json` is required, and `shell --ndjson` for stream events. Devices
-without `shell.v2` receive a visible warning and fall back to the legacy line
-REPL or `exec.v1` command path.
+without `shell.v2` are rejected as incompatible. Internal builds require a
+matching CLI, host server, and device daemon; there is no line-REPL or
+`exec.v1` shell fallback.
 
 The MRPI package installs the USB control plane and a small A/B daemon launcher.
+Persistent executables, manifests, PID files, and heartbeats live under
+`/var/local/kindlebridge/control`, not the FSP/MTP-backed `/mnt/us` tree. The
+userstore retains only the KUAL entry point and developer-visible data.
 The active Bridge may upload and verify a cross-built `kindlebridged`, but it
 never replaces the daemon that owns its current USB transport:
 
@@ -164,22 +169,27 @@ Build the standalone KT6 package on Windows with:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/build-mrpi-dev.ps1
 ```
 
-The build uses the workspace Rust KindleTool checkout at `../KindleTool`; it
-does not build or invoke the legacy C/MinGW implementation.
+The build uses the workspace Rust KindleTool checkout at `../KindleTool`.
 
 Copy the generated install package from `dist/` to `/mnt/us/mrpackages`, unplug
-USB, and run it through MRPI. The installer stops the previous Bridge, replaces
-the package atomically, starts the new version, and restores the previous version
-if activation fails. The normal user flow is therefore only **unplug, run MRPI,
-reconnect**. If the cable is still attached, installation fails before replacing
-the existing version and tells the user to unplug it.
+USB, and run it through MRPI. Installation and upgrades replace the package
+atomically but deliberately leave USB mode unchanged. If KindleBridge is active,
+the installer refuses to replace it and asks the user to choose **Switch to USB
+file transfer** first. After installation, choose **Switch to development mode**
+in KUAL when the Bridge is actually needed.
 
 The package does not install, invoke, or monitor USBNetLite. Its KUAL menu uses
 task-oriented **Switch to development mode**, **Switch to USB file transfer**,
-and **Show status and recovery steps** actions. A staged-update action appears
-only when an update is ready. Repeating either mode action is safe; transitions
-have no KUAL time limit and remain in the menu. `/mnt/us/KINDLEBRIDGE_DISABLE`
-prevents activation. Explicit manager invocations may still select a bounded
+and **Show status and recovery steps** actions. The staged-update action remains
+visible because KUAL does not invalidate its menu cache when the runtime marker
+changes; selecting it without an update explains what to do. Repeating either
+mode action is safe; transitions have no KUAL time limit and remain in the menu.
+Before staged activation shows progress, KUAL performs a read-only cable check;
+the manager repeats that check at the mutation boundary to reject a late replug.
+`/mnt/us/KINDLEBRIDGE_DISABLE`
+prevents activation. KindleBridge also refuses to start while USBNetLite owns
+the USB gadget, with an instruction to turn USBNetwork off first. Explicit
+manager invocations may still select a bounded
 timeout for laboratory tests; `start 0` disables it. Stop always restores stock
 MTP; a temporary `g_ether` rescue transport is not restored or required at runtime.
 Start and stop require an unplugged USB cable on KT6. Once active, KindleBridge
@@ -205,9 +215,49 @@ cargo run --package kindlebridge-bundle -- key init --output dev.key
 cargo run --package kindlebridge-bundle -- build --manifest kindlebridge.toml --input app-root --signing-key dev.key --output app.kbb
 cargo run --package kindlebridge-bundle -- inspect app.kbb
 cargo run --package kindlebridge-bundle -- verify app.kbb --publisher dev.key.pub --target kindlehf
+cargo run --package kindlebridge -- app install YOUR_KINDLE_SERIAL .\app.kbb
+cargo run --package kindlebridge -- app list YOUR_KINDLE_SERIAL
+cargo run --package kindlebridge -- app start YOUR_KINDLE_SERIAL org.example.app
+cargo run --package kindlebridge -- app restart YOUR_KINDLE_SERIAL org.example.app
+cargo run --package kindlebridge -- app stop YOUR_KINDLE_SERIAL org.example.app
+cargo run --package kindlebridge -- app rollback YOUR_KINDLE_SERIAL org.example.app
+cargo run --package kindlebridge -- app uninstall YOUR_KINDLE_SERIAL org.example.app
 ```
 
-The builder refuses to overwrite keys or bundles. `kindlebridge.bundle.v1` accepts exactly one target, no dependencies or migrations, and one Ed25519 publisher signature.
+The builder refuses to overwrite keys or bundles. `kindlebridge.bundle.v1`
+accepts exactly one target, no dependencies or migrations, and one Ed25519
+publisher signature. `app install` resolves the local path before contacting
+the shared host server, verifies the KBB before spending USB bandwidth, uploads
+it through resumable `sync.v1`, then has the Kindle independently verify the
+signature, target, firmware range, required features, file checksum, and every
+raw block. The device stores blocks by BLAKE3 address and changes the active
+application inventory through a journaled, atomic activation generation.
+Before activation, it reconstructs a content-addressed, read-only runtime image
+and records a bounded runtime manifest containing the signed entrypoint digest
+and process policy. `app start`, `app stop`, and `app restart` operate on a real
+process group; list reports the observed PID and reaps exited applications.
+Stop sends TERM, waits the bundle's `stop_timeout_ms`, then kills the process
+group. A parent-death-aware internal runner also cleans the group if the daemon
+is terminated. App stdout/stderr inherit the daemon log, so they are visible to
+the current log snapshot command. Installing the identical bundle again is
+idempotent and verifies that its runtime image is present. Missing or corrupt
+runtime images are hard errors, not compatibility states. `app rollback`
+returns to the previous distinct signed application
+generation without reverting unrelated applications; a repeated rollback does
+not toggle forward. `app uninstall` removes the active application while
+preserving its data and immutable history. `restart = "on-failure"` permits at
+most three retries after the initial start, with bounded backoff; exhaustion is
+reported as `failed`, and an explicit start or stop clears that terminal state.
+All spawns are owned by one daemon-lifetime supervisor thread so Linux
+parent-death cleanup cannot be triggered by a short-lived RPC worker exiting.
+Development bundles may currently use any internally valid publisher key;
+publisher allowlists arrive with pairing/grants and are still a publication
+gate.
+
+KBP protocol revision 3 uses `rpc.v1` for generic request/reply traffic and
+requires `shell.v2`. The application store accepts activation schema 3 under
+`/var/local/kindlebridge/apps`. The CLI, host server, daemon, schema, and package
+are developed and deployed as one matched build.
 
 ## kindlehf device build on Windows
 
