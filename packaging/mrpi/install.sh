@@ -5,37 +5,161 @@ set -eu
 
 MNT_US_ROOT=${KINDLEBRIDGE_MNT_US_ROOT:-/mnt/us}
 VAR_LOCAL_ROOT=${KINDLEBRIDGE_VAR_LOCAL_ROOT:-/var/local}
-BASE="$MNT_US_ROOT/kindlebridge"
+SYS_ROOT=${KINDLEBRIDGE_SYS_ROOT:-/sys}
+PROC_ROOT=${KINDLEBRIDGE_PROC_ROOT:-/proc}
+CONTROL_ROOT="$VAR_LOCAL_ROOT/kindlebridge"
+BASE="$CONTROL_ROOT/control"
 EXT="$MNT_US_ROOT/extensions/kindlebridge"
-STAGE_BASE="$MNT_US_ROOT/.kindlebridge-install.$$"
+STAGE_BASE="$CONTROL_ROOT/.control-install.$$"
 STAGE_EXT="$MNT_US_ROOT/.kindlebridge-extension.$$"
-OLD_BASE="$MNT_US_ROOT/.kindlebridge-previous.$$"
-OLD_EXT="$MNT_US_ROOT/.kindlebridge-extension-previous.$$"
+OLD_BASE="$CONTROL_ROOT/.control-previous"
+OLD_EXT="$MNT_US_ROOT/.kindlebridge-extension-previous"
+TRANSACTION="$CONTROL_ROOT/.install-transaction"
+TRANSACTION_TEMP="$CONTROL_ROOT/.install-transaction.$$"
 PAYLOAD_ROOT="$MNT_US_ROOT/.kindlebridge-payload.$$"
 PAYLOAD_ARCHIVE=${KINDLEBRIDGE_PAYLOAD_ARCHIVE:-payload.tar}
 COMMITTED=0
-OLD_WAS_RUNNING=0
+TRANSACTION_ACTIVE=0
+HAD_BASE=0
+HAD_EXT=0
+
+durability_barrier() {
+    if test "${KINDLEBRIDGE_TEST_SKIP_SYNC:-0}" = 1; then
+        return 0
+    fi
+    sync
+}
 
 cleanup() {
-    rm -rf "$STAGE_BASE" "$STAGE_EXT" "$PAYLOAD_ROOT"
+    rm -rf "$STAGE_BASE" "$STAGE_EXT" "$PAYLOAD_ROOT" "$TRANSACTION_TEMP"
     if test "$COMMITTED" = 1; then
         rm -rf "$OLD_BASE" "$OLD_EXT"
+        durability_barrier >/dev/null 2>&1 || true
+        rm -f "$TRANSACTION"
+    elif test "$TRANSACTION_ACTIVE" = 1; then
+        recover_interrupted_install >/dev/null 2>&1 || true
     fi
 }
 
-restore_previous_install() {
+transaction_value() {
+    key=$1
+    sed -n "s/^$key=//p" "$TRANSACTION" 2>/dev/null | sed -n '1p'
+}
+
+write_transaction() {
+    state=$1
+    {
+        echo KINDLEBRIDGE_INSTALL_TRANSACTION_V2
+        echo "state=$state"
+        echo "had_base=$HAD_BASE"
+        echo "had_ext=$HAD_EXT"
+    } >"$TRANSACTION_TEMP" || return 1
+    mv "$TRANSACTION_TEMP" "$TRANSACTION"
+}
+
+restore_orphaned_backups() {
+    test -d "$OLD_BASE" || test -d "$OLD_EXT" || return 0
+    # A backup without its marker can only be an interrupted replacement.
+    # Prefer the known previous install over a possibly partial new tree.
     rm -rf "$BASE" "$EXT"
     if test -d "$OLD_BASE"; then
-        mv "$OLD_BASE" "$BASE" || true
+        mv "$OLD_BASE" "$BASE" || return 1
     fi
     if test -d "$OLD_EXT"; then
         mkdir -p "$(dirname "$EXT")"
-        mv "$OLD_EXT" "$EXT" || true
+        mv "$OLD_EXT" "$EXT" || return 1
     fi
 }
 
-trap cleanup EXIT HUP INT TERM
+recover_interrupted_install() {
+    if ! test -f "$TRANSACTION"; then
+        restore_orphaned_backups
+        return
+    fi
+    if test "$(sed -n '1p' "$TRANSACTION" 2>/dev/null)" != KINDLEBRIDGE_INSTALL_TRANSACTION_V2; then
+        echo "KindleBridge found an invalid install transaction." >&2
+        return 1
+    fi
+    state=$(transaction_value state)
+    had_base=$(transaction_value had_base)
+    had_ext=$(transaction_value had_ext)
+    case "$state:$had_base:$had_ext" in
+        prepared:[01]:[01]|committed:[01]:[01]) ;;
+        *)
+            echo "KindleBridge found an incomplete install transaction." >&2
+            return 1
+            ;;
+    esac
+    if test "$state" = committed; then
+        rm -rf "$OLD_BASE" "$OLD_EXT"
+        durability_barrier || return 1
+        rm -f "$TRANSACTION"
+        return 0
+    fi
+    if test "$had_base" = 1; then
+        if test -d "$OLD_BASE"; then
+            rm -rf "$BASE"
+            mv "$OLD_BASE" "$BASE" || return 1
+        fi
+    else
+        rm -rf "$BASE"
+    fi
+    if test "$had_ext" = 1; then
+        if test -d "$OLD_EXT"; then
+            rm -rf "$EXT"
+            mkdir -p "$(dirname "$EXT")"
+            mv "$OLD_EXT" "$EXT" || return 1
+        fi
+    else
+        rm -rf "$EXT"
+    fi
+    rm -rf "$OLD_BASE" "$OLD_EXT"
+    durability_barrier || return 1
+    rm -f "$TRANSACTION"
+}
 
+replace_install() {
+    write_transaction prepared || return 1
+    TRANSACTION_ACTIVE=1
+    # The prepared marker must reach storage before any previous tree moves.
+    # That ordering makes the fixed backups recoverable after sudden power loss.
+    durability_barrier || return 1
+    if test "$HAD_BASE" = 1; then
+        mv "$BASE" "$OLD_BASE" || return 1
+    fi
+    if test "$HAD_EXT" = 1; then
+        mv "$EXT" "$OLD_EXT" || return 1
+    fi
+    mv "$STAGE_BASE" "$BASE" || return 1
+    mv "$STAGE_EXT" "$EXT" || return 1
+    write_transaction committed || return 1
+    # Persist the commit decision before cleanup can remove its rollback trees.
+    durability_barrier || return 1
+}
+
+pid_file_is_live() {
+    pid=$(cat "$1" 2>/dev/null || true)
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    test -d "$PROC_ROOT/$pid"
+}
+
+unmanaged_bridge_evidence() {
+    test -d "$VAR_LOCAL_ROOT/kindlebridge/usb" ||
+        test -e "$SYS_ROOT/kernel/config/usb_gadget/mtpgadget/configs/c.1/ffs.kbp" ||
+        test -L "$SYS_ROOT/kernel/config/usb_gadget/mtpgadget/configs/c.1/ffs.kbp" ||
+        pid_file_is_live "$BASE/runtime/run/daemon.pid"
+}
+
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+mkdir -p "$CONTROL_ROOT" "$MNT_US_ROOT/extensions"
+if ! recover_interrupted_install; then
+    echo "The previous KindleBridge install transaction needs manual recovery." >&2
+    return 1
+fi
 test -f "$PAYLOAD_ARCHIVE" || {
     echo "KindleBridge install file is incomplete. Copy the package again." >&2
     return 1
@@ -62,21 +186,22 @@ case "$PACKAGE_VERSION" in
         ;;
 esac
 
-# Upgrades are self-managing. The old manager owns the old processes, so ask it
-# to return USB to stock before replacing any executable or KUAL file.
+# Installation never changes USB ownership. An active manager must be returned
+# to stock file transfer explicitly before its executable can be replaced.
+OLD_MANAGER=
 if test -x "$BASE/bin/usb-gadget-manager.sh"; then
-    bridge_status=$("$BASE/bin/usb-gadget-manager.sh" status 2>/dev/null | sed -n '1p' || true)
+    OLD_MANAGER="$BASE/bin/usb-gadget-manager.sh"
+fi
+if test -n "$OLD_MANAGER"; then
+    bridge_status=$("$OLD_MANAGER" status 2>/dev/null | sed -n '1p' || true)
     case "$bridge_status" in
         active|recovering|degraded|detached|acquiring-stock-usb|starting|stopping|stale|stale-from-previous-boot)
-            OLD_WAS_RUNNING=1
-            if ! stop_output=$("$BASE/bin/usb-gadget-manager.sh" stop 2>&1); then
-                echo "KindleBridge could not prepare the update." >&2
-                echo "Unplug the USB cable, then run MRPI again." >&2
-                echo "$stop_output" >&2
-                return 1
-            fi
+            echo "KindleBridge is currently active ($bridge_status)." >&2
+            echo "In KUAL, choose 'Switch to USB file transfer', then run MRPI again." >&2
+            echo "Installation did not change the current USB mode." >&2
+            return 1
             ;;
-        inactive|'')
+        inactive)
             rm -rf "$VAR_LOCAL_ROOT/kindlebridge/usb"
             ;;
         *)
@@ -86,11 +211,15 @@ if test -x "$BASE/bin/usb-gadget-manager.sh"; then
             ;;
     esac
 else
-    rm -rf "$VAR_LOCAL_ROOT/kindlebridge/usb"
+    if unmanaged_bridge_evidence; then
+        echo "KindleBridge runtime state exists but its manager is missing." >&2
+        echo "Installation did not replace files or change USB mode." >&2
+        echo "Restore the matching manager and use recovery before retrying." >&2
+        return 1
+    fi
 fi
 
-mkdir -p "$STAGE_BASE/bin" "$STAGE_EXT" "$MNT_US_ROOT/extensions" \
-    "$VAR_LOCAL_ROOT/kindlebridge"
+mkdir -p "$STAGE_BASE/bin" "$STAGE_EXT" "$MNT_US_ROOT/extensions" "$CONTROL_ROOT"
 cp -af "$PAYLOAD_ROOT/kindlebridge/." "$STAGE_BASE/"
 cp -af "$PAYLOAD_ROOT/extensions/kindlebridge/." "$STAGE_EXT/"
 chmod 0755 "$STAGE_BASE/bin/kindlebridge-launcher" \
@@ -100,42 +229,25 @@ chmod 0755 "$STAGE_BASE/bin/kindlebridge-launcher" \
     "$STAGE_EXT/bin/kindlebridge.sh"
 
 if test -d "$BASE"; then
-    mv "$BASE" "$OLD_BASE"
+    HAD_BASE=1
 fi
 if test -d "$EXT"; then
-    mv "$EXT" "$OLD_EXT"
+    HAD_EXT=1
 fi
-if ! mv "$STAGE_BASE" "$BASE" || ! mv "$STAGE_EXT" "$EXT"; then
-    restore_previous_install
+if ! replace_install; then
+    recover_interrupted_install || true
     echo "KindleBridge update could not replace its files; the previous version was restored." >&2
     return 1
 fi
+COMMITTED=1
 
 if test -e "$MNT_US_ROOT/KINDLEBRIDGE_DISABLE"; then
-    COMMITTED=1
     echo "KindleBridge installed but disabled by KINDLEBRIDGE_DISABLE."
     echo "Remove that file, then choose 'Switch to development mode' in KUAL."
     return 0
 fi
 
-if start_output=$("$BASE/bin/usb-gadget-manager.sh" start 0 2>&1); then
-    COMMITTED=1
-    echo "KindleBridge $PACKAGE_VERSION installed and ready."
-    echo "Connect the USB cable to the computer."
-    return 0
-fi
-
-restore_previous_install
-restart_note=
-if test "$OLD_WAS_RUNNING" = 1 && test -x "$BASE/bin/usb-gadget-manager.sh"; then
-    if "$BASE/bin/usb-gadget-manager.sh" start 0 >/dev/null 2>&1; then
-        restart_note="The previous KindleBridge version is active again."
-    else
-        restart_note="The previous version was restored but could not be started."
-    fi
-fi
-echo "KindleBridge update did not start, so the previous version was restored." >&2
-echo "Unplug the USB cable and run MRPI again." >&2
-echo "$start_output" >&2
-test -z "$restart_note" || echo "$restart_note" >&2
-return 1
+echo "KindleBridge $PACKAGE_VERSION installed but inactive."
+echo "USB mode was not changed."
+echo "When ready, choose 'Switch to development mode' in KUAL."
+return 0

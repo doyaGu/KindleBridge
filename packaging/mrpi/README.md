@@ -1,8 +1,11 @@
 # Standalone MRPI development package
 
-This package installs KindleBridge under `/mnt/us/kindlebridge` and its KUAL
-menu under `/mnt/us/extensions/kindlebridge`. Runtime state and logs live under
-`/var/local/kindlebridge`. It makes no root filesystem changes and has no
+This package installs the persistent KindleBridge control plane under
+`/var/local/kindlebridge/control` and its KUAL menu under
+`/mnt/us/extensions/kindlebridge`. Runtime state and logs also live under
+`/var/local/kindlebridge`. Keeping the launcher, A/B slots, manifests, PID files,
+and heartbeat off the FSP/MTP userstore prevents `ESTALE` failures when USB is
+connected. It makes no root filesystem changes and has no
 runtime dependency on USBNetLite or KindleRoot.
 
 Starting the bridge first asks stock `volumd` and HAL to release MTP using the
@@ -14,18 +17,29 @@ Bridge link/function, recreates the unplugged `g_ether` handoff state, and asks
 `volumd` to reclaim MTP. It never binds stock MTP directly and never resets the
 MTU3 controller.
 
-Installation and upgrades use one user flow: unplug USB, run MRPI, and reconnect.
-The installer stops an existing Bridge, atomically replaces the program and KUAL
-files, starts the new Bridge, and rolls back to the previous version if startup
-fails. A connected cable aborts before replacement with an actionable message.
+Installation and upgrades atomically replace the program and KUAL files without
+changing USB mode. If KindleBridge is active, the installer aborts before
+replacement and asks the user to switch to USB file transfer first. After a
+successful install, the user explicitly chooses **Switch to development mode**
+when the Bridge is needed. This avoids silently taking USB ownership from stock
+MTP or USBNetLite during package installation.
+
+The installer manages `/var/local/kindlebridge/control` and accepts its v2
+install transaction marker. No other program layout participates in install,
+recovery, or removal.
 
 KUAL keeps the menu open, uses explicit switch-to-development and
 switch-to-file-transfer labels, and shows synchronous next steps in its message
-area. The staged-update action appears only when an update exists. Start and stop
-are idempotent and have no KUAL timeout. Bounded timeouts remain available only
+area. The staged-update action is always visible because KUAL does not invalidate
+its menu cache when an external runtime marker changes; selecting it without a
+staged update displays an explanatory message. Start and stop are idempotent and
+have no KUAL timeout. Bounded timeouts remain available only
 for explicit laboratory manager calls. USB ownership transitions require the
 cable to be unplugged; once active, the bridge supports normal host unplug/replug
-without another mode transition.
+without another mode transition. KindleBridge start fails closed if USBNetLite's
+NCM or RNDIS function owns the gadget and explains how to hand USB back first.
+Staged activation runs a read-only unplugged-cable preflight before showing
+progress and repeats the check immediately before changing USB or daemon state.
 The first development install may still be copied over a rescue network without
 coupling KindleBridge to its provider.
 
