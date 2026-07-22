@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, Condvar, Mutex,
     },
     thread,
@@ -313,6 +313,8 @@ pub struct FunctionFsReadEndpoint {
     file: File,
     #[cfg(unix)]
     control: Arc<FunctionFsControl>,
+    #[cfg(unix)]
+    generation: u64,
 }
 
 impl Read for FunctionFsReadEndpoint {
@@ -322,10 +324,10 @@ impl Read for FunctionFsReadEndpoint {
             retry_after_would_block(
                 &mut self.file,
                 |file| {
-                    ensure_control_active(&self.control)?;
+                    ensure_control_active(&self.control, self.generation)?;
                     file.read(buffer)
                 },
-                |file| wait_until_ready(file, &self.control, PollFlags::IN),
+                |file| wait_until_ready(file, &self.control, self.generation, PollFlags::IN),
             )
         }
         #[cfg(not(unix))]
@@ -338,6 +340,8 @@ pub struct FunctionFsWriteEndpoint {
     file: File,
     #[cfg(unix)]
     control: Arc<FunctionFsControl>,
+    #[cfg(unix)]
+    generation: u64,
 }
 
 impl Write for FunctionFsWriteEndpoint {
@@ -347,10 +351,10 @@ impl Write for FunctionFsWriteEndpoint {
             retry_after_would_block(
                 &mut self.file,
                 |file| {
-                    ensure_control_active(&self.control)?;
+                    ensure_control_active(&self.control, self.generation)?;
                     file.write(buffer)
                 },
-                |file| wait_until_ready(file, &self.control, PollFlags::OUT),
+                |file| wait_until_ready(file, &self.control, self.generation, PollFlags::OUT),
             )
         }
         #[cfg(not(unix))]
@@ -377,7 +381,10 @@ pub(crate) fn retry_after_would_block<Resource, Output>(
 }
 
 #[cfg(unix)]
-fn ensure_control_active(control: &Arc<FunctionFsControl>) -> std::io::Result<()> {
+fn ensure_control_active(control: &Arc<FunctionFsControl>, generation: u64) -> std::io::Result<()> {
+    if !control.endpoint_generation_is_current(generation) {
+        return Err(lifecycle_abort("FunctionFS lifecycle changed"));
+    }
     match control.state() {
         ControlState::Active => Ok(()),
         ControlState::Inactive => Err(lifecycle_abort("FunctionFS became inactive")),
@@ -389,10 +396,11 @@ fn ensure_control_active(control: &Arc<FunctionFsControl>) -> std::io::Result<()
 pub(crate) fn wait_until_ready(
     file: &File,
     control: &Arc<FunctionFsControl>,
+    generation: u64,
     expected: PollFlags,
 ) -> std::io::Result<()> {
     loop {
-        ensure_control_active(control)?;
+        ensure_control_active(control, generation)?;
         // ep0 has one dedicated event owner. Bulk readers and writers must
         // never contend for its mutex: the Kindle's pthread mutex is not fair,
         // so an OUT reader that repeatedly polls ep0 can starve an IN writer
@@ -462,6 +470,7 @@ pub(crate) fn classify_control_event(event: Event) -> ControlAction {
 pub(crate) struct FunctionFsControl {
     ep0: Mutex<File>,
     state: AtomicU8,
+    endpoint_generation: AtomicU64,
     monitor_started: AtomicBool,
     state_wait: Mutex<()>,
     state_changed: Condvar,
@@ -472,6 +481,7 @@ impl FunctionFsControl {
         Self {
             ep0: Mutex::new(ep0),
             state: AtomicU8::new(ControlState::Inactive as u8),
+            endpoint_generation: AtomicU64::new(0),
             monitor_started: AtomicBool::new(false),
             state_wait: Mutex::new(()),
             state_changed: Condvar::new(),
@@ -496,13 +506,26 @@ impl FunctionFsControl {
         // Serialize the state update with Condvar::wait so a transition cannot
         // be lost between the accept loop's state check and sleeping.
         if let Ok(_guard) = self.state_wait.lock() {
-            self.state.store(state as u8, Ordering::Release);
+            let previous = self.state.swap(state as u8, Ordering::AcqRel);
+            if previous == ControlState::Active as u8 && state != ControlState::Active {
+                self.endpoint_generation.fetch_add(1, Ordering::AcqRel);
+            }
             self.state_changed.notify_all();
         } else {
             self.state
                 .store(ControlState::Disconnected as u8, Ordering::Release);
             self.state_changed.notify_all();
         }
+    }
+
+    #[cfg(any(unix, test))]
+    fn endpoint_generation(&self) -> u64 {
+        self.endpoint_generation.load(Ordering::Acquire)
+    }
+
+    #[cfg(any(unix, test))]
+    fn endpoint_generation_is_current(&self, generation: u64) -> bool {
+        self.endpoint_generation() == generation
     }
 
     fn consume_event(&self, ep0: &mut File) -> Result<ControlTransition, EventError> {
@@ -603,6 +626,21 @@ mod control_state_tests {
     use super::*;
 
     #[test]
+    fn endpoint_generation_detects_an_inactive_active_cycle() {
+        let manifest = File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("crate manifest is readable");
+        let control = Arc::new(FunctionFsControl::new(manifest));
+        control.set_state(ControlState::Active);
+        let endpoint_generation = control.endpoint_generation();
+
+        control.set_state(ControlState::Inactive);
+        control.set_state(ControlState::Active);
+
+        assert!(!control.endpoint_generation_is_current(endpoint_generation));
+        assert!(control.endpoint_generation_is_current(control.endpoint_generation()));
+    }
+
+    #[test]
     fn cached_active_state_reopens_endpoints_without_waiting_for_another_enable() {
         let manifest = File::open(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
             .expect("crate manifest is readable");
@@ -637,9 +675,15 @@ mod control_state_tests {
         let (ready, _ready_peer) = UnixStream::pair().unwrap();
         let ready = File::from(OwnedFd::from(ready));
         let ready_control = Arc::clone(&control);
+        let generation = ready_control.endpoint_generation();
         let (writer_tx, writer_rx) = mpsc::sync_channel(1);
         let writer_worker = thread::spawn(move || {
-            let _ = writer_tx.send(wait_until_ready(&ready, &ready_control, PollFlags::OUT));
+            let _ = writer_tx.send(wait_until_ready(
+                &ready,
+                &ready_control,
+                generation,
+                PollFlags::OUT,
+            ));
         });
 
         let writer_result = writer_rx.recv_timeout(Duration::from_millis(100));
@@ -849,7 +893,11 @@ fn open_read_endpoint(
 ) -> Result<FunctionFsReadEndpoint, FunctionFsError> {
     let file = open_endpoint(path, true)?;
     #[cfg(unix)]
-    return Ok(FunctionFsReadEndpoint { file, control });
+    return Ok(FunctionFsReadEndpoint {
+        file,
+        generation: control.endpoint_generation(),
+        control,
+    });
     #[cfg(not(unix))]
     {
         drop(control);
@@ -863,7 +911,11 @@ fn open_write_endpoint(
 ) -> Result<FunctionFsWriteEndpoint, FunctionFsError> {
     let file = open_endpoint(path, false)?;
     #[cfg(unix)]
-    return Ok(FunctionFsWriteEndpoint { file, control });
+    return Ok(FunctionFsWriteEndpoint {
+        file,
+        generation: control.endpoint_generation(),
+        control,
+    });
     #[cfg(not(unix))]
     {
         drop(control);
