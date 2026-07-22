@@ -13,7 +13,7 @@ PID_PROC_ROOT=${KINDLEBRIDGE_PID_PROC_ROOT:-/proc}
 DEV_ROOT=${KINDLEBRIDGE_DEV_ROOT:-/dev}
 TMP_ROOT=${KINDLEBRIDGE_TMP_ROOT:-/tmp}
 
-BASE="$MNT_US_ROOT/kindlebridge"
+BASE="$VAR_LOCAL_ROOT/kindlebridge/control"
 LAUNCHER="$BASE/bin/kindlebridge-launcher"
 RUNTIME="$BASE/runtime"
 DAEMON_PID_FILE="$RUNTIME/run/daemon.pid"
@@ -25,6 +25,8 @@ GADGET="$SYS_ROOT/kernel/config/usb_gadget/mtpgadget"
 CONFIG="$GADGET/configs/c.1"
 FUNCTION="$GADGET/functions/ffs.kbp"
 LINK="$CONFIG/ffs.kbp"
+USBNET_NCM_LINK="$CONFIG/ncm.usbnetlite"
+USBNET_RNDIS_LINK="$CONFIG/rndis.usbnetlite"
 MOUNT="$DEV_ROOT/usb-ffs/kbp"
 UDC_CLASS="$SYS_ROOT/class/udc"
 BOOT_ID_FILE="$PROC_ROOT/sys/kernel/random/boot_id"
@@ -203,9 +205,15 @@ select_sync_root() {
 launch_supervised_daemon() {
     serial=$1
     select_sync_root
-    "$LAUNCHER" run --root "$RUNTIME" -- \
-        serve-usb --functionfs-dir "$MOUNT" --serial "$serial" \
-        --sync-root "$SYNC_ROOT" >>"$LOG" 2>&1 &
+    # MRPI invokes installers from its temporary staging mount. Never let the
+    # persistent supervisor inherit that cwd, or it pins MRPI's tmpfs after a
+    # successful installation and prevents clean package-manager teardown.
+    (
+        cd "$BASE" || exit 1
+        exec "$LAUNCHER" run --root "$RUNTIME" -- \
+            serve-usb --functionfs-dir "$MOUNT" --serial "$serial" \
+            --sync-root "$SYNC_ROOT"
+    ) >>"$LOG" 2>&1 &
     launcher_pid=$!
     printf '%s\n' "$launcher_pid" >"$STATE/launcher_pid"
     kill -0 "$launcher_pid" 2>/dev/null || return 1
@@ -358,6 +366,11 @@ wait_for_stock_mtp_owner() {
 stock_mtp_owner_ready() {
     test "$(volumd_network_mode || true)" = 0 &&
         ! module_is_loaded g_ether && test "$(mtp_is_started || true)" = 1
+}
+
+usbnetlite_owns_usb() {
+    test -e "$USBNET_NCM_LINK" || test -L "$USBNET_NCM_LINK" ||
+        test -e "$USBNET_RNDIS_LINK" || test -L "$USBNET_RNDIS_LINK"
 }
 
 return_usb_to_volumd() {
@@ -523,6 +536,10 @@ start_bridge() {
         return 2
     fi
     test "$(id -u)" = 0 || { echo "must run as root" >&2; return 1; }
+    if usbnetlite_owns_usb; then
+        echo "USBNetLite owns USB; switch it to USB file transfer first" >&2
+        return 1
+    fi
     if test "$(status 2>/dev/null | sed -n '1p')" = active; then
         echo "KindleBridge USB is already active"
         return 0
@@ -702,18 +719,34 @@ status() {
 }
 
 apply_staged_command() {
-    test -f "$RUNTIME/next" || {
-        echo "no staged daemon update" >&2
-        return 1
-    }
+    apply_staged_preflight || return 1
     if test -d "$STATE"; then
         stop_command || return 1
     fi
     start_bridge 0
 }
 
+apply_staged_preflight() {
+    test -f "$RUNTIME/next" || {
+        echo "no staged daemon update" >&2
+        return 1
+    }
+    test "$(id -u)" = 0 || { echo "must run as root" >&2; return 1; }
+    if test -d "$STATE"; then
+        udc=$(read_state udc "$DEFAULT_UDC")
+    else
+        udc=$(ls "$UDC_CLASS" | head -n 1)
+        test -n "$udc" || udc=$DEFAULT_UDC
+    fi
+    test -d "$UDC_CLASS/$udc" || {
+        echo "USB controller is unavailable: $udc" >&2
+        return 1
+    }
+    require_unplugged "$udc" 'applying staged daemon update'
+}
+
 usage() {
-    echo "usage: $0 start [TIMEOUT_SECONDS|0] | stop | status | apply-staged" >&2
+    echo "usage: $0 start [TIMEOUT_SECONDS|0] | stop | status | apply-staged | preflight apply-staged" >&2
     exit 2
 }
 
@@ -722,6 +755,13 @@ case "${1:-}" in
     stop) test "$#" -eq 1 || usage; stop_command ;;
     status) test "$#" -eq 1 || usage; status ;;
     apply-staged) test "$#" -eq 1 || usage; apply_staged_command ;;
+    preflight)
+        test "$#" -eq 2 || usage
+        case "$2" in
+            apply-staged) apply_staged_preflight ;;
+            *) usage ;;
+        esac
+        ;;
     restore-after) test "$#" -eq 2 || usage; restore_after "$2" ;;
     *) usage ;;
 esac

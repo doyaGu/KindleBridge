@@ -9,9 +9,9 @@ Use the MRPI package manager instead. It requires an unplugged cable and hands
 USB ownership to and from stock `volumd`/HAL:
 
 ```sh
-/mnt/us/kindlebridge/bin/usb-gadget-manager.sh start 0
-/mnt/us/kindlebridge/bin/usb-gadget-manager.sh status
-/mnt/us/kindlebridge/bin/usb-gadget-manager.sh stop
+/var/local/kindlebridge/control/bin/usb-gadget-manager.sh start 0
+/var/local/kindlebridge/control/bin/usb-gadget-manager.sh status
+/var/local/kindlebridge/control/bin/usb-gadget-manager.sh stop
 ```
 
 The legacy script refuses mutating commands unless a developer explicitly sets

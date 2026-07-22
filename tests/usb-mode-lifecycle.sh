@@ -81,6 +81,7 @@ setup_case() {
     export KINDLEBRIDGE_PID_PROC_ROOT=/proc
     export KINDLEBRIDGE_DEV_ROOT="$CASE_ROOT/dev"
     export KINDLEBRIDGE_TMP_ROOT="$CASE_ROOT/tmp"
+    CONTROL_ROOT="$CASE_ROOT/var/local/kindlebridge/control"
     export KINDLEBRIDGE_TEST_ALLOW_MTP_DIRECTORY=1
     unset KINDLEBRIDGE_TEST_MOUNT_FAIL KINDLEBRIDGE_TEST_REAL_SLEEP
     unset KINDLEBRIDGE_TEST_NO_HEARTBEAT
@@ -91,10 +92,11 @@ setup_case() {
         "$CASE_ROOT/bin" \
         "$CASE_ROOT/lipc" \
         "$CASE_ROOT/mnt/base-us" \
-        "$CASE_ROOT/mnt/us/kindlebridge/bin" \
-        "$CASE_ROOT/mnt/us/kindlebridge/runtime/slots/A/bin" \
-        "$CASE_ROOT/mnt/us/kindlebridge/runtime/slots/B/bin" \
-        "$CASE_ROOT/mnt/us/kindlebridge/runtime/run" \
+        "$CASE_ROOT/mnt/us" \
+        "$CONTROL_ROOT/bin" \
+        "$CONTROL_ROOT/runtime/slots/A/bin" \
+        "$CONTROL_ROOT/runtime/slots/B/bin" \
+        "$CONTROL_ROOT/runtime/run" \
         "$CASE_ROOT/var/local" \
         "$CASE_ROOT/tmp" \
         "$CASE_ROOT/dev" \
@@ -109,13 +111,13 @@ setup_case() {
         cp "$FIXTURES/fake-command.sh" "$CASE_ROOT/bin/$command"
         chmod 0755 "$CASE_ROOT/bin/$command"
     done
-    cp "$FIXTURES/kindlebridge-launcher" "$CASE_ROOT/mnt/us/kindlebridge/bin/kindlebridge-launcher"
-    cp "$FIXTURES/kindlebridged" "$CASE_ROOT/mnt/us/kindlebridge/runtime/slots/A/bin/kindlebridged"
-    cp "$FIXTURES/kindlebridged" "$CASE_ROOT/mnt/us/kindlebridge/runtime/slots/B/bin/kindlebridged"
-    chmod 0755 "$CASE_ROOT/mnt/us/kindlebridge/bin/kindlebridge-launcher" \
-        "$CASE_ROOT/mnt/us/kindlebridge/runtime/slots/A/bin/kindlebridged" \
-        "$CASE_ROOT/mnt/us/kindlebridge/runtime/slots/B/bin/kindlebridged"
-    printf '%s\n' A >"$CASE_ROOT/mnt/us/kindlebridge/runtime/current"
+    cp "$FIXTURES/kindlebridge-launcher" "$CONTROL_ROOT/bin/kindlebridge-launcher"
+    cp "$FIXTURES/kindlebridged" "$CONTROL_ROOT/runtime/slots/A/bin/kindlebridged"
+    cp "$FIXTURES/kindlebridged" "$CONTROL_ROOT/runtime/slots/B/bin/kindlebridged"
+    chmod 0755 "$CONTROL_ROOT/bin/kindlebridge-launcher" \
+        "$CONTROL_ROOT/runtime/slots/A/bin/kindlebridged" \
+        "$CONTROL_ROOT/runtime/slots/B/bin/kindlebridged"
+    printf '%s\n' A >"$CONTROL_ROOT/runtime/current"
 
     printf '%s\n' 11211000.usb \
         >"$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/UDC"
@@ -144,7 +146,7 @@ run_manager() {
 remember_daemon() {
     for state in \
         "$CASE_ROOT/var/local/kindlebridge/usb/launcher_pid" \
-        "$CASE_ROOT/mnt/us/kindlebridge/runtime/run/daemon.pid"; do
+        "$CONTROL_ROOT/runtime/run/daemon.pid"; do
         if test -f "$state"; then
             pid=$(cat "$state")
             PIDS="$PIDS $pid"
@@ -154,7 +156,7 @@ remember_daemon() {
 
 assert_daemon_sync_root() {
     expected=$1
-    daemon_pid=$(cat "$CASE_ROOT/mnt/us/kindlebridge/runtime/run/daemon.pid")
+    daemon_pid=$(cat "$CONTROL_ROOT/runtime/run/daemon.pid")
     actual=$(tr '\000' '\n' <"/proc/$daemon_pid/cmdline" | awk '
         previous == "--sync-root" { print; exit }
         { previous=$0 }
@@ -191,6 +193,19 @@ assert_equal 11211000.usb "$(cat "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgad
     'indeterminate start changed the stock UDC binding'
 pass 'indeterminate stock state fails closed'
 
+setup_case usbnetlite_owner
+mkdir -p "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/functions/ncm.usbnetlite"
+ln -s "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/functions/ncm.usbnetlite" \
+    "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/configs/c.1/ncm.usbnetlite"
+run_manager "$CASE_ROOT/output" start 0
+test "$MANAGER_RC" -ne 0 || fail 'KindleBridge started while USBNetLite owned USB'
+grep -q 'USBNetLite owns USB' "$CASE_ROOT/output" ||
+    fail 'USBNetLite ownership conflict was not explained'
+assert_file_empty "$CASE_ROOT/trace" 'USBNetLite ownership conflict mutated USB state'
+assert_equal 11211000.usb "$(cat "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/UDC")" \
+    'USBNetLite ownership conflict changed the UDC binding'
+pass 'USBNetLite ownership conflict fails closed with an actionable result'
+
 setup_case concurrent_transition
 cp "$FIXTURES/kindlebridged" "$CASE_ROOT/usb-gadget-manager.sh"
 chmod 0755 "$CASE_ROOT/usb-gadget-manager.sh"
@@ -210,6 +225,9 @@ run_manager "$CASE_ROOT/output" start 0
 test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/output" >&2; fail 'stock MTP to bridge start failed'; }
 remember_daemon
 assert_daemon_sync_root "$CASE_ROOT/mnt/us/kindlebridge-data"
+launcher_pid=$(cat "$CASE_ROOT/var/local/kindlebridge/usb/launcher_pid")
+assert_equal "$CONTROL_ROOT" "$(readlink "/proc/$launcher_pid/cwd")" \
+    'launcher inherited the package manager working directory'
 pre_request_sleeps=$(awk '
     /^lipc-set useUsbForNetwork 1$/ { print count + 0; found=1; exit }
     /^sleep 1$/ { count++ }
@@ -335,18 +353,18 @@ test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/start-output" >&2; fail 'supervise
 remember_daemon
 run_manager "$CASE_ROOT/stop-output" stop
 test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/stop-output" >&2; fail 'supervised stop failed'; }
-test ! -f "$CASE_ROOT/mnt/us/kindlebridge/runtime/launcher/watchdog-state" ||
+test ! -f "$CONTROL_ROOT/runtime/launcher/watchdog-state" ||
     fail 'controlled stop was recorded as daemon crashes and halted the next start'
 pass 'controlled stop cannot trip the persistent launcher crash fuse'
 
 setup_case manual_retry
-mkdir -p "$CASE_ROOT/mnt/us/kindlebridge/runtime/launcher"
+mkdir -p "$CONTROL_ROOT/runtime/launcher"
 printf 'KINDLEBRIDGE_WATCHDOG_V1\nslot=A\ncrashes=3\nnext_start_ms=1\nhalted=1\n' \
-    >"$CASE_ROOT/mnt/us/kindlebridge/runtime/launcher/watchdog-state"
+    >"$CONTROL_ROOT/runtime/launcher/watchdog-state"
 run_manager "$CASE_ROOT/start-output" start 0
 test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/start-output" >&2; fail 'manual retry stayed fused'; }
 remember_daemon
-test ! -f "$CASE_ROOT/mnt/us/kindlebridge/runtime/launcher/watchdog-state" ||
+test ! -f "$CONTROL_ROOT/runtime/launcher/watchdog-state" ||
     fail 'manual retry did not clear the previous crash fuse'
 run_manager "$CASE_ROOT/stop-output" stop
 test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/stop-output" >&2; fail 'manual retry cleanup failed'; }
@@ -423,7 +441,7 @@ PIDS="$PIDS $unrelated_pid"
 export KINDLEBRIDGE_PID_PROC_ROOT="$CASE_ROOT/pid-proc"
 mkdir -p "$KINDLEBRIDGE_PID_PROC_ROOT/$unrelated_pid"
 printf '%s\0%s\0' "$CASE_ROOT/unrelated/unrelated-process" \
-    "$CASE_ROOT/mnt/us/kindlebridge/bin/kindlebridge-launcher" \
+    "$CONTROL_ROOT/bin/kindlebridge-launcher" \
     >"$KINDLEBRIDGE_PID_PROC_ROOT/$unrelated_pid/cmdline"
 printf '%s\n' test-boot-id >"$CASE_ROOT/var/local/kindlebridge/usb/boot_id"
 printf '%s\n' active >"$CASE_ROOT/var/local/kindlebridge/usb/mode"
@@ -442,18 +460,39 @@ kill "$unrelated_pid" 2>/dev/null || true
 wait "$unrelated_pid" 2>/dev/null || true
 pass 'cleanup matches the managed executable rather than arbitrary arguments'
 
+setup_case staged_apply_rechecks_cable
+printf '%s\n' B >"$CONTROL_ROOT/runtime/next"
+run_manager "$CASE_ROOT/preflight-output" preflight apply-staged
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/preflight-output" >&2
+    fail 'offline staged-update preflight failed'
+}
+printf '%s\n' 1 >"$CASE_ROOT/sys/class/udc/11211000.usb/connected"
+run_manager "$CASE_ROOT/apply-output" apply-staged
+test "$MANAGER_RC" -ne 0 || fail 'connected staged update unexpectedly succeeded after preflight'
+grep -q 'Unplug USB before applying staged daemon update' "$CASE_ROOT/apply-output" ||
+    fail 'staged update did not report its entry-point cable check'
+assert_equal A "$(cat "$CONTROL_ROOT/runtime/current")" \
+    'connected staged update changed the current daemon slot'
+assert_equal B "$(cat "$CONTROL_ROOT/runtime/next")" \
+    'connected staged update discarded the pending daemon slot'
+assert_file_empty "$CASE_ROOT/trace" 'connected staged update issued a mutating command'
+test ! -d "$CASE_ROOT/var/local/kindlebridge/usb" ||
+    fail 'connected staged update created transition state'
+pass 'staged activation rechecks the cable after read-only preflight'
+
 setup_case staged_apply
 run_manager "$CASE_ROOT/start-output" start 0
 test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/start-output" >&2; fail 'staged-apply setup failed'; }
 remember_daemon
-printf '%s\n' B >"$CASE_ROOT/mnt/us/kindlebridge/runtime/next"
+printf '%s\n' B >"$CONTROL_ROOT/runtime/next"
 run_manager "$CASE_ROOT/apply-output" apply-staged
 test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/apply-output" >&2; fail 'offline staged activation failed'; }
 remember_daemon
-assert_equal B "$(cat "$CASE_ROOT/mnt/us/kindlebridge/runtime/current")" \
+assert_equal B "$(cat "$CONTROL_ROOT/runtime/current")" \
     'offline activation did not select the staged slot'
-test ! -f "$CASE_ROOT/mnt/us/kindlebridge/runtime/next" || fail 'offline activation left the next pointer'
-test ! -f "$CASE_ROOT/mnt/us/kindlebridge/runtime/launcher/pending-slot" ||
+test ! -f "$CONTROL_ROOT/runtime/next" || fail 'offline activation left the next pointer'
+test ! -f "$CONTROL_ROOT/runtime/launcher/pending-slot" ||
     fail 'USB was bound before the launcher confirmed or rolled back the staged slot'
 assert_equal active "$(sh "$MANAGER" status | sed -n '1p')" \
     'offline activation did not return active status'
@@ -497,22 +536,22 @@ setup_case heartbeat_health
 run_manager "$CASE_ROOT/start-output" start 0
 test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/start-output" >&2; fail 'heartbeat health setup failed'; }
 remember_daemon
-rm -f "$CASE_ROOT/mnt/us/kindlebridge/runtime/run/heartbeat"
+rm -f "$CONTROL_ROOT/runtime/run/heartbeat"
 run_manager "$CASE_ROOT/status-output" status
 assert_equal recovering "$(sed -n '1p' "$CASE_ROOT/status-output")" \
     'status reported active while the daemon heartbeat was unavailable'
-mkdir -p "$CASE_ROOT/mnt/us/kindlebridge/runtime/launcher"
+mkdir -p "$CONTROL_ROOT/runtime/launcher"
 printf 'KINDLEBRIDGE_WATCHDOG_V1\nslot=A\ncrashes=3\nnext_start_ms=0\nhalted=1\n' \
-    >"$CASE_ROOT/mnt/us/kindlebridge/runtime/launcher/watchdog-state"
+    >"$CONTROL_ROOT/runtime/launcher/watchdog-state"
 run_manager "$CASE_ROOT/halted-status-output" status
 assert_equal degraded "$(sed -n '1p' "$CASE_ROOT/halted-status-output")" \
     'status reported active while the launcher crash fuse was halted'
 pass 'status distinguishes recovering and degraded health from active USB'
 
 setup_case kual_feedback
-cp "$MANAGER" "$CASE_ROOT/mnt/us/kindlebridge/bin/usb-gadget-manager.sh"
-chmod 0755 "$CASE_ROOT/mnt/us/kindlebridge/bin/usb-gadget-manager.sh"
-printf '%s\n' 0.1.0-test >"$CASE_ROOT/mnt/us/kindlebridge/VERSION"
+cp "$MANAGER" "$CONTROL_ROOT/bin/usb-gadget-manager.sh"
+chmod 0755 "$CONTROL_ROOT/bin/usb-gadget-manager.sh"
+printf '%s\n' 0.1.0-test >"$CONTROL_ROOT/VERSION"
 KUAL_CAPTURE="$CASE_ROOT/kual-message"
 export KUAL_CAPTURE
 printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$3" >"$KUAL_CAPTURE"' \
@@ -527,16 +566,60 @@ grep -q 'E-CABLE' "$KUAL_CAPTURE" || fail 'KUAL did not classify the connected-c
 sh "$KUAL_WRAPPER" status >"$CASE_ROOT/kual-status-output" 2>&1
 grep -q 'Last action failed: E-CABLE' "$KUAL_CAPTURE" ||
     fail 'KUAL status did not explain the last failure'
+printf '%s\n' B >"$CONTROL_ROOT/runtime/next"
+printf '%s' '' >"$CASE_ROOT/trace"
+if sh "$KUAL_WRAPPER" apply-staged >"$CASE_ROOT/kual-apply-connected-output" 2>&1; then
+    fail 'KUAL connected staged update unexpectedly succeeded'
+fi
+grep -q 'E-CABLE' "$KUAL_CAPTURE" ||
+    fail 'KUAL did not classify the connected staged-update failure'
+if grep -q 'Applying staged daemon update' "$CASE_ROOT/kual-apply-connected-output"; then
+    fail 'KUAL announced staged activation before checking that USB was unplugged'
+fi
+assert_equal A "$(cat "$CONTROL_ROOT/runtime/current")" \
+    'connected staged update changed the current daemon slot'
+assert_equal B "$(cat "$CONTROL_ROOT/runtime/next")" \
+    'connected staged update discarded the pending daemon slot'
+assert_file_empty "$CASE_ROOT/trace" 'connected staged update issued a mutating command'
+printf '%s\n' 0 >"$CASE_ROOT/sys/class/udc/11211000.usb/connected"
+mkdir -p "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/functions/ncm.usbnetlite"
+ln -s "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/functions/ncm.usbnetlite" \
+    "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/configs/c.1/ncm.usbnetlite"
+if sh "$KUAL_WRAPPER" start >"$CASE_ROOT/kual-owner-output" 2>&1; then
+    fail 'KUAL started KindleBridge while USBNetLite owned USB'
+fi
+grep -q 'E-OWNER' "$KUAL_CAPTURE" ||
+    fail 'KUAL did not explain the USBNetLite ownership conflict'
+mkdir -p "$CASE_ROOT/var/local/kindlebridge/usb"
+printf '%s\n' 4242 >"$CASE_ROOT/var/local/kindlebridge/usb/launcher_pid"
+sh "$KUAL_WRAPPER" export-diagnostics >"$CASE_ROOT/kual-diagnostics-output" 2>&1
+test -s "$CASE_ROOT/mnt/us/kindlebridge-diagnostics.txt" ||
+    fail 'KUAL did not export diagnostics to USB storage'
+grep -q '\[manager status\]' "$CASE_ROOT/mnt/us/kindlebridge-diagnostics.txt" ||
+    fail 'KUAL diagnostics omitted manager state'
+grep -q '\[managed processes\]' "$CASE_ROOT/mnt/us/kindlebridge-diagnostics.txt" ||
+    fail 'KUAL diagnostics omitted process state'
+grep -q '^launcher.pid=4242$' "$CASE_ROOT/mnt/us/kindlebridge-diagnostics.txt" ||
+    fail 'KUAL diagnostics read the launcher PID from the wrong state path'
+rm -f "$CONTROL_ROOT/bin/usb-gadget-manager.sh"
+sh "$KUAL_WRAPPER" export-diagnostics >"$CASE_ROOT/kual-missing-manager-diagnostics-output" 2>&1
+grep -q '^manager=missing$' "$CASE_ROOT/mnt/us/kindlebridge-diagnostics.txt" ||
+    fail 'KUAL could not export diagnostics after the manager was lost'
 unset KUAL KUAL_CAPTURE
-pass 'KUAL status preserves a short actionable failure result'
+pass 'KUAL status preserves failures and exports diagnostics'
 
 exitmenu_count=$(grep -c '"exitmenu": false' "$KUAL_MENU")
-assert_equal 4 "$exitmenu_count" 'not every KUAL action preserves the menu'
+assert_equal 5 "$exitmenu_count" 'not every KUAL action preserves the menu'
 grep -q 'Switch to development mode' "$KUAL_MENU" || fail 'KUAL development action is ambiguous'
 grep -q 'Switch to USB file transfer' "$KUAL_MENU" || fail 'KUAL file-transfer action is ambiguous'
-grep -q 'runtime/next.*-f' "$KUAL_MENU" || fail 'KUAL always exposes the staged-update action'
+grep -q '"params": "apply-staged"' "$KUAL_MENU" || fail 'KUAL has no staged-update action'
+if grep -q 'runtime/next.*-f' "$KUAL_MENU"; then
+    fail 'KUAL hides the staged-update action behind a cache-stale external marker'
+fi
 grep -q 'start 0' "$KUAL_WRAPPER" || fail 'KUAL start still has a safety timeout'
-grep -q 'apply-staged' "$KUAL_WRAPPER" || fail 'KUAL has no offline staged activation action'
+grep -q 'preflight apply-staged' "$KUAL_WRAPPER" ||
+    fail 'KUAL staged activation has no read-only cable preflight'
+grep -q 'Export diagnostics' "$KUAL_MENU" || fail 'KUAL has no diagnostics export action'
 grep -q 'E-DAEMON' "$KUAL_WRAPPER" || fail 'KUAL daemon failures do not fit on screen as a short code'
 grep -q 'last-error.log' "$KUAL_WRAPPER" || fail 'KUAL does not preserve the full failure detail'
 if grep -q 'nohup' "$KUAL_WRAPPER"; then
@@ -546,6 +629,11 @@ grep -q 'active|recovering|degraded|detached|acquiring-stock-usb|starting|stoppi
     fail 'installer can replace files during USB acquisition'
 grep -q 'active|recovering|degraded|detached|acquiring-stock-usb|starting|stopping|stale' "$PROJECT_DIR/packaging/mrpi/uninstall.sh" ||
     fail 'uninstaller can remove files during USB acquisition'
+grep -q 'usb_gadget/mtpgadget/UDC' "$KUAL_WRAPPER" ||
+    fail 'diagnostics do not inspect the managed mtpgadget UDC binding'
+if grep -q 'usb_gadget/kindlebridge/UDC' "$KUAL_WRAPPER"; then
+    fail 'diagnostics still inspect the obsolete kindlebridge gadget path'
+fi
 pass 'KUAL actions stay in-menu and start without a timeout'
 
 printf '1..%s\n' "$PASSED"

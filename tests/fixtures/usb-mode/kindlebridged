@@ -3,7 +3,7 @@
 trap 'exit 0' HUP INT TERM
 if test "${KINDLEBRIDGE_TEST_SUPERVISOR_RACE:-0}" = 1; then
     gadget="$KINDLEBRIDGE_TEST_ROOT/sys/kernel/config/usb_gadget/mtpgadget"
-    state="$KINDLEBRIDGE_TEST_ROOT/mnt/us/kindlebridge/runtime/launcher/watchdog-state"
+    state="$KINDLEBRIDGE_TEST_ROOT/var/local/kindlebridge/control/runtime/launcher/watchdog-state"
     seen_bound=0
     while :; do
         bound=$(cat "$gadget/UDC" 2>/dev/null || true)

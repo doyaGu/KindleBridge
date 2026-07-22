@@ -2,10 +2,14 @@
 
 MNT_US_ROOT=${KINDLEBRIDGE_MNT_US_ROOT:-/mnt/us}
 VAR_LOCAL_ROOT=${KINDLEBRIDGE_VAR_LOCAL_ROOT:-/var/local}
-MANAGER="$MNT_US_ROOT/kindlebridge/bin/usb-gadget-manager.sh"
-VERSION_FILE="$MNT_US_ROOT/kindlebridge/VERSION"
+MANAGER="$VAR_LOCAL_ROOT/kindlebridge/control/bin/usb-gadget-manager.sh"
+VERSION_FILE="$VAR_LOCAL_ROOT/kindlebridge/control/VERSION"
 ERROR_LOG="$VAR_LOCAL_ROOT/kindlebridge/last-error.log"
 USB_LOG="$VAR_LOCAL_ROOT/kindlebridge/usb.log"
+DIAGNOSTICS_FILE="$MNT_US_ROOT/kindlebridge-diagnostics.txt"
+PROC_ROOT=${KINDLEBRIDGE_PROC_ROOT:-/proc}
+SYS_ROOT=${KINDLEBRIDGE_SYS_ROOT:-/sys}
+DEV_ROOT=${KINDLEBRIDGE_DEV_ROOT:-/dev}
 
 show() {
     message=$1
@@ -26,6 +30,7 @@ failure_code() {
         *"Unplug USB before"*) echo E-CABLE ;;
         *"another USB transition is active"*) echo E-BUSY ;;
         *"disabled by"*) echo E-DISABLED ;;
+        *"USBNetLite owns USB"*) echo E-OWNER ;;
         *"launcher or daemon exited early"*|*"no daemon slot became healthy"*|*"could not select staged daemon"*)
             echo E-DAEMON
             ;;
@@ -57,6 +62,11 @@ Wait a moment, then check status."
             show "KindleBridge is disabled.
 Delete KINDLEBRIDGE_DISABLE
 from USB storage, then retry."
+            ;;
+        E-OWNER)
+            show "USB is used by USBNetLite (E-OWNER).
+In USBNetLite, turn USBNetwork off,
+then retry."
             ;;
         E-DAEMON)
             show "Development service failed (E-DAEMON).
@@ -96,6 +106,11 @@ Wait, then check status again."
 Delete KINDLEBRIDGE_DISABLE,
 then retry."
             ;;
+        E-OWNER)
+            show "Last action failed: E-OWNER.
+Turn USBNetwork off in USBNetLite,
+then retry KindleBridge."
+            ;;
         E-DAEMON)
             show "Last action failed: E-DAEMON.
 Unplug USB, switch to file transfer,
@@ -120,13 +135,111 @@ Details remain in the USB log."
     rm -f "$ERROR_LOG"
 }
 
-test -x "$MANAGER" || {
-    show "KindleBridge is not installed correctly.
-Run the MRPI installer again."
-    exit 1
+export_diagnostics() {
+    temp="$VAR_LOCAL_ROOT/kindlebridge/.diagnostics.$$"
+    mkdir -p "$VAR_LOCAL_ROOT/kindlebridge"
+    umask 077
+    {
+        echo "KindleBridge diagnostics v1"
+        echo "captured=$(date '+%Y-%m-%dT%H:%M:%S%z')"
+        if test -f "$VERSION_FILE"; then
+            echo "version=$(tr -d '\r\n' <"$VERSION_FILE")"
+        else
+            echo "version=unknown"
+        fi
+        echo
+        echo "[manager status]"
+        if test -x "$MANAGER"; then
+            sh "$MANAGER" status 2>&1 || true
+        else
+            echo "manager=missing"
+        fi
+        echo
+        echo "[system]"
+        uname -a 2>&1 || true
+        uptime 2>&1 || true
+        echo "boot_id=$(cat "$PROC_ROOT/sys/kernel/random/boot_id" 2>/dev/null || echo unknown)"
+        echo
+        echo "[usb gadget]"
+        for file in "$SYS_ROOT/kernel/config/usb_gadget/mtpgadget/UDC" \
+            "$SYS_ROOT/class/udc"/*/state; do
+            test -e "$file" || continue
+            printf '%s=' "$file"
+            cat "$file" 2>/dev/null || true
+        done
+        ls -la "$SYS_ROOT/kernel/config/usb_gadget/mtpgadget/configs/c.1" 2>&1 || true
+        mount 2>&1 | sed -n '/functionfs\|configfs/p' || true
+        ls -la "$DEV_ROOT/usb-ffs/kbp" 2>&1 || true
+        echo
+        echo "[installed files]"
+        for file in \
+            "$VAR_LOCAL_ROOT/kindlebridge/control/bin/kindlebridge-launcher" \
+            "$VAR_LOCAL_ROOT/kindlebridge/control/runtime/slots/A/bin/kindlebridged" \
+            "$VAR_LOCAL_ROOT/kindlebridge/control/runtime/slots/B/bin/kindlebridged"; do
+            test -f "$file" || continue
+            if command -v sha256sum >/dev/null 2>&1; then
+                sha256sum "$file" 2>&1 || true
+            else
+                ls -l "$file" 2>&1 || true
+            fi
+        done
+        echo
+        echo "[managed processes]"
+        for role in launcher daemon; do
+            if test "$role" = launcher; then
+                pid=$(cat "$VAR_LOCAL_ROOT/kindlebridge/usb/launcher_pid" 2>/dev/null || true)
+            else
+                pid=$(cat "$VAR_LOCAL_ROOT/kindlebridge/control/runtime/run/daemon.pid" 2>/dev/null || true)
+            fi
+            echo "$role.pid=${pid:-missing}"
+            case "$pid" in
+                ''|*[!0-9]*) continue ;;
+            esac
+            test -d "$PROC_ROOT/$pid" || { echo "$role.process=missing"; continue; }
+            printf '%s.cmdline=' "$role"
+            tr '\000' ' ' <"$PROC_ROOT/$pid/cmdline" 2>/dev/null || true
+            echo
+            sed -n '1,24p' "$PROC_ROOT/$pid/status" 2>/dev/null || true
+            for task in "$PROC_ROOT/$pid/task"/*; do
+                test -d "$task" || continue
+                tid=${task##*/}
+                printf 'thread.%s.wchan=' "$tid"
+                cat "$task/wchan" 2>/dev/null || true
+                printf 'thread.%s.stack=' "$tid"
+                tr '\n' ' ' <"$task/stack" 2>/dev/null || true
+                echo
+            done
+            ls -l "$PROC_ROOT/$pid/fd" 2>&1 || true
+        done
+        echo
+        echo "[recent log]"
+        tail -n 300 "$USB_LOG" 2>&1 || true
+    } >"$temp"
+    if ! mv "$temp" "$DIAGNOSTICS_FILE"; then
+        rm -f "$temp"
+        return 1
+    fi
+    sync
 }
 
-case "${1:-}" in
+ACTION=${1:-}
+case "$ACTION" in
+    export-diagnostics) ;;
+    start|stop|status|apply-staged)
+        test -x "$MANAGER" || {
+            show "KindleBridge is not installed correctly.
+Run the MRPI installer again."
+            exit 1
+        }
+        ;;
+    *)
+        show "Unknown KindleBridge action.
+Open status and recovery steps."
+        exit 2
+        ;;
+esac
+
+case "$ACTION" in
     start)
         show "Switching to development mode...
 Keep USB unplugged."
@@ -203,6 +316,10 @@ Details were saved to the log."
         esac
         ;;
     apply-staged)
+        if ! output=$(sh "$MANAGER" preflight apply-staged 2>&1); then
+            show_failure "Staged daemon update" "$output"
+            exit 1
+        fi
         show "Applying staged daemon update...
 Keep USB unplugged."
         if output=$(sh "$MANAGER" apply-staged 2>&1); then
@@ -214,6 +331,15 @@ Connect USB to the computer."
             exit 1
         fi
         ;;
-    *) show "Unknown KindleBridge action.
-Open status and recovery steps."; exit 2 ;;
+    export-diagnostics)
+        if export_diagnostics; then
+            show "Diagnostics saved.
+Switch to USB file transfer,
+then open kindlebridge-diagnostics.txt."
+        else
+            show "Could not export diagnostics (E-DIAG).
+USB mode was not changed."
+            exit 1
+        fi
+        ;;
 esac

@@ -39,7 +39,7 @@ mkdir -p \
     "$BASE/transactions" \
     "$BASE/blocks" \
     "$BASE/profiles" \
-    "$BASE/activations/generations" \
+    "$BASE/apps/generations" \
     "$DATA/apps" \
     "$DATA/exports" \
     "$DATA/packages"

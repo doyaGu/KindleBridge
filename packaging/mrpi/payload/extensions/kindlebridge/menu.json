@@ -29,8 +29,15 @@
           "status": false
         },
         {
+          "name": "Export diagnostics",
+          "action": "./bin/kindlebridge.sh",
+          "params": "export-diagnostics",
+          "exitmenu": false,
+          "refresh": false,
+          "status": false
+        },
+        {
           "name": "Apply staged daemon update",
-          "if": "\"/mnt/us/kindlebridge/runtime/next\" -f",
           "action": "./bin/kindlebridge.sh",
           "params": "apply-staged",
           "exitmenu": false,
