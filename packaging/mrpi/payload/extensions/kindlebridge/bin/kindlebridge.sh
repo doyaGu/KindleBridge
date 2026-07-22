@@ -50,13 +50,13 @@ show_failure() {
         "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$action" "$code" "$output" >>"$USB_LOG"
     case "$code" in
         E-CABLE)
-            show "USB is still connected (E-CABLE).
-Unplug it, then tap the action again.
+            show "USB is connected (E-CABLE).
+Unplug it, then retry.
 No restart is needed."
             ;;
         E-BUSY)
-            show "USB mode is still switching (E-BUSY).
-Wait a moment, then check status."
+            show "USB is switching (E-BUSY).
+Wait, then check status."
             ;;
         E-DISABLED)
             show "KindleBridge is disabled.
@@ -69,12 +69,12 @@ In USBNetLite, turn USBNetwork off,
 then retry."
             ;;
         E-DAEMON)
-            show "Development service failed (E-DAEMON).
-Switch to USB file transfer,
-then try development mode again."
+            show "Service failed (E-DAEMON).
+Choose USB file transfer.
+Then try development mode."
             ;;
         E-STOCK)
-            show "USB handoff is not ready (E-STOCK).
+            show "USB is not ready (E-STOCK).
 Wait 5 seconds, then retry."
             ;;
         E-NOUPDATE)
@@ -113,8 +113,8 @@ then retry KindleBridge."
             ;;
         E-DAEMON)
             show "Last action failed: E-DAEMON.
-Unplug USB, switch to file transfer,
-then try development mode again."
+Unplug USB.
+Choose file transfer, then retry."
             ;;
         E-STOCK)
             show "Last action failed: E-STOCK.
@@ -267,6 +267,7 @@ Connect USB to the computer."
     status)
         status_output=$(sh "$MANAGER" status 2>&1 || true)
         status=$(printf '%s\n' "$status_output" | sed -n '1p')
+        reason=$(printf '%s\n' "$status_output" | sed -n 's/^reason=//p' | sed -n '1p')
         version=$(tr -d '\r\n' <"$VERSION_FILE" 2>/dev/null || echo unknown)
         if test -s "$ERROR_LOG"; then
             code=$(sed -n '1p' "$ERROR_LOG")
@@ -292,18 +293,42 @@ Development service is recovering.
 Wait 10 seconds, then check status."
                 ;;
             degraded)
-                show "Development service needs recovery.
-Unplug USB, switch to file transfer,
-then switch to development mode."
+                case "$reason" in
+                    daemon-restarted)
+                        show "Development service stopped.
+Unplug USB.
+Choose file transfer.
+Then choose development mode."
+                        ;;
+                    health-monitor)
+                        show "Health check is not running.
+Unplug USB.
+Choose file transfer.
+Then choose development mode."
+                        ;;
+                    watchdog-halted)
+                        show "Service keeps failing.
+Unplug USB.
+Choose file transfer.
+Then export diagnostics."
+                        ;;
+                    *)
+                        show "Development mode needs recovery.
+Unplug USB.
+Choose file transfer.
+Then choose development mode."
+                        ;;
+                esac
                 ;;
             detached|stale|stale-from-previous-boot)
                 show "USB mode needs recovery.
-Unplug USB, switch to file transfer,
-then switch to development mode."
+Unplug USB.
+Choose file transfer.
+Then choose development mode."
                 ;;
             acquiring-stock-usb|starting|stopping)
-                show "USB mode is still switching.
-Wait a moment, then check status again."
+                show "USB mode is switching.
+Wait, then check status again."
                 ;;
             *)
                 mkdir -p "$VAR_LOCAL_ROOT/kindlebridge"

@@ -96,6 +96,10 @@ case "$command_name" in
         record "mount $*"
         test "${KINDLEBRIDGE_TEST_MOUNT_FAIL:-0}" != 1 || exit 1
         target=$(last_argument "$@")
+        mkdir -p "$target"
+        : >"$target/ep0"
+        : >"$target/ep1"
+        : >"$target/ep2"
         printf 'functionfs %s functionfs rw 0 0\n' "$target" >>"$MOUNTS"
         ;;
     umount)
@@ -103,6 +107,7 @@ case "$command_name" in
         target=$(last_argument "$@")
         grep -v " $target " "$MOUNTS" >"$MOUNTS.next" || true
         mv "$MOUNTS.next" "$MOUNTS"
+        rm -f "$target/ep0" "$target/ep1" "$target/ep2"
         ;;
     *)
         printf 'unexpected fake command: %s\n' "$command_name" >&2

@@ -36,6 +36,7 @@ MOUNTS_FILE="$PROC_ROOT/mounts"
 DEFAULT_UDC=11211000.usb
 DISCONNECT_SETTLE_SECONDS=2
 STOCK_WAIT_SECONDS=15
+SELF=$(readlink -f "$0")
 
 log() {
     mkdir -p "$VAR_LOCAL_ROOT/kindlebridge"
@@ -54,10 +55,10 @@ pid_entrypoint() {
     pid=$1
     test -n "$pid" || return 1
     test -r "$PID_PROC_ROOT/$pid/cmdline" || return 1
-    executable=$(tr '\000' '\n' <"$PID_PROC_ROOT/$pid/cmdline" 2>/dev/null | sed -n '1p')
+    executable=$(tr '\000' '\n' 2>/dev/null <"$PID_PROC_ROOT/$pid/cmdline" | sed -n '1p')
     case "$executable" in
-        */sh | */bash)
-            tr '\000' '\n' <"$PID_PROC_ROOT/$pid/cmdline" 2>/dev/null | sed -n '2p'
+        sh | bash | */sh | */bash)
+            tr '\000' '\n' 2>/dev/null <"$PID_PROC_ROOT/$pid/cmdline" | sed -n '2p'
             ;;
         *) printf '%s\n' "$executable" ;;
     esac
@@ -75,12 +76,17 @@ daemon_pid_is_owned() {
     esac
 }
 
+monitor_pid_is_owned() {
+    test "$(pid_entrypoint "$1")" = "$SELF"
+}
+
 owned_pid_is() {
     role=$1
     pid=$2
     case "$role" in
         launcher) launcher_pid_is_owned "$pid" ;;
         daemon) daemon_pid_is_owned "$pid" ;;
+        monitor) monitor_pid_is_owned "$pid" ;;
         *) return 1 ;;
     esac
 }
@@ -108,6 +114,14 @@ terminate_owned_pid() {
 
 current_daemon_pid() {
     cat "$DAEMON_PID_FILE" 2>/dev/null || read_state daemon_pid ''
+}
+
+write_state_value() {
+    name=$1
+    value=$2
+    temporary="$STATE/.$name.$$"
+    printf '%s\n' "$value" >"$temporary" || return 1
+    mv "$temporary" "$STATE/$name"
 }
 
 wait_for_daemon() {
@@ -178,7 +192,8 @@ wait_for_active_daemon_ready() {
         if daemon_pid_is_owned "$daemon_pid" &&
             test -n "$instance" && test "$instance" != "$previous_instance" &&
             test ! -f "$RUNTIME/launcher/pending-slot"; then
-            printf '%s\n' "$daemon_pid" >"$STATE/daemon_pid"
+            write_state_value daemon_pid "$daemon_pid"
+            write_state_value daemon_instance "$instance"
             return 0
         fi
         launcher_pid_is_owned "$launcher_pid" || return 1
@@ -445,6 +460,92 @@ bind_bridge_gadget() {
     log "KindleBridge composite bound to $udc; host state $(udc_state "$udc")"
 }
 
+monitor_bridge_once_locked() {
+    test -d "$STATE" || return 0
+    test "$(read_state mode '')" = active || return 0
+    launcher_pid=$(read_state launcher_pid '')
+    launcher_pid_is_owned "$launcher_pid" || return 0
+    watchdog_is_halted && return 0
+    test ! -f "$RUNTIME/launcher/pending-slot" || return 0
+
+    daemon_pid=$(current_daemon_pid)
+    daemon_pid_is_owned "$daemon_pid" || return 0
+    heartbeat_is_fresh || return 0
+    instance=$(heartbeat_instance)
+    test -n "$instance" || return 0
+    previous_instance=$(read_state daemon_instance '')
+    previous_daemon_pid=$(read_state daemon_pid '')
+    if test -n "$previous_instance" && test "$daemon_pid" != "$previous_daemon_pid" &&
+        test "$instance" = "$previous_instance"; then
+        return 0
+    fi
+
+    test -L "$LINK" || return 0
+    test -e "$MOUNT/ep1" && test -e "$MOUNT/ep2" || return 0
+    udc=$(read_state udc "$DEFAULT_UDC")
+    test -d "$UDC_CLASS/$udc" || return 0
+    bound=$(cat "$GADGET/UDC" 2>/dev/null || true)
+    test "$bound" = "$udc" || return 0
+    write_state_value daemon_pid "$daemon_pid"
+    write_state_value daemon_instance "$instance"
+    if test "$daemon_pid" != "$previous_daemon_pid"; then
+        write_state_value recovery_required daemon-restarted
+        log "daemon restarted ${previous_daemon_pid:-unknown} -> $daemon_pid; leaving USB untouched and requiring an unplugged restart"
+    fi
+}
+
+monitor_bridge_once() {
+    test -d "$STATE" || return 0
+    test "$(read_state mode '')" = active || return 0
+    launcher_pid=$(read_state launcher_pid '')
+    launcher_pid_is_owned "$launcher_pid" || return 0
+    watchdog_is_halted && return 0
+    test ! -f "$RUNTIME/launcher/pending-slot" || return 0
+    daemon_pid=$(current_daemon_pid)
+    daemon_pid_is_owned "$daemon_pid" || return 0
+    heartbeat_is_fresh || return 0
+    test -L "$LINK" || return 0
+    test -e "$MOUNT/ep1" && test -e "$MOUNT/ep2" || return 0
+    udc=$(read_state udc "$DEFAULT_UDC")
+    bound=$(cat "$GADGET/UDC" 2>/dev/null || true)
+    previous_daemon_pid=$(read_state daemon_pid '')
+    if test "$daemon_pid" = "$previous_daemon_pid" && test "$bound" = "$udc"; then
+        return 0
+    fi
+    acquire_lock || return 0
+    trap 'release_lock' EXIT
+    trap 'release_lock; exit 1' HUP INT TERM
+    monitor_bridge_once_locked
+    result=$?
+    trap - EXIT HUP INT TERM
+    release_lock
+    return "$result"
+}
+
+monitor_bridge() {
+    while test -d "$STATE" && test "$(read_state mode '')" = active; do
+        monitor_bridge_once || log "KindleBridge daemon health monitor failed"
+        sleep 1
+    done
+}
+
+start_bridge_monitor() {
+    if test "${KINDLEBRIDGE_TEST_DISABLE_MONITOR:-0}" = 1; then
+        return 0
+    fi
+    nohup sh "$SELF" monitor </dev/null >>"$LOG" 2>&1 &
+    monitor_pid=$!
+    write_state_value monitor_pid "$monitor_pid"
+    attempts=0
+    while test "$attempts" -lt 5; do
+        monitor_pid_is_owned "$monitor_pid" && return 0
+        attempts=$((attempts + 1))
+        sleep 1
+    done
+    log "KindleBridge health monitor did not stay running"
+    return 1
+}
+
 cleanup_bridge_payload() {
     launcher_pid=$(read_state launcher_pid '')
     daemon_pid=$(current_daemon_pid)
@@ -488,8 +589,12 @@ stop_bridge() {
         return 0
     fi
     watchdog_pid=$(read_state watchdog_pid '')
+    monitor_pid=$(read_state monitor_pid '')
 
     printf '%s\n' stopping >"$STATE/mode"
+    if test "$monitor_pid" != "$$"; then
+        terminate_owned_pid monitor "$monitor_pid" || return 1
+    fi
     cleanup_bridge_payload || return 1
     return_usb_to_volumd || return 1
 
@@ -623,6 +728,7 @@ start_bridge() {
     sleep "$DISCONNECT_SETTLE_SECONDS"
     bind_bridge_gadget "$udc" || return 1
     printf '%s\n' active >"$STATE/mode"
+    start_bridge_monitor || { echo "could not start KindleBridge health monitor" >&2; return 1; }
     if test "$timeout" -eq 0; then
         log "KindleBridge USB active for serial $serial; safety timeout disabled"
     else
@@ -678,11 +784,27 @@ status() {
                 echo "slot=$(cat "$RUNTIME/current" 2>/dev/null || echo unknown)"
                 return 1
             fi
+            if test "${KINDLEBRIDGE_TEST_DISABLE_MONITOR:-0}" != 1; then
+                monitor_pid=$(read_state monitor_pid '')
+                if ! monitor_pid_is_owned "$monitor_pid"; then
+                    echo degraded
+                    echo "reason=health-monitor"
+                    echo "slot=$(cat "$RUNTIME/current" 2>/dev/null || echo unknown)"
+                    return 1
+                fi
+            fi
             if test -f "$RUNTIME/launcher/pending-slot" || ! heartbeat_is_fresh; then
                 echo recovering
                 echo "reason=daemon-heartbeat"
                 echo "slot=$(cat "$RUNTIME/current" 2>/dev/null || echo unknown)"
                 return 0
+            fi
+            if test -f "$STATE/recovery_required"; then
+                echo degraded
+                echo "reason=$(read_state recovery_required unknown)"
+                echo "recovery=unplug USB, switch to file transfer, then start development mode"
+                echo "slot=$(cat "$RUNTIME/current" 2>/dev/null || echo unknown)"
+                return 1
             fi
             echo active
             link_state=$(udc_state "$udc")
@@ -763,5 +885,7 @@ case "${1:-}" in
         esac
         ;;
     restore-after) test "$#" -eq 2 || usage; restore_after "$2" ;;
+    monitor) test "$#" -eq 1 || usage; monitor_bridge ;;
+    monitor-once) test "$#" -eq 1 || usage; monitor_bridge_once ;;
     *) usage ;;
 esac

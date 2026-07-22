@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "base64",
  "blake3",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge-broker"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "serde",
  "serde_json",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge-bundle"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "blake3",
  "clap",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge-device-bench"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "blake3",
  "serde",
@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge-fake-device"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "ed25519-dalek",
  "kindlebridge",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge-functionfs"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "kindlebridge-transport-tcp",
  "kindlebridge-wire",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge-launcher"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "blake3",
  "clap",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge-schema"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "serde",
  "serde_json",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge-server"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "base64",
  "blake3",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge-tcp-probe"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "kindlebridge-transport-tcp",
  "kindlebridge-wire",
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge-transport"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "kindlebridge-schema",
  "kindlebridge-wire",
@@ -648,14 +648,14 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge-transport-tcp"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "kindlebridge-wire",
 ]
 
 [[package]]
 name = "kindlebridge-transport-usb"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "nusb",
  "thiserror 2.0.18",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge-usb-bench"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "kindlebridge-transport-tcp",
  "kindlebridge-transport-usb",
@@ -674,11 +674,11 @@ dependencies = [
 
 [[package]]
 name = "kindlebridge-wire"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 
 [[package]]
 name = "kindlebridged"
-version = "0.1.0-dev.26"
+version = "0.1.0-dev.31"
 dependencies = [
  "blake3",
  "clap",

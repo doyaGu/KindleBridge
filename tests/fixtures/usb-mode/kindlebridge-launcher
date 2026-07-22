@@ -41,7 +41,8 @@ start_child() {
 }
 
 start_child "$@"
-if test "${KINDLEBRIDGE_TEST_SUPERVISOR_RACE:-0}" = 1; then
+if test "${KINDLEBRIDGE_TEST_SUPERVISOR_RACE:-0}" = 1 ||
+    test "${KINDLEBRIDGE_TEST_SUPERVISOR_RESTART:-0}" = 1; then
     crashes=0
     while :; do
         wait "$child" 2>/dev/null || true

@@ -86,7 +86,9 @@ setup_case() {
     unset KINDLEBRIDGE_TEST_MOUNT_FAIL KINDLEBRIDGE_TEST_REAL_SLEEP
     unset KINDLEBRIDGE_TEST_NO_HEARTBEAT
     unset KINDLEBRIDGE_TEST_BIND_STOCK_MTP
-    unset KINDLEBRIDGE_TEST_SUPERVISOR_RACE KINDLEBRIDGE_TEST_AFTER_UNBIND_DELAY
+    unset KINDLEBRIDGE_TEST_SUPERVISOR_RACE KINDLEBRIDGE_TEST_SUPERVISOR_RESTART
+    unset KINDLEBRIDGE_TEST_AFTER_UNBIND_DELAY
+    export KINDLEBRIDGE_TEST_DISABLE_MONITOR=1
 
     mkdir -p \
         "$CASE_ROOT/bin" \
@@ -401,6 +403,91 @@ run_manager "$CASE_ROOT/cleanup-output" stop
 test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/cleanup-output" >&2; fail 'detached-status cleanup failed'; }
 pass 'status reports a detached UDC instead of a false active state'
 
+setup_case daemon_restart_degraded
+export KINDLEBRIDGE_TEST_SUPERVISOR_RESTART=1
+export KINDLEBRIDGE_TEST_REAL_SLEEP=1
+unset KINDLEBRIDGE_TEST_DISABLE_MONITOR
+run_manager "$CASE_ROOT/start-output" start 0
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/start-output" >&2
+    fail 'daemon-restart degraded-state setup failed'
+}
+old_daemon_pid=$(cat "$CONTROL_ROOT/runtime/run/daemon.pid")
+old_instance=$(sed -n '2s/^instance=//p' "$CONTROL_ROOT/runtime/run/heartbeat")
+PIDS="$PIDS $old_daemon_pid"
+kill -9 "$old_daemon_pid"
+attempts=100
+new_daemon_pid=$old_daemon_pid
+while test "$attempts" -gt 0 && test "$new_daemon_pid" = "$old_daemon_pid"; do
+    /usr/bin/sleep 0.02
+    new_daemon_pid=$(cat "$CONTROL_ROOT/runtime/run/daemon.pid" 2>/dev/null || true)
+    attempts=$((attempts - 1))
+done
+new_instance=$old_instance
+attempts=100
+while test "$attempts" -gt 0 && test "$new_instance" = "$old_instance"; do
+    /usr/bin/sleep 0.02
+    new_instance=$(sed -n '2s/^instance=//p' \
+        "$CONTROL_ROOT/runtime/run/heartbeat" 2>/dev/null || true)
+    attempts=$((attempts - 1))
+done
+test -n "$new_daemon_pid" && test "$new_daemon_pid" != "$old_daemon_pid" &&
+    test -n "$new_instance" && test "$new_instance" != "$old_instance" ||
+    fail 'fake launcher did not make the replacement daemon ready'
+PIDS="$PIDS $new_daemon_pid"
+attempts=100
+managed_daemon_pid=$old_daemon_pid
+while test "$attempts" -gt 0 && test "$managed_daemon_pid" != "$new_daemon_pid"; do
+    /usr/bin/sleep 0.02
+    managed_daemon_pid=$(cat "$CASE_ROOT/var/local/kindlebridge/usb/daemon_pid" 2>/dev/null || true)
+    attempts=$((attempts - 1))
+done
+assert_equal "$new_daemon_pid" \
+    "$managed_daemon_pid" \
+    'manager retained the crashed daemon PID'
+assert_equal 11211000.usb \
+    "$(cat "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/UDC")" \
+    'daemon restart cycled the live FunctionFS gadget'
+run_manager "$CASE_ROOT/status-output" status
+test "$MANAGER_RC" -ne 0 || fail 'restarted daemon was reported as transparently recovered'
+assert_equal degraded "$(sed -n '1p' "$CASE_ROOT/status-output")" \
+    'restarted daemon did not require explicit recovery'
+grep -q '^reason=daemon-restarted$' "$CASE_ROOT/status-output" ||
+    fail 'restarted daemon did not report its recovery reason'
+grep -q "daemon restarted $old_daemon_pid -> $new_daemon_pid; leaving USB untouched" \
+    "$CASE_ROOT/var/local/kindlebridge/usb.log" ||
+    fail 'daemon restart was not recorded'
+run_manager "$CASE_ROOT/cleanup-output" stop
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/cleanup-output" >&2
+    fail 'daemon-restart degraded-state cleanup failed'
+}
+pass 'daemon restart is marked degraded without cycling FunctionFS'
+
+setup_case healthy_monitor_lock_free
+run_manager "$CASE_ROOT/start-output" start 0
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/start-output" >&2
+    fail 'healthy-monitor setup failed'
+}
+remember_daemon
+mkdir "$CASE_ROOT/tmp/kindlebridge-usb.lock"
+printf '%s\n' 999999 >"$CASE_ROOT/tmp/kindlebridge-usb.lock/pid"
+run_manager "$CASE_ROOT/monitor-output" monitor-once
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/monitor-output" >&2
+    fail 'healthy monitor iteration failed'
+}
+assert_equal 999999 "$(cat "$CASE_ROOT/tmp/kindlebridge-usb.lock/pid")" \
+    'healthy monitor acquired or replaced the transition lock'
+rm -rf "$CASE_ROOT/tmp/kindlebridge-usb.lock"
+run_manager "$CASE_ROOT/cleanup-output" stop
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/cleanup-output" >&2
+    fail 'healthy-monitor cleanup failed'
+}
+pass 'healthy monitor does not contend on the transition lock'
+
 setup_case pid_ownership
 mkdir -p "$CASE_ROOT/unrelated" "$CASE_ROOT/var/local/kindlebridge/usb"
 cp "$FIXTURES/same-name-launcher" "$CASE_ROOT/unrelated/kindlebridge-launcher"
@@ -548,6 +635,67 @@ assert_equal degraded "$(sed -n '1p' "$CASE_ROOT/halted-status-output")" \
     'status reported active while the launcher crash fuse was halted'
 pass 'status distinguishes recovering and degraded health from active USB'
 
+setup_case missing_health_monitor
+run_manager "$CASE_ROOT/start-output" start 0
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/start-output" >&2
+    fail 'missing-monitor status setup failed'
+}
+remember_daemon
+unset KINDLEBRIDGE_TEST_DISABLE_MONITOR
+run_manager "$CASE_ROOT/status-output" status
+test "$MANAGER_RC" -ne 0 || fail 'missing health monitor reported active'
+assert_equal degraded "$(sed -n '1p' "$CASE_ROOT/status-output")" \
+    'missing health monitor was not degraded'
+grep -q '^reason=health-monitor$' "$CASE_ROOT/status-output" ||
+    fail 'missing health monitor did not report an actionable reason'
+export KINDLEBRIDGE_TEST_DISABLE_MONITOR=1
+run_manager "$CASE_ROOT/cleanup-output" stop
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/cleanup-output" >&2
+    fail 'missing-monitor status cleanup failed'
+}
+pass 'status fails closed when the health monitor is missing'
+
+setup_case busybox_monitor_ownership
+export KINDLEBRIDGE_PID_PROC_ROOT="$CASE_ROOT/pid-proc"
+mkdir -p \
+    "$KINDLEBRIDGE_PID_PROC_ROOT/101" \
+    "$KINDLEBRIDGE_PID_PROC_ROOT/102" \
+    "$KINDLEBRIDGE_PID_PROC_ROOT/103" \
+    "$CASE_ROOT/var/local/kindlebridge/usb" \
+    "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/functions/ffs.kbp" \
+    "$CASE_ROOT/dev/usb-ffs/kbp"
+printf '%s\0' "$CONTROL_ROOT/bin/kindlebridge-launcher" \
+    >"$KINDLEBRIDGE_PID_PROC_ROOT/101/cmdline"
+printf '%s\0' "$CONTROL_ROOT/runtime/slots/A/bin/kindlebridged" \
+    >"$KINDLEBRIDGE_PID_PROC_ROOT/102/cmdline"
+printf 'sh\0%s\0monitor\0' "$(readlink -f "$MANAGER")" \
+    >"$KINDLEBRIDGE_PID_PROC_ROOT/103/cmdline"
+printf '%s\n' test-boot-id >"$CASE_ROOT/var/local/kindlebridge/usb/boot_id"
+printf '%s\n' active >"$CASE_ROOT/var/local/kindlebridge/usb/mode"
+printf '%s\n' 11211000.usb >"$CASE_ROOT/var/local/kindlebridge/usb/udc"
+printf '%s\n' 101 >"$CASE_ROOT/var/local/kindlebridge/usb/launcher_pid"
+printf '%s\n' 102 >"$CASE_ROOT/var/local/kindlebridge/usb/daemon_pid"
+printf '%s\n' 103 >"$CASE_ROOT/var/local/kindlebridge/usb/monitor_pid"
+printf '%s\n' 102 >"$CONTROL_ROOT/runtime/run/daemon.pid"
+timestamp_ms=$(($(date +%s) * 1000))
+printf 'KINDLEBRIDGE_HEARTBEAT_V1\ninstance=busybox-monitor\ntimestamp_ms=%s\n' \
+    "$timestamp_ms" >"$CONTROL_ROOT/runtime/run/heartbeat"
+ln -s "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/functions/ffs.kbp" \
+    "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/configs/c.1/ffs.kbp"
+: >"$CASE_ROOT/dev/usb-ffs/kbp/ep1"
+: >"$CASE_ROOT/dev/usb-ffs/kbp/ep2"
+unset KINDLEBRIDGE_TEST_DISABLE_MONITOR
+run_manager "$CASE_ROOT/status-output" status
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/status-output" >&2
+    fail 'BusyBox-style monitor command line was rejected'
+}
+assert_equal active "$(sed -n '1p' "$CASE_ROOT/status-output")" \
+    'BusyBox-style health monitor did not report active'
+pass 'monitor ownership accepts BusyBox bare sh argv0'
+
 setup_case kual_feedback
 cp "$MANAGER" "$CONTROL_ROOT/bin/usb-gadget-manager.sh"
 chmod 0755 "$CONTROL_ROOT/bin/usb-gadget-manager.sh"
@@ -601,6 +749,17 @@ grep -q '\[managed processes\]' "$CASE_ROOT/mnt/us/kindlebridge-diagnostics.txt"
     fail 'KUAL diagnostics omitted process state'
 grep -q '^launcher.pid=4242$' "$CASE_ROOT/mnt/us/kindlebridge-diagnostics.txt" ||
     fail 'KUAL diagnostics read the launcher PID from the wrong state path'
+rm -f "$CASE_ROOT/var/local/kindlebridge/last-error.log"
+mv "$CONTROL_ROOT/bin/usb-gadget-manager.sh" "$CONTROL_ROOT/bin/usb-gadget-manager.real"
+printf '%s\n' '#!/bin/sh' \
+    'printf "%s\n" degraded reason=daemon-restarted' \
+    'exit 1' >"$CONTROL_ROOT/bin/usb-gadget-manager.sh"
+chmod 0755 "$CONTROL_ROOT/bin/usb-gadget-manager.sh"
+sh "$KUAL_WRAPPER" status >"$CASE_ROOT/kual-degraded-output" 2>&1
+grep -q 'Development service stopped' "$KUAL_CAPTURE" ||
+    fail 'KUAL did not explain a daemon-restart degraded state'
+grep -q 'Choose file transfer' "$KUAL_CAPTURE" ||
+    fail 'KUAL degraded recovery omitted the file-transfer step'
 rm -f "$CONTROL_ROOT/bin/usb-gadget-manager.sh"
 sh "$KUAL_WRAPPER" export-diagnostics >"$CASE_ROOT/kual-missing-manager-diagnostics-output" 2>&1
 grep -q '^manager=missing$' "$CASE_ROOT/mnt/us/kindlebridge-diagnostics.txt" ||
