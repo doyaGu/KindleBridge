@@ -11,17 +11,21 @@ repository.workspace = true
 default = ["full"]
 full = [
     "activation-store",
+    "builder",
     "dep:clap",
-    "dep:crc32c",
-    "dep:ed25519-dalek",
     "dep:rand_core",
-    "dep:semver",
     "dep:serde_json",
     "dep:toml",
     "dep:walkdir",
-    "dep:zstd",
 ]
 activation-store = []
+verify = [
+    "dep:crc32c",
+    "dep:ed25519-dalek",
+    "dep:semver",
+    "dep:zstd",
+]
+builder = ["verify"]
 
 [dependencies]
 blake3 = "1.5"

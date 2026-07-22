@@ -5,6 +5,8 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::model::{BundleKind, Digest};
 use crate::path::{validate_channel, validate_logical_id};
 
+pub const ACTIVATION_SCHEMA_VERSION: u64 = 3;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GenerationId(pub [u8; 16]);
 
@@ -70,9 +72,104 @@ pub struct ActivationGeneration {
     pub profile_id: String,
     pub profile_digest: Digest,
     pub entries: Vec<ActivationEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ActivationAction>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ActivationAction {
+    Rollback {
+        app_id: String,
+        next_generation: Option<GenerationId>,
+    },
 }
 
 impl ActivationGeneration {
+    /// Build an activation record whose identifier is derived from its complete
+    /// semantic contents. Repeating the same install against the same base is
+    /// therefore idempotent, while any profile or entry change creates a new ID.
+    pub fn new(
+        previous_generation: Option<GenerationId>,
+        profile_id: impl Into<String>,
+        profile_digest: Digest,
+        entries: Vec<ActivationEntry>,
+    ) -> Result<Self> {
+        Self::new_with_action(
+            previous_generation,
+            profile_id,
+            profile_digest,
+            entries,
+            None,
+        )
+    }
+
+    pub fn new_rollback(
+        previous_generation: GenerationId,
+        profile_id: impl Into<String>,
+        profile_digest: Digest,
+        entries: Vec<ActivationEntry>,
+        app_id: impl Into<String>,
+        next_generation: Option<GenerationId>,
+    ) -> Result<Self> {
+        Self::new_with_action(
+            Some(previous_generation),
+            profile_id,
+            profile_digest,
+            entries,
+            Some(ActivationAction::Rollback {
+                app_id: app_id.into(),
+                next_generation,
+            }),
+        )
+    }
+
+    fn new_with_action(
+        previous_generation: Option<GenerationId>,
+        profile_id: impl Into<String>,
+        profile_digest: Digest,
+        entries: Vec<ActivationEntry>,
+        action: Option<ActivationAction>,
+    ) -> Result<Self> {
+        #[derive(Serialize)]
+        struct GenerationIdentity<'a> {
+            schema: u64,
+            previous_generation: Option<GenerationId>,
+            profile_id: &'a str,
+            profile_digest: Digest,
+            entries: &'a [ActivationEntry],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            action: &'a Option<ActivationAction>,
+        }
+
+        let profile_id = profile_id.into();
+        let identity = GenerationIdentity {
+            schema: ACTIVATION_SCHEMA_VERSION,
+            previous_generation,
+            profile_id: &profile_id,
+            profile_digest,
+            entries: &entries,
+            action: &action,
+        };
+        let canonical = to_canonical_vec(&identity)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"KINDLEBRIDGE-ACTIVATION-GENERATION-V2\0");
+        hasher.update(&canonical);
+        let mut generation_id = [0_u8; 16];
+        generation_id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        let generation = Self {
+            schema: ACTIVATION_SCHEMA_VERSION,
+            generation_id: GenerationId(generation_id),
+            previous_generation,
+            profile_id,
+            profile_digest,
+            entries,
+            action,
+        };
+        generation.validate()?;
+        Ok(generation)
+    }
+
     pub fn to_cbor(&self) -> Result<Vec<u8>> {
         self.validate()?;
         to_canonical_vec(self)
@@ -85,8 +182,16 @@ impl ActivationGeneration {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema != 1 {
-            return activation_error("activation schema must be 1");
+        if self.schema != ACTIVATION_SCHEMA_VERSION {
+            return activation_error(format!(
+                "activation schema must be {ACTIVATION_SCHEMA_VERSION}"
+            ));
+        }
+        if let Some(ActivationAction::Rollback { app_id, .. }) = &self.action {
+            validate_logical_id(app_id)?;
+            if self.previous_generation.is_none() {
+                return activation_error("rollback activation requires a previous generation");
+            }
         }
         validate_component(&self.profile_id, "profile_id")?;
 
@@ -161,7 +266,7 @@ mod tests {
 
     fn generation() -> ActivationGeneration {
         ActivationGeneration {
-            schema: 1,
+            schema: ACTIVATION_SCHEMA_VERSION,
             generation_id: GenerationId([0x23; 16]),
             previous_generation: None,
             profile_id: "kt6-5.17".into(),
@@ -175,6 +280,7 @@ mod tests {
                 data_generation: Some("data-1".into()),
                 dependency_roots: Vec::new(),
             }],
+            action: None,
         }
     }
 
@@ -197,5 +303,68 @@ mod tests {
             generation.validate().unwrap_err().code,
             ErrorCode::Activation
         );
+    }
+
+    #[test]
+    fn derived_generation_ids_are_stable_and_content_addressed() {
+        let source = generation();
+        let first = ActivationGeneration::new(
+            source.previous_generation,
+            &source.profile_id,
+            source.profile_digest,
+            source.entries.clone(),
+        )
+        .unwrap();
+        let repeated = ActivationGeneration::new(
+            source.previous_generation,
+            &source.profile_id,
+            source.profile_digest,
+            source.entries.clone(),
+        )
+        .unwrap();
+        assert_eq!(first.generation_id, repeated.generation_id);
+
+        let mut changed_entries = source.entries;
+        changed_entries[0].code_version = "2.0.0".into();
+        let changed = ActivationGeneration::new(
+            source.previous_generation,
+            source.profile_id,
+            source.profile_digest,
+            changed_entries,
+        )
+        .unwrap();
+        assert_ne!(first.generation_id, changed.generation_id);
+    }
+
+    #[test]
+    fn rollback_action_is_canonical_in_the_current_schema() {
+        let source = generation();
+        let rollback = ActivationGeneration::new_rollback(
+            source.generation_id,
+            &source.profile_id,
+            source.profile_digest,
+            source.entries.clone(),
+            "org.example.reader",
+            None,
+        )
+        .unwrap();
+        assert_eq!(rollback.schema, ACTIVATION_SCHEMA_VERSION);
+        assert!(matches!(
+            rollback.action,
+            Some(ActivationAction::Rollback {
+                ref app_id,
+                next_generation: None,
+            }) if app_id == "org.example.reader"
+        ));
+        assert_eq!(
+            ActivationGeneration::from_cbor(&rollback.to_cbor().unwrap()).unwrap(),
+            rollback
+        );
+
+        for unsupported_schema in [1, 2] {
+            let mut invalid = source.clone();
+            invalid.schema = unsupported_schema;
+            assert_eq!(invalid.validate().unwrap_err().code, ErrorCode::Activation);
+        }
     }
 }

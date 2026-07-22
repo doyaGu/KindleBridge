@@ -1,10 +1,10 @@
-#[cfg(feature = "full")]
+#[cfg(feature = "verify")]
 use std::collections::{BTreeMap, BTreeSet};
 
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{Error, ErrorCode, Result};
-#[cfg(feature = "full")]
+#[cfg(feature = "verify")]
 use crate::model::{FileEntry, FileType};
 
 pub fn validate_bundle_path(path: &str) -> Result<()> {
@@ -80,7 +80,7 @@ pub(crate) fn validate_channel(channel: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "full")]
+#[cfg(feature = "verify")]
 pub(crate) fn validate_tree_paths(entries: &[FileEntry]) -> Result<()> {
     let mut previous: Option<&[u8]> = None;
     let mut folded = BTreeSet::new();
@@ -111,7 +111,7 @@ pub(crate) fn validate_tree_paths(entries: &[FileEntry]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "full")]
+#[cfg(feature = "verify")]
 pub(crate) fn validate_symlinks(entries: &[FileEntry]) -> Result<()> {
     let by_path: BTreeMap<&str, &FileEntry> = entries
         .iter()
@@ -147,7 +147,7 @@ pub(crate) fn validate_symlinks(entries: &[FileEntry]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "full")]
+#[cfg(feature = "verify")]
 fn resolve_target(link_path: &str, target: &str) -> Result<String> {
     let mut parts: Vec<&str> = link_path.split('/').collect();
     parts.pop();

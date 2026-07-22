@@ -250,6 +250,7 @@ fn build_bundle(
         &VerifyOptions {
             expected_publisher: Some(&signing_key.verifying_key()),
             target: None,
+            firmware: None,
         },
     )?;
 
@@ -326,6 +327,7 @@ fn verify_bundle(
         &VerifyOptions {
             expected_publisher: expected_publisher.as_ref(),
             target: Some(target),
+            firmware: None,
         },
     )?;
     if json_output {

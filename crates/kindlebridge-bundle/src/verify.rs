@@ -57,6 +57,8 @@ pub struct VerifyOptions<'a> {
     pub expected_publisher: Option<&'a VerifyingKey>,
     /// If set, the profile's sole variant must target this value.
     pub target: Option<&'a str>,
+    /// If set, the device firmware must satisfy the variant's declared range.
+    pub firmware: Option<&'a str>,
 }
 
 pub fn inspect<R: Read + Seek>(reader: &mut R) -> Result<Inspection> {
@@ -116,6 +118,24 @@ pub fn verify<R: Read + Seek>(
             return Err(Error::new(
                 ErrorCode::Target,
                 format!("bundle target does not match {target}"),
+            ));
+        }
+    }
+    if let Some(firmware) = options.firmware {
+        let firmware = parse_firmware(firmware)?;
+        let variant = &inspection.envelope.variants[0];
+        if variant
+            .firmware_min
+            .as_deref()
+            .is_some_and(|minimum| compare_firmware(&firmware, minimum).is_lt())
+            || variant
+                .firmware_max_exclusive
+                .as_deref()
+                .is_some_and(|maximum| !compare_firmware(&firmware, maximum).is_lt())
+        {
+            return Err(Error::new(
+                ErrorCode::Target,
+                "bundle does not support this firmware version",
             ));
         }
     }
@@ -450,6 +470,21 @@ fn validate_permissions_and_policy(envelope: &Envelope) -> Result<()> {
         }
         if let Some(path) = &process.working_dir {
             validate_bundle_path(path)?;
+            let tree = &envelope.trees[0];
+            let entry = tree
+                .entries
+                .binary_search_by(|entry| entry.path.as_str().cmp(path.as_str()))
+                .ok()
+                .map(|index| &tree.entries[index])
+                .ok_or_else(|| {
+                    Error::new(ErrorCode::Tree, "process working directory does not exist")
+                })?;
+            if entry.file_type != FileType::Directory {
+                return Err(Error::new(
+                    ErrorCode::Tree,
+                    "process working directory is not a directory",
+                ));
+            }
         }
         if let Some(environment) = &process.environment {
             for (key, value) in environment {
@@ -657,7 +692,7 @@ fn verify_payload<R: Read + Seek>(reader: &mut R, inspection: &Inspection) -> Re
     Ok(())
 }
 
-fn read_raw_block<R: Read + Seek>(
+pub(crate) fn read_raw_block<R: Read + Seek>(
     reader: &mut R,
     payload_section_offset: u64,
     descriptor: &BlockDescriptor,
@@ -737,6 +772,16 @@ fn validate_firmware_bound(bound: Option<&[u64]>) -> Result<()> {
         return schema_error("invalid firmware bound");
     }
     Ok(())
+}
+
+fn parse_firmware(value: &str) -> Result<Vec<u64>> {
+    let components = value
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| Error::new(ErrorCode::Target, "device firmware version is invalid"))?;
+    validate_firmware_bound(Some(&components))?;
+    Ok(components)
 }
 
 fn compare_firmware(left: &[u64], right: &[u64]) -> std::cmp::Ordering {
@@ -820,10 +865,56 @@ mod tests {
                 &VerifyOptions {
                     expected_publisher: Some(&key.verifying_key()),
                     target: Some("kindlehf"),
+                    firmware: None,
                 },
             )
             .unwrap();
             assert_eq!(verified.inspection.envelope.profile, PROFILE);
+        }
+    }
+
+    #[test]
+    fn device_firmware_must_fall_inside_the_declared_half_open_range() {
+        let key = SigningKey::from_bytes(&[0x17; 32]);
+        let mut config = BuildConfig::new(
+            BundleKind::Application,
+            "org.example.firmware",
+            "1.0.0",
+            1,
+            "kindlehf",
+        );
+        config.firmware_min = Some(vec![5, 16, 3]);
+        config.firmware_max_exclusive = Some(vec![5, 18]);
+        config.entrypoints.insert("main".into(), "bin/main".into());
+        let mut builder = BundleBuilder::new(config);
+        builder.add_file("bin/main", b"app".to_vec(), true).unwrap();
+        let bytes = builder.build(&key).unwrap();
+
+        for firmware in ["5.16.3", "5.17.1.0.4", "5.17.999"] {
+            verify_bytes(
+                &bytes,
+                &VerifyOptions {
+                    firmware: Some(firmware),
+                    target: Some("kindlehf"),
+                    ..VerifyOptions::default()
+                },
+            )
+            .unwrap();
+        }
+        for firmware in ["5.16.2.9", "5.18", "5.18.0", "not-a-version"] {
+            assert_eq!(
+                verify_bytes(
+                    &bytes,
+                    &VerifyOptions {
+                        firmware: Some(firmware),
+                        target: Some("kindlehf"),
+                        ..VerifyOptions::default()
+                    },
+                )
+                .unwrap_err()
+                .code,
+                ErrorCode::Target
+            );
         }
     }
 
@@ -883,6 +974,7 @@ mod tests {
                 &VerifyOptions {
                     expected_publisher: Some(&other.verifying_key()),
                     target: Some("kindlehf"),
+                    firmware: None,
                 },
             )
             .unwrap_err()

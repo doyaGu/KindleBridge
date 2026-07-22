@@ -311,6 +311,7 @@ impl BundleBuilder {
             &VerifyOptions {
                 expected_publisher: Some(&verifying_key),
                 target: Some(&self.config.target),
+                firmware: None,
             },
         )?;
         Ok(output)

@@ -973,7 +973,7 @@ mod tests {
 
     fn generation(id_byte: u8, previous: Option<GenerationId>) -> ActivationGeneration {
         ActivationGeneration {
-            schema: 1,
+            schema: crate::ACTIVATION_SCHEMA_VERSION,
             generation_id: GenerationId([id_byte; 16]),
             previous_generation: previous,
             profile_id: "kt6-5.17".into(),
@@ -987,6 +987,7 @@ mod tests {
                 data_generation: None,
                 dependency_roots: Vec::new(),
             }],
+            action: None,
         }
     }
 
