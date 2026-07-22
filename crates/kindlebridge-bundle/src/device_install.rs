@@ -419,6 +419,20 @@ mod tests {
     use super::*;
     use crate::{BuildConfig, BundleBuilder, BundleKind, VerifyOptions};
 
+    #[cfg(unix)]
+    fn make_test_tree_removable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return;
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for entry in std::fs::read_dir(path).unwrap() {
+            make_test_tree_removable(&entry.unwrap().path());
+        }
+    }
+
     #[test]
     fn verified_blocks_are_ingested_idempotently() {
         let mut config = BuildConfig::new(
@@ -482,6 +496,8 @@ mod tests {
         std::fs::write(&first.main, damaged).unwrap();
         assert!(load_materialized_application(&store, first.bundle_root).is_err());
         drop(store);
+        #[cfg(unix)]
+        make_test_tree_removable(&directory);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

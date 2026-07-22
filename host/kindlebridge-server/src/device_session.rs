@@ -2197,6 +2197,20 @@ mod tests {
     const TEST_SESSION_ID: &str = "000102030405060708090a0b0c0d0e0f";
     const STALE_SESSION_ID: &str = "f0e0d0c0b0a090807060504030201000";
 
+    #[cfg(unix)]
+    fn make_test_tree_removable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = fs::symlink_metadata(path).unwrap();
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return;
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        for entry in fs::read_dir(path).unwrap() {
+            make_test_tree_removable(&entry.unwrap().path());
+        }
+    }
+
     #[test]
     fn rejects_a_mismatched_device_protocol() {
         let hello = DeviceHello {
@@ -3213,6 +3227,8 @@ mod tests {
         drop(provider);
         worker.join().unwrap().unwrap();
         fs::remove_file(bundle_path).unwrap();
+        #[cfg(unix)]
+        make_test_tree_removable(&root);
         fs::remove_dir_all(root).unwrap();
     }
 
