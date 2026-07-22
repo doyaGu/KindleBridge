@@ -143,6 +143,17 @@ destroy the transport needed to repair it. The launcher, USB ownership manager,
 and package layout therefore remain MRPI-managed control-plane components;
 normal apps and payloads can still update online.
 
+A daemon process restart is not reported as transparent USB recovery. Closing
+all FunctionFS endpoints disables the function and unregisters the gadget; on
+the KT6, reopening them after a process restart does not reliably reattach the
+still-connected host. The USB manager therefore leaves the UDC, HAL, and driver
+untouched, marks the mode `degraded`, and asks for an unplugged switch through
+USB file transfer back to development mode. Reliable transparent daemon
+replacement would require a separate long-lived USB frontend that owns and
+services every FunctionFS endpoint while backends change behind IPC. See the
+[Linux FunctionFS documentation](https://docs.kernel.org/usb/functionfs.html)
+and [AOSP's single-process FunctionFS owner](https://android.googlesource.com/platform/system/core/+/c745f09b33804242c43f823242f0112645ed3a98/adb/daemon/usb_ffs.cpp).
+
 Use `--usb-serial` only to select among multiple attached Kindles and
 `--no-usb` to disable automatic discovery. Unplug the cable again before
 running `usb-gadget-manager.sh stop`. The manager asks stock `volumd` to perform the
