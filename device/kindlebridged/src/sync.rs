@@ -485,6 +485,14 @@ impl SyncStore {
         })
     }
 
+    /// Open a fully committed sync file through the same confined path checks
+    /// used by pull. Staging files and absolute/traversal paths are unreachable.
+    pub fn open_committed(&self, remote_path: &str) -> Result<File, StoreError> {
+        let logical = LogicalPath::parse(remote_path.to_owned())?;
+        self.ensure_layout()?;
+        File::open(self.open_existing_target(&logical)?).map_err(StoreError::Io)
+    }
+
     fn ensure_layout(&self) -> Result<(), StoreError> {
         fs::create_dir_all(&self.root)?;
         fs::create_dir_all(self.stage_root())?;

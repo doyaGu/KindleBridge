@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use kindlebridge_broker::{AuthenticatedSession, Grant};
@@ -48,12 +49,26 @@ enum Command {
         #[arg(long, default_value = "/mnt/us/kindlebridge-data")]
         sync_root: PathBuf,
     },
-    /// Run the bounded legacy hardware bring-up echo probe.
+    /// Run the bounded hardware bring-up echo probe.
     ProbeTcp {
         #[arg(long)]
         listen: SocketAddr,
         #[arg(long)]
         allow_peer: IpAddr,
+    },
+    #[command(hide = true)]
+    RunAppSupervisor {
+        #[arg(long)]
+        entrypoint: PathBuf,
+        #[arg(long)]
+        stop_timeout_ms: u64,
+        #[arg(long)]
+        restart_on_failure: bool,
+    },
+    #[command(hide = true)]
+    ExecApp {
+        #[arg(long)]
+        entrypoint: PathBuf,
     },
 }
 
@@ -118,6 +133,16 @@ fn run(arguments: Args) -> Result<(), String> {
             server.serve_forever().map_err(|error| error.to_string())
         }
         Some(Command::ProbeTcp { listen, allow_peer }) => run_probe(listen, allow_peer),
+        Some(Command::RunAppSupervisor {
+            entrypoint,
+            stop_timeout_ms,
+            restart_on_failure,
+        }) => kindlebridged::app::run_application_supervisor(
+            &entrypoint,
+            Duration::from_millis(stop_timeout_ms),
+            restart_on_failure,
+        ),
+        Some(Command::ExecApp { entrypoint }) => kindlebridged::app::exec_application(&entrypoint),
         None => report(),
     }
 }

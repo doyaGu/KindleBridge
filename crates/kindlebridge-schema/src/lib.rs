@@ -64,8 +64,10 @@ pub mod error_codes {
     pub const FILE_NOT_FOUND: i64 = -32_013;
     pub const APP_NOT_FOUND: i64 = -32_020;
     pub const NO_ROLLBACK_AVAILABLE: i64 = -32_021;
+    pub const APP_INSTALL_FAILED: i64 = -32_022;
     pub const PROCESS_NOT_FOUND: i64 = -32_030;
     pub const INVALID_SIGNAL: i64 = -32_031;
+    pub const PROCESS_SIGNAL_FAILED: i64 = -32_032;
     pub const LOG_CURSOR_EXPIRED: i64 = -32_040;
     pub const EXEC_TIMEOUT: i64 = -32_050;
     pub const EXEC_OUTPUT_LIMIT: i64 = -32_051;
@@ -487,7 +489,15 @@ pub struct SyncPullResult {
 }
 
 pub const MAX_SYNC_BLOCK_SIZE: u32 = device_protocol::MAX_HOST_TO_DEVICE_PAYLOAD;
-pub const DEFAULT_SYNC_BLOCK_SIZE: u32 = MAX_SYNC_BLOCK_SIZE;
+/// Default wire payload for one sync DATA frame.
+///
+/// KBP scheduling happens between complete frames, so a 1 MiB default can
+/// occupy a full-speed USB link for longer than the interactive shell latency
+/// budget. 256 KiB keeps sync efficient while giving Interactive traffic a
+/// scheduling opportunity several times per 50 ms window. Callers that value
+/// bulk throughput over latency can still request up to
+/// [`MAX_SYNC_BLOCK_SIZE`].
+pub const DEFAULT_SYNC_BLOCK_SIZE: u32 = 256 * 1024;
 
 const fn default_sync_block_size() -> u32 {
     DEFAULT_SYNC_BLOCK_SIZE
@@ -513,9 +523,9 @@ pub struct SyncStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppState {
-    Unknown,
     Stopped,
     Running,
+    Failed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -536,8 +546,32 @@ pub struct AppList {
 #[serde(deny_unknown_fields)]
 pub struct AppInstallParams {
     pub serial: String,
-    pub app_id: String,
-    pub version: String,
+    /// Absolute KBB path on the host. The CLI resolves friendly relative input
+    /// before calling the shared server so its working directory is irrelevant.
+    pub bundle_path: String,
+}
+
+#[cfg(test)]
+mod app_api_tests {
+    use serde_json::json;
+
+    use super::AppInstallParams;
+
+    #[test]
+    fn public_install_accepts_only_a_host_bundle_path() {
+        let params: AppInstallParams = serde_json::from_value(json!({
+            "serial": "KT6",
+            "bundle_path": "C:\\apps\\reader.kbb",
+        }))
+        .unwrap();
+        assert_eq!(params.bundle_path, "C:\\apps\\reader.kbb");
+        assert!(serde_json::from_value::<AppInstallParams>(json!({
+            "serial": "KT6",
+            "app_id": "org.example.forged",
+            "version": "99.0.0",
+        }))
+        .is_err());
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,6 +604,129 @@ pub struct ProcessSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessList {
     pub processes: Vec<ProcessSummary>,
+}
+
+/// Linux process signals accepted by the stable process-control API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ProcessSignal {
+    Hup = 1,
+    Int,
+    Quit,
+    Ill,
+    Trap,
+    Abrt,
+    Bus,
+    Fpe,
+    Kill,
+    Usr1,
+    Segv,
+    Usr2,
+    Pipe,
+    Alrm,
+    Term,
+    Stkflt,
+    Chld,
+    Cont,
+    Stop,
+    Tstp,
+    Ttin,
+    Ttou,
+    Urg,
+    Xcpu,
+    Xfsz,
+    Vtalrm,
+    Prof,
+    Winch,
+    Io,
+    Pwr,
+    Sys,
+}
+
+impl ProcessSignal {
+    /// Accepts the conventional name with or without `SIG`, case-insensitively,
+    /// plus the Linux signal number used by the Kindle target.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalized = value.to_ascii_uppercase();
+        let name = normalized.strip_prefix("SIG").unwrap_or(&normalized);
+        Some(match name {
+            "HUP" | "1" => Self::Hup,
+            "INT" | "2" => Self::Int,
+            "QUIT" | "3" => Self::Quit,
+            "ILL" | "4" => Self::Ill,
+            "TRAP" | "5" => Self::Trap,
+            "ABRT" | "IOT" | "6" => Self::Abrt,
+            "BUS" | "7" => Self::Bus,
+            "FPE" | "8" => Self::Fpe,
+            "KILL" | "9" => Self::Kill,
+            "USR1" | "10" => Self::Usr1,
+            "SEGV" | "11" => Self::Segv,
+            "USR2" | "12" => Self::Usr2,
+            "PIPE" | "13" => Self::Pipe,
+            "ALRM" | "14" => Self::Alrm,
+            "TERM" | "15" => Self::Term,
+            "STKFLT" | "16" => Self::Stkflt,
+            "CHLD" | "CLD" | "17" => Self::Chld,
+            "CONT" | "18" => Self::Cont,
+            "STOP" | "19" => Self::Stop,
+            "TSTP" | "20" => Self::Tstp,
+            "TTIN" | "21" => Self::Ttin,
+            "TTOU" | "22" => Self::Ttou,
+            "URG" | "23" => Self::Urg,
+            "XCPU" | "24" => Self::Xcpu,
+            "XFSZ" | "25" => Self::Xfsz,
+            "VTALRM" | "26" => Self::Vtalrm,
+            "PROF" | "27" => Self::Prof,
+            "WINCH" | "28" => Self::Winch,
+            "IO" | "POLL" | "29" => Self::Io,
+            "PWR" | "30" => Self::Pwr,
+            "SYS" | "UNUSED" | "31" => Self::Sys,
+            _ => return None,
+        })
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Hup => "HUP",
+            Self::Int => "INT",
+            Self::Quit => "QUIT",
+            Self::Ill => "ILL",
+            Self::Trap => "TRAP",
+            Self::Abrt => "ABRT",
+            Self::Bus => "BUS",
+            Self::Fpe => "FPE",
+            Self::Kill => "KILL",
+            Self::Usr1 => "USR1",
+            Self::Segv => "SEGV",
+            Self::Usr2 => "USR2",
+            Self::Pipe => "PIPE",
+            Self::Alrm => "ALRM",
+            Self::Term => "TERM",
+            Self::Stkflt => "STKFLT",
+            Self::Chld => "CHLD",
+            Self::Cont => "CONT",
+            Self::Stop => "STOP",
+            Self::Tstp => "TSTP",
+            Self::Ttin => "TTIN",
+            Self::Ttou => "TTOU",
+            Self::Urg => "URG",
+            Self::Xcpu => "XCPU",
+            Self::Xfsz => "XFSZ",
+            Self::Vtalrm => "VTALRM",
+            Self::Prof => "PROF",
+            Self::Winch => "WINCH",
+            Self::Io => "IO",
+            Self::Pwr => "PWR",
+            Self::Sys => "SYS",
+        }
+    }
+
+    #[must_use]
+    pub const fn number(self) -> i32 {
+        self as i32
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -843,18 +1000,21 @@ mod tests {
     }
 
     #[test]
-    fn sync_defaults_to_a_full_usb_transfer_batch() {
-        assert_eq!(DEFAULT_SYNC_BLOCK_SIZE, MAX_SYNC_BLOCK_SIZE);
-        assert_eq!(DEFAULT_SYNC_BLOCK_SIZE, 1024 * 1024);
+    fn sync_default_preserves_interactive_scheduling_opportunities() {
+        assert_eq!(DEFAULT_SYNC_BLOCK_SIZE, 256 * 1024);
+        assert_eq!(MAX_SYNC_BLOCK_SIZE, 1024 * 1024);
     }
 
     #[test]
-    fn unknown_app_state_has_a_stable_wire_value() {
-        assert_eq!(serde_json::to_value(AppState::Unknown).unwrap(), "unknown");
-        assert_eq!(
-            serde_json::from_str::<AppState>("\"unknown\"").unwrap(),
-            AppState::Unknown
-        );
+    fn process_signals_accept_linux_names_aliases_and_numbers() {
+        assert_eq!(ProcessSignal::parse("term"), Some(ProcessSignal::Term));
+        assert_eq!(ProcessSignal::parse("SIGKILL"), Some(ProcessSignal::Kill));
+        assert_eq!(ProcessSignal::parse("CLD"), Some(ProcessSignal::Chld));
+        assert_eq!(ProcessSignal::parse("29"), Some(ProcessSignal::Io));
+        assert_eq!(ProcessSignal::parse("0"), None);
+        assert_eq!(ProcessSignal::parse("SIGRTMIN"), None);
+        assert_eq!(ProcessSignal::Term.name(), "TERM");
+        assert_eq!(ProcessSignal::Term.number(), 15);
     }
 
     #[test]

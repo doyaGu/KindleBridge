@@ -1,0 +1,21 @@
+kind = "application"
+id = "org.kindlebridge.restart-test"
+version = "0.1.0"
+release = 1
+channel = "dev"
+target = "kindlehf"
+firmware_min = [5, 16, 3]
+entrypoints = { main = "bin/restart-test.sh" }
+publisher_name = "KindleBridge bounded restart fixture"
+
+[permissions]
+requested = []
+optional = []
+
+[process]
+restart = "on-failure"
+stop_timeout_ms = 1000
+
+[data]
+policy = "preserve"
+schema = 1

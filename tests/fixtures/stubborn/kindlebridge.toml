@@ -1,0 +1,21 @@
+kind = "application"
+id = "org.kindlebridge.stubborn"
+version = "0.1.0"
+release = 1
+channel = "dev"
+target = "kindlehf"
+firmware_min = [5, 16, 3]
+entrypoints = { main = "bin/stubborn.sh" }
+publisher_name = "KindleBridge forced-stop fixture"
+
+[permissions]
+requested = []
+optional = []
+
+[process]
+restart = "never"
+stop_timeout_ms = 100
+
+[data]
+policy = "ephemeral"
+schema = 1

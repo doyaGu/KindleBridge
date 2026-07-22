@@ -1,0 +1,21 @@
+kind = "application"
+id = "org.kindlebridge.lifecycle"
+version = "0.2.0"
+release = 2
+channel = "dev"
+target = "kindlehf"
+firmware_min = [5, 16, 3]
+entrypoints = { main = "bin/lifecycle.sh" }
+publisher_name = "KindleBridge lifecycle upgrade fixture"
+
+[permissions]
+requested = []
+optional = []
+
+[process]
+restart = "never"
+stop_timeout_ms = 1000
+
+[data]
+policy = "preserve"
+schema = 1

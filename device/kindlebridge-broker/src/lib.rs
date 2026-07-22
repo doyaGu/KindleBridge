@@ -141,7 +141,7 @@ impl BrokerPolicy {
             if !is_generation_id(generation_id) {
                 return Err(AuthorizationError::InvalidGenerationId);
             }
-            let expected = format!("activations/generations/{generation_id}/activation.cbor");
+            let expected = format!("apps/generations/{generation_id}/activation.cbor");
             if activation_relative_path != &expected {
                 return Err(AuthorizationError::InvalidActivationPath);
             }
