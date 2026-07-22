@@ -127,7 +127,10 @@ Cargo package is an internal build identifier, not a product release.
   with a safe public-path fallback, and actionable KUAL behavior. The current
   stock-`volumd` manager has completed both handoff directions and re-entry on
   KT6; discovery, repeated root exec, multi-window stability, and large sync then
-  passed. Repeated sleep/wake and repeated-cycle validation remain gates.
+  passed. Dev.26 additionally passed a stock suspend/resume with an active Shell,
+  Windows Terminal live resize from 30x120 to 42x132, and ten rounds of concurrent
+  Shell/sync/log traffic. Larger repeated physical-cycle qualification remains a
+  publication gate.
 - The package integrates a root-confined A/B daemon launcher into the USB
   manager. Host `daemon stage` uploads through `sync.v1`, verifies BLAKE3 plus
   the ELF32 little-endian ARM header on-device, writes only the inactive slot,
