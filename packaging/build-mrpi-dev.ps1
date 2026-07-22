@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
     [string]$KindleTool,
-    [string]$Version = '0.1.0-dev.6',
     [switch]$SkipDeviceBuild
 )
 
@@ -11,6 +10,16 @@ $WorkspaceRoot = Split-Path -Parent $RepositoryRoot
 $TargetRoot = Join-Path $RepositoryRoot 'target\mrpi-dev'
 $StageRoot = Join-Path $TargetRoot 'stage'
 $DistRoot = Join-Path $RepositoryRoot 'dist'
+$MetadataJson = & cargo metadata --format-version 1 --no-deps --manifest-path (Join-Path $RepositoryRoot 'Cargo.toml')
+if ($LASTEXITCODE -ne 0) {
+    throw 'could not read the KindleBridge workspace version'
+}
+$Metadata = $MetadataJson | ConvertFrom-Json
+$DevicePackages = @($Metadata.packages | Where-Object { $_.name -eq 'kindlebridged' })
+if ($DevicePackages.Count -ne 1) {
+    throw "expected exactly one kindlebridged package, found $($DevicePackages.Count)"
+}
+$Version = [string]$DevicePackages[0].version
 if ($Version -notmatch '^[0-9A-Za-z][0-9A-Za-z.-]{0,63}$') {
     throw "unsafe package version: $Version"
 }
@@ -46,6 +55,19 @@ $PayloadSource = Join-Path $PSScriptRoot 'mrpi\payload'
 Copy-Item -LiteralPath $PayloadSource -Destination (Join-Path $StageRoot 'payload') -Recurse
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'mrpi\install.sh') -Destination $StageRoot
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'mrpi\uninstall.sh') -Destination $StageRoot
+$StagedKualConfig = Join-Path $StageRoot 'payload\extensions\kindlebridge\config.xml'
+$KualVersionToken = '@KINDLEBRIDGE_VERSION@'
+$KualConfigText = [IO.File]::ReadAllText($StagedKualConfig)
+$FirstKualVersionToken = $KualConfigText.IndexOf($KualVersionToken, [StringComparison]::Ordinal)
+$LastKualVersionToken = $KualConfigText.LastIndexOf($KualVersionToken, [StringComparison]::Ordinal)
+if ($FirstKualVersionToken -lt 0 -or $FirstKualVersionToken -ne $LastKualVersionToken) {
+    throw "KUAL config must contain exactly one $KualVersionToken token"
+}
+[IO.File]::WriteAllText(
+    $StagedKualConfig,
+    $KualConfigText.Replace($KualVersionToken, $Version),
+    [Text.UTF8Encoding]::new($false)
+)
 $PayloadVersion = Join-Path $StageRoot 'payload\kindlebridge\VERSION'
 [IO.File]::WriteAllText($PayloadVersion, "$Version`n", [Text.UTF8Encoding]::new($false))
 $DeviceBinary = Join-Path $RepositoryRoot 'target\armv7-unknown-linux-gnueabihf\release\kindlebridged'

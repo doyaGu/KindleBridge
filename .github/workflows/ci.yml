@@ -33,6 +33,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check device bundle feature boundary
+        run: cargo check --package kindlebridge-bundle --no-default-features --features activation-store,verify --locked
+
       - name: Run Rust tests
         run: cargo test --workspace --all-targets --locked
 
@@ -45,3 +48,7 @@ jobs:
       - name: Validate Windows onboarding selector
         shell: pwsh
         run: ./scripts/install-windows-winusb.ps1 -Validate
+
+      - name: Validate release metadata contract
+        shell: pwsh
+        run: ./scripts/check-release-contract.ps1
