@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
+use std::fs::File;
 use std::path::Path;
 
+use kindlebridge_bundle::{verify, BundleKind, VerifyOptions};
 use kindlebridge_schema::{
     error_codes, AppInstallParams, AppList, AppState, AppSummary, AppTargetParams, LogEntry,
-    LogSnapshot, LogTailParams, ProcessList, ProcessSignalParams, ProcessState, ProcessSummary,
-    RpcError, SerialParams, SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult,
-    SyncStatus, SyncStatusParams, TransferDirection, TransferState,
+    LogSnapshot, LogTailParams, ProcessList, ProcessSignal, ProcessSignalParams, ProcessState,
+    ProcessSummary, RpcError, SerialParams, SyncPullParams, SyncPullResult, SyncPushParams,
+    SyncPushResult, SyncStatus, SyncStatusParams, TransferDirection, TransferState,
 };
 use serde_json::json;
 
@@ -25,9 +27,16 @@ struct Transfer {
 }
 
 #[derive(Debug)]
+struct AppVersion {
+    version: String,
+    bundle_root: String,
+}
+
+#[derive(Debug)]
 struct AppRuntime {
     version: String,
-    history: Vec<String>,
+    bundle_root: String,
+    history: Vec<AppVersion>,
     state: AppState,
     pid: Option<u32>,
 }
@@ -200,31 +209,61 @@ impl RuntimeState {
     }
 
     pub(crate) fn app_install(&mut self, params: AppInstallParams) -> Result<AppSummary, RpcError> {
-        validate_app_id(&params.app_id)?;
-        if params.version.is_empty() {
-            return Err(RpcError::invalid_params("version must not be empty"));
+        validate_host_path(&params.bundle_path)?;
+        let mut bundle = File::open(&params.bundle_path)
+            .map_err(|error| host_file_error("open", &params.bundle_path, &error))?;
+        let verified = verify(&mut bundle, &VerifyOptions::default()).map_err(|error| {
+            RpcError::new(
+                error_codes::APP_INSTALL_FAILED,
+                "Application install failed",
+            )
+            .with_data(json!({
+                "stage": "verify",
+                "reason": format!("{:?}", error.code),
+                "detail": error.message,
+            }))
+        })?;
+        let envelope = &verified.inspection.envelope;
+        if envelope.kind != BundleKind::Application {
+            return Err(RpcError::new(
+                error_codes::APP_INSTALL_FAILED,
+                "Application install failed",
+            )
+            .with_data(json!({
+                "stage": "verify",
+                "reason": "bundle_kind",
+                "detail": "app install accepts application bundles only",
+            })));
         }
-        let key = (params.serial.clone(), params.app_id.clone());
+        let app_id = envelope.id.clone();
+        let version = envelope.version.clone();
+        let bundle_root = format!("{:?}", verified.inspection.header.bundle_root);
+        let key = (params.serial.clone(), app_id.clone());
         let mut app = self.apps.remove(&key).unwrap_or(AppRuntime {
-            version: params.version.clone(),
+            version: version.clone(),
+            bundle_root: bundle_root.clone(),
             history: Vec::new(),
             state: AppState::Stopped,
             pid: None,
         });
-        if app.version != params.version {
-            app.history.push(app.version.clone());
+        if app.bundle_root != bundle_root {
+            app.history.push(AppVersion {
+                version: app.version.clone(),
+                bundle_root: app.bundle_root.clone(),
+            });
             if let Some(pid) = app.pid.take() {
                 self.processes.remove(&(params.serial.clone(), pid));
             }
-            app.version = params.version;
+            app.version = version;
+            app.bundle_root = bundle_root;
             app.state = AppState::Stopped;
         }
-        let summary = app.summary(params.app_id.clone());
+        let summary = app.summary(app_id.clone());
         self.apps.insert(key, app);
         self.log(
             &params.serial,
             "info",
-            &params.app_id,
+            &app_id,
             &format!("installed {}", summary.version),
         );
         Ok(summary)
@@ -286,7 +325,7 @@ impl RuntimeState {
             .apps
             .remove(&key)
             .ok_or_else(|| app_not_found(&params.app_id))?;
-        let Some(version) = app.history.pop() else {
+        let Some(previous) = app.history.pop() else {
             self.apps.insert(key, app);
             return Err(stable_error(
                 error_codes::NO_ROLLBACK_AVAILABLE,
@@ -297,7 +336,8 @@ impl RuntimeState {
         if let Some(pid) = app.pid.take() {
             self.processes.remove(&(params.serial.clone(), pid));
         }
-        app.version = version;
+        app.version = previous.version;
+        app.bundle_root = previous.bundle_root;
         app.state = AppState::Stopped;
         let summary = app.summary(params.app_id.clone());
         self.apps.insert(key, app);
@@ -346,21 +386,20 @@ impl RuntimeState {
         &mut self,
         params: &ProcessSignalParams,
     ) -> Result<ProcessSummary, RpcError> {
-        let signal = params.signal.to_ascii_uppercase();
-        if !matches!(signal.as_str(), "TERM" | "KILL" | "HUP" | "INT") {
+        let Some(signal) = ProcessSignal::parse(&params.signal) else {
             return Err(stable_error(
                 error_codes::INVALID_SIGNAL,
                 "Invalid signal",
                 json!({ "signal": params.signal }),
             ));
-        }
+        };
         let key = (params.serial.clone(), params.pid);
         let process = self
             .processes
             .get(&key)
             .cloned()
             .ok_or_else(|| process_not_found(params.pid))?;
-        if matches!(signal.as_str(), "TERM" | "KILL") {
+        if matches!(signal, ProcessSignal::Term | ProcessSignal::Kill) {
             self.processes.remove(&key);
             if let Some(app_id) = &process.app_id {
                 if let Some(app) = self.apps.get_mut(&(params.serial.clone(), app_id.clone())) {
@@ -373,7 +412,7 @@ impl RuntimeState {
             &params.serial,
             "info",
             &process.name,
-            &format!("signal {signal} sent to {}", params.pid),
+            &format!("signal {} sent to {}", signal.name(), params.pid),
         );
         Ok(process)
     }
@@ -515,19 +554,6 @@ fn host_file_error(operation: &str, path: impl AsRef<Path>, error: &std::io::Err
         "path": path.as_ref().to_string_lossy(),
         "kind": format!("{:?}", error.kind())
     }))
-}
-
-fn validate_app_id(app_id: &str) -> Result<(), RpcError> {
-    let valid = !app_id.is_empty()
-        && app_id.len() <= 128
-        && app_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
-    if valid {
-        Ok(())
-    } else {
-        Err(RpcError::invalid_params("invalid app_id"))
-    }
 }
 
 fn stable_error(code: i64, message: &str, data: serde_json::Value) -> RpcError {

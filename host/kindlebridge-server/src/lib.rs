@@ -264,6 +264,7 @@ impl DeviceProvider for MemoryDeviceProvider {
 #[error("device provider failed: {message}")]
 pub struct ProviderError {
     message: String,
+    public_message: Option<String>,
 }
 
 impl ProviderError {
@@ -271,6 +272,16 @@ impl ProviderError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            public_message: None,
+        }
+    }
+
+    #[must_use]
+    pub fn public(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            message: message.clone(),
+            public_message: Some(message),
         }
     }
 }
@@ -451,9 +462,15 @@ fn require_empty_params(params: Option<&Value>) -> Result<(), RpcError> {
     }
 }
 
-fn provider_rpc_error(_error: ProviderError) -> RpcError {
-    // Provider details can contain host paths or transport internals. Keep the public error stable.
-    RpcError::new(error_codes::SERVER_NOT_READY, "Server not ready")
+fn provider_rpc_error(error: ProviderError) -> RpcError {
+    // Most provider details can contain host paths or transport internals. Only errors
+    // explicitly constructed as public are safe and actionable at the CLI boundary.
+    RpcError::new(
+        error_codes::SERVER_NOT_READY,
+        error
+            .public_message
+            .unwrap_or_else(|| "Server not ready".to_owned()),
+    )
 }
 
 /// Serves framed JSON-RPC messages until clean EOF or a framing error.
@@ -986,6 +1003,22 @@ mod tests {
     }
 
     #[test]
+    fn provider_errors_are_private_unless_marked_for_the_cli() {
+        let private = provider_rpc_error(ProviderError::new("C:\\private\\transport-detail"));
+        assert_eq!(private.code, error_codes::SERVER_NOT_READY);
+        assert_eq!(private.message, "Server not ready");
+
+        let public = provider_rpc_error(ProviderError::public(
+            "Incompatible KindleBridge daemon protocol 2; host requires 3",
+        ));
+        assert_eq!(public.code, error_codes::SERVER_NOT_READY);
+        assert_eq!(
+            public.message,
+            "Incompatible KindleBridge daemon protocol 2; host requires 3"
+        );
+    }
+
+    #[test]
     fn shell_open_streams_data_exit_and_close_notifications() {
         let shell = Arc::new(FakeShell::new([
             DeviceShellEvent::Packet(ShellPacket::Stdout(b"out\0".to_vec())),
@@ -1198,11 +1231,32 @@ mod tests {
     #[test]
     fn failed_rollback_preserves_the_installed_app() {
         let provider = provider();
+        let bundle = std::env::temp_dir().join(format!(
+            "kindlebridge-memory-app-{}.kbb",
+            std::process::id()
+        ));
+        let mut config = kindlebridge_bundle::BuildConfig::new(
+            kindlebridge_bundle::BundleKind::Application,
+            "org.example.app",
+            "1.0.0",
+            1,
+            "kindlehf",
+        );
+        config.entrypoints =
+            std::collections::BTreeMap::from([("main".to_owned(), "bin/app".to_owned())]);
+        let mut builder = kindlebridge_bundle::BundleBuilder::new(config);
+        builder.add_file("bin/app", b"app".to_vec(), true).unwrap();
+        fs::write(
+            &bundle,
+            builder
+                .build(&ed25519_dalek::SigningKey::from_bytes(&[9; 32]))
+                .unwrap(),
+        )
+        .unwrap();
         provider
             .app_install(AppInstallParams {
                 serial: "KT6-TEST".to_owned(),
-                app_id: "org.example.app".to_owned(),
-                version: "1.0.0".to_owned(),
+                bundle_path: bundle.to_string_lossy().into_owned(),
             })
             .unwrap();
         let error = provider
@@ -1222,5 +1276,6 @@ mod tests {
                 .len(),
             1
         );
+        fs::remove_file(bundle).unwrap();
     }
 }

@@ -11,6 +11,7 @@ blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
 getrandom = "0.2"
 interprocess = "=2.4.2"
+kindlebridge-bundle = { path = "../../crates/kindlebridge-bundle", default-features = false, features = ["verify"] }
 kindlebridge-schema = { path = "../../crates/kindlebridge-schema" }
 kindlebridge-transport = { path = "../../crates/kindlebridge-transport" }
 kindlebridge-transport-tcp = { path = "../../crates/kindlebridge-transport-tcp" }
@@ -21,7 +22,9 @@ serde_json = "1.0"
 thiserror = "2.0"
 
 [dev-dependencies]
+ed25519-dalek = "2.1"
 kindlebridged = { path = "../../device/kindlebridged" }
+kindlebridge-bundle = { path = "../../crates/kindlebridge-bundle", features = ["builder"] }
 
 [lints]
 workspace = true

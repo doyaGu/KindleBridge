@@ -18,8 +18,7 @@ use interprocess::local_socket::{
     prelude::*, GenericFilePath, GenericNamespaced, SendHalf, Stream,
 };
 use kindlebridge::{
-    execute, execute_with_status, Cli, CliError, CommandOutput, ServerCommand, ShellArgs,
-    TopLevelCommand,
+    execute_with_status, Cli, CliError, CommandOutput, ServerCommand, ShellArgs, TopLevelCommand,
 };
 use kindlebridge_schema::device_protocol::{ShellMode, ShellOpen, TerminalSize, SHELL_V2_FEATURE};
 use kindlebridge_schema::{
@@ -32,6 +31,9 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const SERVER_ENDPOINT_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const INPUT_POLL: Duration = Duration::from_millis(50);
 const MAX_INPUT_PACKET: usize = kindlebridge_schema::shell_protocol::MAX_SHELL_PACKET_PAYLOAD;
 
@@ -113,7 +115,11 @@ fn run(cli: &Cli) -> Result<CommandOutput, RunError> {
                     exit_code: 0,
                 });
             };
-            return run_rpc(stream, cli);
+            let output = run_rpc(stream, cli)?;
+            if matches!(args.command, ServerCommand::Stop) {
+                wait_for_local_server_shutdown()?;
+            }
+            return Ok(output);
         }
     }
 
@@ -167,6 +173,9 @@ fn run_stdio_rpc(cli: &Cli) -> Result<CommandOutput, RunError> {
             format!("server exited with {status}: {detail}")
         }));
     }
+    if std::env::var_os("KINDLEBRIDGE_TRACE_SERVER_STDERR").is_some() && !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
     result
 }
 
@@ -183,20 +192,10 @@ fn run_shell(cli: &Cli, args: &ShellArgs) -> Result<CommandOutput, RunError> {
         .iter()
         .any(|feature| feature == SHELL_V2_FEATURE)
     {
-        eprintln!(
-            "\x1b[1;33mwarning:\x1b[0m device daemon lacks shell.v2; upgrade kindlebridged for PTY support"
-        );
-        let stream = connect_or_start(cli)?;
-        let (reader, writer) = stream.split();
-        let mut client = RpcClient::new(BufReader::new(reader), BufWriter::new(writer));
-        if args.command.is_some() {
-            return execute_with_status(&mut client, &cli.command, cli.json)
-                .map_err(RunError::Command);
-        }
-        return run_legacy_repl(&mut client, args, cli.json).map(|output| CommandOutput {
-            output,
-            exit_code: 0,
-        });
+        return Err(RunError::Message(
+            "incompatible device daemon: shell.v2 is required; install the matching KindleBridge package"
+                .to_owned(),
+        ));
     }
     if cli.json {
         return Err(RunError::Arguments(
@@ -798,7 +797,45 @@ fn connect_or_start(cli: &Cli) -> Result<Stream, RunError> {
                 "shared local server startup timed out".to_owned(),
             ));
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(SERVER_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_local_server_shutdown() -> Result<(), RunError> {
+    // On Windows, a named-pipe connect can fail with ERROR_PIPE_BUSY while the old
+    // listener still exists. Require a short, continuous unavailable period so
+    // the next CLI cannot land in the server's final accept/exit window.
+    if wait_until_stable(SERVER_STOP_TIMEOUT, SERVER_ENDPOINT_QUIET_PERIOD, || {
+        connect_local().is_err()
+    }) {
+        Ok(())
+    } else {
+        Err(RunError::Startup(
+            "shared local server did not stop within 5 seconds".to_owned(),
+        ))
+    }
+}
+
+fn wait_until_stable(
+    timeout: Duration,
+    stable_for: Duration,
+    mut condition: impl FnMut() -> bool,
+) -> bool {
+    let started = Instant::now();
+    let mut stable_since = None;
+    loop {
+        if condition() {
+            let stable_since = stable_since.get_or_insert_with(Instant::now);
+            if stable_since.elapsed() >= stable_for {
+                return true;
+            }
+        } else {
+            stable_since = None;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        thread::sleep(SERVER_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
     }
 }
 
@@ -885,56 +922,6 @@ fn sanitize_endpoint_component(value: &str) -> String {
     }
 }
 
-fn run_legacy_repl<R: BufRead, W: Write>(
-    client: &mut RpcClient<R, W>,
-    args: &ShellArgs,
-    json: bool,
-) -> Result<String, RunError> {
-    if json {
-        return Err(RunError::Arguments(
-            "interactive shell does not support --json".to_owned(),
-        ));
-    }
-    let stdin = io::stdin();
-    let mut input = stdin.lock();
-    let mut line = String::new();
-    loop {
-        print!("kindlebridge:{}$ ", args.serial);
-        io::stdout()
-            .flush()
-            .map_err(|error| RunError::Message(error.to_string()))?;
-        line.clear();
-        if input
-            .read_line(&mut line)
-            .map_err(|error| RunError::Message(error.to_string()))?
-            == 0
-        {
-            break;
-        }
-        let command = line.trim_end_matches(['\r', '\n']);
-        if matches!(command.trim(), "exit" | "quit") {
-            break;
-        }
-        if command.trim().is_empty() {
-            continue;
-        }
-        let legacy = TopLevelCommand::Shell(ShellArgs {
-            serial: args.serial.clone(),
-            command: Some(command.to_owned()),
-            tty: 0,
-            no_tty: true,
-            no_stdin: true,
-            escape: "none".to_owned(),
-            ndjson: false,
-        });
-        let output = execute(client, &legacy, false).map_err(RunError::Command)?;
-        if !output.is_empty() {
-            println!("{output}");
-        }
-    }
-    Ok("shell closed".to_owned())
-}
-
 fn print_error(json_output: bool, error: &RunError) {
     if json_output {
         eprintln!("{}", json_error(error));
@@ -999,6 +986,7 @@ fn command_error_code(error: &CliError) -> &'static str {
         CliError::RemotePathOutsideSyncRoot(_) => "INVALID_REMOTE_PATH",
         CliError::CurrentDirectory(_) => "HOST_IO_ERROR",
         CliError::InvalidUpdateBinary(_) => "INVALID_UPDATE_BINARY",
+        CliError::StreamingShellRequired => "STREAMING_SHELL_REQUIRED",
         CliError::UpdateRejected { .. } => "UPDATE_REJECTED",
     }
 }
@@ -1006,6 +994,25 @@ fn command_error_code(error: &CliError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_wait_does_not_return_while_the_old_endpoint_accepts_connections() {
+        let mut attempts = 0;
+        assert!(wait_until_stable(
+            Duration::from_secs(1),
+            Duration::ZERO,
+            || {
+                attempts += 1;
+                attempts >= 3
+            }
+        ));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn shutdown_wait_is_bounded() {
+        assert!(!wait_until_stable(Duration::ZERO, Duration::ZERO, || false));
+    }
 
     #[test]
     fn escape_filter_closes_only_for_line_leading_tilde_dot() {

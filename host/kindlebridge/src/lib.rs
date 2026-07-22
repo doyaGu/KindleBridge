@@ -154,7 +154,7 @@ pub enum SyncCommand {
         local_path: String,
         /// Relative device path, or an absolute path below `/mnt/us/kindlebridge-data`.
         remote_path: String,
-        /// Transfer frame size; the 1 MiB default is recommended for USB. Values below 64 KiB are for diagnostics.
+        /// Transfer frame size; the 256 KiB default balances USB throughput and interactive latency. Values below 64 KiB are for diagnostics.
         #[arg(long, default_value_t = DEFAULT_SYNC_BLOCK_SIZE as usize)]
         block_size: usize,
         /// Continue a previously interrupted transfer by its transfer ID.
@@ -169,7 +169,7 @@ pub enum SyncCommand {
         remote_path: String,
         /// Local destination file, which must not already exist.
         local_path: String,
-        /// Transfer frame size; the 1 MiB default is recommended for USB. Values below 64 KiB are for diagnostics.
+        /// Transfer frame size; the 256 KiB default balances USB throughput and interactive latency. Values below 64 KiB are for diagnostics.
         #[arg(long, default_value_t = DEFAULT_SYNC_BLOCK_SIZE)]
         block_size: u32,
         /// Continue a previously interrupted transfer by its transfer ID.
@@ -188,10 +188,10 @@ pub struct AppArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AppCommand {
+    /// Verify, upload, and atomically install a local KBB application bundle.
     Install {
         serial: String,
-        app_id: String,
-        version: String,
+        bundle_path: String,
     },
     Start {
         serial: String,
@@ -304,7 +304,7 @@ pub enum CliError {
     Rpc(#[from] ClientError),
     #[error("server returned an invalid {kind} result")]
     InvalidResult { kind: &'static str },
-    #[error("block size must be between 1 and 1048576 bytes; omit --block-size for the recommended USB default")]
+    #[error("block size must be between 1 and 1048576 bytes; omit --block-size for the latency-safe USB default")]
     InvalidBlockSize,
     #[error("device path must be relative or below {DEVICE_SYNC_ROOT}: {0}")]
     RemotePathOutsideSyncRoot(String),
@@ -312,12 +312,14 @@ pub enum CliError {
     CurrentDirectory(#[source] std::io::Error),
     #[error("invalid update binary: {0}")]
     InvalidUpdateBinary(String),
+    #[error("shell requires the streaming shell.v2 path through the shared local server")]
+    StreamingShellRequired,
     #[error("device rejected the {step} step: {message}")]
     UpdateRejected { step: &'static str, message: String },
 }
 
-const DEVICE_LAUNCHER: &str = "/mnt/us/kindlebridge/bin/kindlebridge-launcher";
-const DEVICE_RUNTIME_ROOT: &str = "/mnt/us/kindlebridge/runtime";
+const DEVICE_LAUNCHER: &str = "/var/local/kindlebridge/control/bin/kindlebridge-launcher";
+const DEVICE_RUNTIME_ROOT: &str = "/var/local/kindlebridge/control/runtime";
 const DEVICE_SYNC_ROOT: &str = "/mnt/us/kindlebridge-data";
 const MAX_UPDATE_BINARY_SIZE: u64 = 32 * 1024 * 1024;
 
@@ -345,17 +347,7 @@ pub fn execute_with_status<C: RpcCaller>(
         TopLevelCommand::Exec(args) => {
             execute_exec(caller, &args.serial, args.argv.clone(), 30_000, json_output)
         }
-        TopLevelCommand::Shell(args) => execute_exec(
-            caller,
-            &args.serial,
-            vec![
-                "/bin/sh".to_owned(),
-                "-lc".to_owned(),
-                args.command.clone().unwrap_or_default(),
-            ],
-            30_000,
-            json_output,
-        ),
+        TopLevelCommand::Shell(_) => Err(CliError::StreamingShellRequired),
         _ => execute(caller, command, json_output).map(CommandOutput::success),
     }
 }
@@ -470,18 +462,7 @@ pub fn execute<C: RpcCaller>(
             json_output,
         )
         .map(|result| result.output),
-        TopLevelCommand::Shell(args) => execute_exec(
-            caller,
-            &args.serial,
-            vec![
-                "/bin/sh".to_owned(),
-                "-lc".to_owned(),
-                args.command.clone().unwrap_or_default(),
-            ],
-            30_000,
-            json_output,
-        )
-        .map(|result| result.output),
+        TopLevelCommand::Shell(_) => Err(CliError::StreamingShellRequired),
         TopLevelCommand::Sync(args) => execute_sync(caller, &args.command, json_output),
         TopLevelCommand::Daemon(args) => execute_daemon(caller, &args.command, json_output),
         TopLevelCommand::App(args) => execute_app(caller, &args.command, json_output),
@@ -813,16 +794,15 @@ fn execute_app<C: RpcCaller>(
     match command {
         AppCommand::Install {
             serial,
-            app_id,
-            version,
+            bundle_path,
         } => {
+            let bundle_path = normalize_host_path(bundle_path)?;
             let (value, app): (_, AppSummary) = call_typed(
                 caller,
                 methods::APP_INSTALL,
                 &AppInstallParams {
                     serial: serial.clone(),
-                    app_id: app_id.clone(),
-                    version: version.clone(),
+                    bundle_path,
                 },
                 "app install",
             )?;
@@ -1051,9 +1031,9 @@ fn format_app_result(
 
 fn format_app(app: &AppSummary) -> String {
     let state = match app.state {
-        AppState::Unknown => "unknown".to_owned(),
         AppState::Stopped => "stopped".to_owned(),
         AppState::Running => format!("running pid={}", app.pid.unwrap_or(0)),
+        AppState::Failed => "failed".to_owned(),
     };
     format!("{}\t{}\t{}", app.app_id, app.version, state)
 }
@@ -1173,17 +1153,12 @@ mod tests {
     }
 
     #[test]
-    fn shell_command_uses_the_device_shell_without_host_reparsing() {
+    fn shell_command_cannot_fall_back_to_captured_exec() {
         let mut caller = RecordingCaller {
             calls: Vec::new(),
-            replies: VecDeque::from([json!({
-                "exit_code": 0,
-                "stdout": "shell-ok\n",
-                "stderr": "",
-                "duration_ms": 1
-            })]),
+            replies: VecDeque::new(),
         };
-        let output = execute(
+        let error = execute(
             &mut caller,
             &TopLevelCommand::Shell(ShellArgs {
                 serial: "KT6-TEST".to_owned(),
@@ -1196,11 +1171,9 @@ mod tests {
             }),
             false,
         )
-        .unwrap();
-        assert_eq!(output, "shell-ok");
-        let params = caller.calls[0].1.as_ref().unwrap();
-        assert_eq!(params["serial"], "KT6-TEST");
-        assert_eq!(params["argv"], json!(["/bin/sh", "-lc", "printf shell-ok"]));
+        .unwrap_err();
+        assert!(matches!(error, CliError::StreamingShellRequired));
+        assert!(caller.calls.is_empty());
     }
 
     #[test]
@@ -1231,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_uses_the_high_throughput_block_size_by_default() {
+    fn sync_uses_the_latency_safe_block_size_by_default() {
         let cli = Cli::try_parse_from([
             "kindlebridge",
             "sync",
@@ -1247,7 +1220,34 @@ mod tests {
         else {
             panic!("expected sync push command");
         };
-        assert_eq!(block_size, 1024 * 1024);
+        assert_eq!(block_size, 256 * 1024);
+    }
+
+    #[test]
+    fn app_install_cli_takes_one_bundle_instead_of_claimed_identity_fields() {
+        let cli = Cli::try_parse_from(["kindlebridge", "app", "install", "KT6-TEST", "reader.kbb"])
+            .unwrap();
+        let TopLevelCommand::App(AppArgs {
+            command:
+                AppCommand::Install {
+                    serial,
+                    bundle_path,
+                },
+        }) = cli.command
+        else {
+            panic!("expected app install command");
+        };
+        assert_eq!(serial, "KT6-TEST");
+        assert_eq!(bundle_path, "reader.kbb");
+        assert!(Cli::try_parse_from([
+            "kindlebridge",
+            "app",
+            "install",
+            "KT6-TEST",
+            "org.example.forged",
+            "99.0.0",
+        ])
+        .is_err());
     }
 
     #[test]

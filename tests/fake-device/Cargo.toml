@@ -11,7 +11,9 @@ kindlebridge-server = { path = "../../host/kindlebridge-server" }
 serde_json = "1.0"
 
 [dev-dependencies]
+ed25519-dalek = "2.1"
 kindlebridge = { path = "../../host/kindlebridge" }
+kindlebridge-bundle = { path = "../../crates/kindlebridge-bundle", features = ["builder"] }
 
 [lints]
 workspace = true

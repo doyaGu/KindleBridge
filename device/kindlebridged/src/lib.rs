@@ -66,7 +66,7 @@ pub const SERVICES: &[ServiceDefinition] = &[
         available_on_kindlehf: true,
     },
     ServiceDefinition {
-        name: "shell.v1",
+        name: "rpc.v1",
         required_grant: Grant::ShellUser,
         available_on_kindlehf: true,
     },
@@ -251,7 +251,7 @@ mod tests {
             Some(ServiceStatus::Supported)
         );
         assert_eq!(
-            daemon.service_status(&session, "shell.v1"),
+            daemon.service_status(&session, "rpc.v1"),
             Some(ServiceStatus::Disabled)
         );
     }

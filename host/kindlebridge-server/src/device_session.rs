@@ -8,13 +8,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use kindlebridge_bundle::{verify, BundleKind, VerifyOptions};
 use kindlebridge_schema::device_protocol::{
-    is_valid_session_id, is_valid_transfer_id, DeviceCall, DeviceHello, DeviceReply, HostHello,
-    ShellOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE, APP_RESTART_FEATURE,
-    APP_ROLLBACK_FEATURE, APP_START_FEATURE, APP_STOP_FEATURE, APP_UNINSTALL_FEATURE,
-    DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, LEGACY_RPC_SERVICE, LOG_TAIL_FEATURE,
-    MAX_HOST_TO_DEVICE_PAYLOAD, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION,
-    SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE, SYNC_SERVICE,
+    is_valid_session_id, is_valid_transfer_id, DeviceAppInstallParams, DeviceCall, DeviceHello,
+    DeviceReply, HostHello, ShellOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE,
+    APP_LIST_FEATURE, APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE, APP_START_FEATURE,
+    APP_STOP_FEATURE, APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW,
+    LOG_TAIL_FEATURE, MAX_HOST_TO_DEVICE_PAYLOAD, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE,
+    PROTOCOL_VERSION, RPC_SERVICE, SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE,
+    SYNC_FEATURE, SYNC_SERVICE,
 };
 #[cfg(test)]
 use kindlebridge_schema::device_protocol::{ServiceAccept, ServiceOpen, SYNC_CREDIT_BATCH_SIZE};
@@ -54,9 +56,9 @@ const SESSION_IO_TIMEOUT: Duration = Duration::from_secs(10 * 60 + 30);
 // Match the device's order-2 FunctionFS request size. Larger host transfers
 // force the KT6 4.9 gadget stack into fragile high-order page allocations.
 const USB_TRANSFER_SIZE: usize = 16 * 1024;
-const USB_READ_QUEUE_DEPTH: usize = 4;
 // Four order-2 requests keep 64 KiB in flight without asking the KT6 gadget
 // stack for larger, fragile high-order allocations.
+const USB_READ_QUEUE_DEPTH: usize = 4;
 const USB_WRITE_QUEUE_DEPTH: usize = 4;
 const USB_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const USB_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -124,7 +126,16 @@ impl ConnectedDeviceProvider {
                     devices: Vec::new(),
                 });
             }
-            Err(error) => return Err(ProviderError::new(error.to_string())),
+            Err(LinkError::IncompatibleProtocol { device, host }) => {
+                return Err(ProviderError::public(format!(
+                    "Incompatible KindleBridge daemon protocol {device}; host requires {host}. Install the matching KindleBridge package"
+                )));
+            }
+            Err(_error) => {
+                return Err(ProviderError::public(format!(
+                    "Could not establish KindleBridge protocol {PROTOCOL_VERSION}. Ensure development mode is active and install the matching KindleBridge package"
+                )));
+            }
         };
         let mut features = hello.features;
         features.sort();
@@ -365,12 +376,69 @@ impl DeviceProvider for ConnectedDeviceProvider {
     }
 
     fn app_install(&self, params: AppInstallParams) -> Result<AppSummary, RpcError> {
-        self.remote_call(
-            &params.serial,
-            APP_INSTALL_FEATURE,
-            kindlebridge_schema::methods::APP_INSTALL,
-            &params,
-        )
+        let device = self.require_feature(&params.serial, APP_INSTALL_FEATURE)?;
+        self.require_feature(&params.serial, SYNC_FEATURE)?;
+        validate_host_path(&params.bundle_path)?;
+        let mut file = File::open(&params.bundle_path)
+            .map_err(|error| host_file_error("read", &params.bundle_path, &error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| host_file_error("stat", &params.bundle_path, &error))?;
+        if !metadata.is_file() {
+            return Err(RpcError::invalid_params("bundle_path must name a file"));
+        }
+        let total_size = metadata.len();
+        verify(&mut file, &VerifyOptions::default())
+            .map_err(|error| host_bundle_error("verify", &error))
+            .and_then(|verified| {
+                if verified.inspection.envelope.kind == BundleKind::Application {
+                    Ok(())
+                } else {
+                    Err(RpcError::new(
+                        error_codes::APP_INSTALL_FAILED,
+                        "Application install failed",
+                    )
+                    .with_data(serde_json::json!({
+                        "stage": "host_verify",
+                        "reason": "bundle_kind",
+                        "detail": "app install accepts application bundles only",
+                    })))
+                }
+            })?;
+        let file_hash = hash_file(&mut file, total_size)?;
+        let remote_path = format!("packages/kbb/{file_hash}.kbb");
+        let sync_params = SyncPushParams {
+            serial: params.serial.clone(),
+            local_path: params.bundle_path,
+            remote_path: remote_path.clone(),
+            transfer_id: None,
+            block_size: kindlebridge_schema::DEFAULT_SYNC_BLOCK_SIZE,
+        };
+        let pushed = device
+            .session
+            .sync_push(&sync_params, &mut file, total_size, &file_hash)
+            .map_err(link_rpc_error)?;
+        if pushed.state != TransferState::Complete || pushed.accepted_offset != total_size {
+            return Err(RpcError::new(
+                error_codes::INVALID_STATE,
+                "Bundle upload did not complete",
+            )
+            .with_data(serde_json::json!({
+                "transfer_id": pushed.transfer_id,
+                "accepted_offset": pushed.accepted_offset,
+                "total_size": total_size,
+            })));
+        }
+        let device_params = DeviceAppInstallParams {
+            serial: params.serial,
+            remote_path,
+            file_hash,
+        };
+        let value = device
+            .session
+            .call(kindlebridge_schema::methods::APP_INSTALL, &device_params)
+            .map_err(link_rpc_error)?;
+        serde_json::from_value(value).map_err(|_| RpcError::internal_error())
     }
 
     fn app_start(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
@@ -528,7 +596,17 @@ impl ActorDeviceSession {
                     "initial probe failed after {} ms: {error}",
                     initial_started.elapsed().as_millis()
                 ));
-                Self::connect_usb_attempt(criteria, true)
+                let recovery_started = Instant::now();
+                let result = Self::connect_usb_attempt(criteria, true);
+                trace_usb_recovery(format_args!(
+                    "recovery attempt finished after {} ms ({})",
+                    recovery_started.elapsed().as_millis(),
+                    result
+                        .as_ref()
+                        .map(|_| "ok".to_owned())
+                        .unwrap_or_else(|error| format!("error: {error}"))
+                ));
+                result
             }
             result => result,
         }
@@ -542,13 +620,18 @@ impl ActorDeviceSession {
         let transport = kindlebridge_transport_usb::open(criteria, usb_buffer_config())?;
         let (mut reader, mut writer) = transport.split();
         if recover_abandoned_frame {
+            trace_usb_recovery(format_args!("recovery transport opened"));
             writer.set_write_timeout(USB_RECOVERY_TIMEOUT);
             write_usb_recovery_exchange(&mut reader, &mut writer, limits)?;
+            trace_usb_recovery(format_args!("recovery exchange finished"));
             reader.set_read_timeout(USB_RECOVERY_TIMEOUT);
         }
         let mut stream = SplitFrameStream::new(reader, writer, transport_config)?;
         let session_id = new_session_id()?;
         let (state, hello) = negotiate(&mut stream, limits, recover_abandoned_frame, &session_id)?;
+        if recover_abandoned_frame {
+            trace_usb_recovery(format_args!("recovery HELLO finished"));
+        }
         stream.reader_mut().set_read_timeout(Duration::MAX);
         stream.writer_mut().set_write_timeout(Duration::MAX);
         let (reader, writer) = stream.into_inner();
@@ -559,17 +642,29 @@ impl ActorDeviceSession {
     }
 
     fn call(&self, method: &str, params: &impl Serialize) -> Result<Value, LinkError> {
-        let mut stream = self.connection.open(
-            LEGACY_RPC_SERVICE,
-            DEFAULT_STREAM_WINDOW,
-            TrafficClass::Bulk,
-        )?;
+        let mut stream = self
+            .connection
+            .open(RPC_SERVICE, DEFAULT_STREAM_WINDOW, TrafficClass::Bulk)
+            .map_err(|error| {
+                trace_usb_recovery(format_args!("RPC {method} OPEN failed: {error:?}"));
+                LinkError::Connection(error)
+            })?;
+        trace_usb_recovery(format_args!(
+            "RPC {method} OPEN accepted as stream {}",
+            stream.id()
+        ));
         let call = DeviceCall {
             method: method.to_owned(),
             params: serde_json::to_value(params)?,
         };
-        stream.send_data(encode(&call)?, true)?;
-        let response = actor_data(&mut stream)?;
+        stream.send_data(encode(&call)?, true).map_err(|error| {
+            trace_usb_recovery(format_args!("RPC {method} DATA failed: {error:?}"));
+            LinkError::Connection(error)
+        })?;
+        let response = actor_data(&mut stream).map_err(|error| {
+            trace_usb_recovery(format_args!("RPC {method} response failed: {error:?}"));
+            error
+        })?;
         if response.header.flags & FLAG_END_STREAM == 0 {
             return Err(LinkError::UnexpectedFrame(
                 "device reply did not end the stream",
@@ -684,6 +779,7 @@ impl ActorDeviceSession {
     }
 
     fn sync_pull(&self, params: &SyncPullParams) -> Result<SyncPullResult, LinkError> {
+        let started = Instant::now();
         let mut stream =
             self.connection
                 .open(SYNC_SERVICE, DEFAULT_STREAM_WINDOW, TrafficClass::Bulk)?;
@@ -716,6 +812,12 @@ impl ActorDeviceSession {
             SyncReply::Failure { error } => return Err(LinkError::Remote(error)),
             _ => return Err(LinkError::UnexpectedFrame("invalid sync pull READY")),
         };
+        let ready_at = started.elapsed();
+        trace_sync(format_args!(
+            "pull {transfer_id}: READY after {:.3}s (offset {remote_offset}, total {total_size}, block {})",
+            ready_at.as_secs_f64(),
+            params.block_size
+        ));
         if !is_valid_transfer_id(&transfer_id)
             || params
                 .transfer_id
@@ -750,6 +852,13 @@ impl ActorDeviceSession {
                 break;
             }
         }
+        let payload_at = started.elapsed();
+        trace_sync(format_args!(
+            "pull {transfer_id}: received {} bytes in {:.3}s after READY ({:.3}s total)",
+            received.saturating_sub(remote_offset),
+            payload_at.saturating_sub(ready_at).as_secs_f64(),
+            payload_at.as_secs_f64()
+        ));
         if received != total_size || hasher.finalize().to_hex().as_str() != file_hash {
             output.set_len(0)?;
             output.sync_all()?;
@@ -762,6 +871,12 @@ impl ActorDeviceSession {
         output.sync_all()?;
         drop(output);
         commit_host_file(&staging, Path::new(&params.local_path))?;
+        let committed_at = started.elapsed();
+        trace_sync(format_args!(
+            "pull {transfer_id}: host durability and commit took {:.3}s ({:.3}s total)",
+            committed_at.saturating_sub(payload_at).as_secs_f64(),
+            committed_at.as_secs_f64()
+        ));
         actor_close(&mut stream)?;
         Ok(SyncPullResult {
             transfer_id,
@@ -885,7 +1000,22 @@ struct UsbActorSource(FrameReader<UsbReader>);
 
 impl ActorFrameSource for UsbActorSource {
     fn read_frame(&mut self) -> Result<Frame, String> {
-        self.0.read_frame().map_err(|error| error.to_string())
+        self.0
+            .read_frame()
+            .inspect(|frame| {
+                trace_usb_recovery(format_args!(
+                    "actor inbound {:?} stream={} sequence={} flags={:#x} bytes={}",
+                    frame.header.command,
+                    frame.header.stream_id,
+                    frame.header.sequence,
+                    frame.header.flags,
+                    frame.header.payload_length
+                ));
+            })
+            .map_err(|error| {
+                trace_usb_recovery(format_args!("actor read failed: {error}"));
+                error.to_string()
+            })
     }
 }
 
@@ -893,11 +1023,25 @@ struct UsbActorSink(FrameWriter<UsbWriter>);
 
 impl ActorFrameSink for UsbActorSink {
     fn write_frame(&mut self, frame: &Frame) -> Result<(), String> {
-        self.0.write_frame(frame).map_err(|error| error.to_string())
+        trace_usb_recovery(format_args!(
+            "actor outbound {:?} stream={} sequence={} flags={:#x} bytes={}",
+            frame.header.command,
+            frame.header.stream_id,
+            frame.header.sequence,
+            frame.header.flags,
+            frame.header.payload_length
+        ));
+        self.0.write_frame(frame).map_err(|error| {
+            trace_usb_recovery(format_args!("actor write failed: {error}"));
+            error.to_string()
+        })
     }
 
     fn flush(&mut self) -> Result<(), String> {
-        self.0.flush().map_err(|error| error.to_string())
+        self.0.flush().map_err(|error| {
+            trace_usb_recovery(format_args!("actor flush failed: {error}"));
+            error.to_string()
+        })
     }
 }
 
@@ -1084,7 +1228,7 @@ impl DeviceSession {
                 stream_id,
                 0,
                 encode(&ServiceOpen {
-                    service: LEGACY_RPC_SERVICE.to_owned(),
+                    service: RPC_SERVICE.to_owned(),
                 })?,
             )?,
             FrameContext::default(),
@@ -1594,6 +1738,12 @@ fn trace_usb_recovery(arguments: std::fmt::Arguments<'_>) {
     }
 }
 
+fn trace_sync(arguments: std::fmt::Arguments<'_>) {
+    if std::env::var_os("KINDLEBRIDGE_TRACE_SYNC").is_some() {
+        eprintln!("kindlebridge-server: sync: {arguments}");
+    }
+}
+
 fn usb_buffer_config() -> BufferConfig {
     BufferConfig {
         transfer_size: USB_TRANSFER_SIZE,
@@ -1652,6 +1802,18 @@ fn hash_file(file: &mut File, length: u64) -> Result<String, RpcError> {
     hash_prefix(file, length)
         .map(|hasher| hasher.finalize().to_hex().to_string())
         .map_err(|_| RpcError::new(error_codes::INVALID_STATE, "Host file could not be hashed"))
+}
+
+fn host_bundle_error(stage: &str, error: &kindlebridge_bundle::Error) -> RpcError {
+    RpcError::new(
+        error_codes::APP_INSTALL_FAILED,
+        "Application install failed",
+    )
+    .with_data(serde_json::json!({
+        "stage": format!("host_{stage}"),
+        "reason": format!("{:?}", error.code),
+        "detail": error.message,
+    }))
 }
 
 fn hash_prefix(file: &mut File, length: u64) -> Result<blake3::Hasher, LinkError> {
@@ -1742,8 +1904,13 @@ fn next_sequence(sequence: u32) -> Result<u32, LinkError> {
 }
 
 fn validate_device_hello(hello: &DeviceHello, expected_session_id: &str) -> Result<(), LinkError> {
-    if hello.protocol_version != PROTOCOL_VERSION
-        || !is_valid_session_id(&hello.session_id)
+    if hello.protocol_version != PROTOCOL_VERSION {
+        return Err(LinkError::IncompatibleProtocol {
+            device: hello.protocol_version,
+            host: PROTOCOL_VERSION,
+        });
+    }
+    if !is_valid_session_id(&hello.session_id)
         || hello.session_id != expected_session_id
         || hello.serial.is_empty()
         || hello.model.is_empty()
@@ -1977,6 +2144,8 @@ enum LinkError {
     },
     #[error("device HELLO is incompatible")]
     InvalidHello,
+    #[error("incompatible device protocol {device}; host requires {host}")]
+    IncompatibleProtocol { device: u32, host: u32 },
     #[error("a USB session identifier could not be generated")]
     SessionIdUnavailable,
     #[cfg(test)]
@@ -2027,6 +2196,27 @@ mod tests {
 
     const TEST_SESSION_ID: &str = "000102030405060708090a0b0c0d0e0f";
     const STALE_SESSION_ID: &str = "f0e0d0c0b0a090807060504030201000";
+
+    #[test]
+    fn rejects_a_mismatched_device_protocol() {
+        let hello = DeviceHello {
+            protocol_version: PROTOCOL_VERSION - 1,
+            session_id: TEST_SESSION_ID.to_owned(),
+            serial: "KT6-PROTOCOL-TEST".to_owned(),
+            model: "KT6".to_owned(),
+            firmware: "5.17.1.0.4".to_owned(),
+            target: "kindlehf".to_owned(),
+            features: Vec::new(),
+            initial_connection_window: DEFAULT_CONNECTION_WINDOW,
+        };
+        assert!(matches!(
+            validate_device_hello(&hello, TEST_SESSION_ID),
+            Err(LinkError::IncompatibleProtocol {
+                device,
+                host
+            }) if device == PROTOCOL_VERSION - 1 && host == PROTOCOL_VERSION
+        ));
+    }
 
     #[test]
     fn usb_bulk_io_bounds_the_complete_initial_handshake() {
@@ -2535,10 +2725,17 @@ mod tests {
         assert_eq!(
             provider.features("KT6-LINK").unwrap().unwrap().features,
             vec![
+                kindlebridge_schema::device_protocol::APP_INSTALL_FEATURE,
                 kindlebridge_schema::device_protocol::APP_LIST_FEATURE,
+                kindlebridge_schema::device_protocol::APP_RESTART_FEATURE,
+                kindlebridge_schema::device_protocol::APP_ROLLBACK_FEATURE,
+                kindlebridge_schema::device_protocol::APP_START_FEATURE,
+                kindlebridge_schema::device_protocol::APP_STOP_FEATURE,
+                kindlebridge_schema::device_protocol::APP_UNINSTALL_FEATURE,
                 kindlebridge_schema::device_protocol::EXEC_FEATURE,
                 kindlebridge_schema::device_protocol::LOG_TAIL_FEATURE,
                 kindlebridge_schema::device_protocol::PROCESS_LIST_FEATURE,
+                kindlebridge_schema::device_protocol::PROCESS_SIGNAL_FEATURE,
                 kindlebridge_schema::device_protocol::SHELL_V2_FEATURE,
                 kindlebridge_schema::device_protocol::SYNC_FEATURE,
             ]
@@ -2565,17 +2762,13 @@ mod tests {
             .unwrap()
             .entries
             .is_empty());
-        let unsupported = provider
+        let missing = provider
             .app_start(&AppTargetParams {
                 serial: "KT6-LINK".to_owned(),
                 app_id: "org.example.reader".to_owned(),
             })
             .unwrap_err();
-        assert_eq!(unsupported.code, error_codes::FEATURE_UNAVAILABLE);
-        assert_eq!(
-            unsupported.data.as_ref().unwrap()["feature"],
-            kindlebridge_schema::device_protocol::APP_START_FEATURE
-        );
+        assert_eq!(missing.code, error_codes::APP_NOT_FOUND);
 
         let executable = std::env::current_exe().unwrap();
         let successful_params = ExecParams {
@@ -2955,6 +3148,72 @@ mod tests {
         if std::env::var_os("KBP_CHILD_SLEEP").is_some() {
             std::thread::sleep(Duration::from_secs(1));
         }
+    }
+
+    #[test]
+    fn app_install_uploads_and_commits_a_real_kbb_over_one_device_session() {
+        let unique = format!("{}-app-install-link", std::process::id());
+        let root = std::env::temp_dir().join(format!("kindlebridge-device-{unique}"));
+        let activation_root = root.join("activations");
+        let bundle_path = std::env::temp_dir().join(format!("kindlebridge-{unique}.kbb"));
+        let mut bundle_config = kindlebridge_bundle::BuildConfig::new(
+            kindlebridge_bundle::BundleKind::Application,
+            "org.example.connected",
+            "1.2.3",
+            4,
+            "kindlehf",
+        );
+        bundle_config.firmware_min = Some(vec![5, 17]);
+        bundle_config.required_features = vec![SYNC_FEATURE.to_owned()];
+        bundle_config.entrypoints =
+            BTreeMap::from([("main".to_owned(), "bin/connected".to_owned())]);
+        let mut builder = kindlebridge_bundle::BundleBuilder::new(bundle_config);
+        builder
+            .add_file("bin/connected", b"#!/bin/sh\nexit 0\n".to_vec(), true)
+            .unwrap();
+        fs::write(
+            &bundle_path,
+            builder
+                .build(&ed25519_dalek::SigningKey::from_bytes(&[0x21; 32]))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let server = TcpServer::bind(
+            SocketAddr::new(loopback, 0),
+            ServerConfig::new(DeviceInfo::kt6("KT6-APP"))
+                .allow_peer(loopback)
+                .sync_root(&root)
+                .activation_root(&activation_root),
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let worker = thread::spawn(move || server.serve_once());
+        let provider = ConnectedDeviceProvider::connect(&[address]).unwrap();
+
+        let installed = provider
+            .app_install(AppInstallParams {
+                serial: "KT6-APP".to_owned(),
+                bundle_path: bundle_path.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        assert_eq!(installed.app_id, "org.example.connected");
+        assert_eq!(installed.version, "1.2.3");
+        assert_eq!(installed.state, kindlebridge_schema::AppState::Stopped);
+        let listed = provider
+            .app_list(&SerialParams {
+                serial: "KT6-APP".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(listed.apps, vec![installed]);
+        assert!(root.join("packages/kbb").read_dir().unwrap().count() >= 1);
+        assert!(activation_root.join("active-generation").is_file());
+
+        drop(provider);
+        worker.join().unwrap().unwrap();
+        fs::remove_file(bundle_path).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

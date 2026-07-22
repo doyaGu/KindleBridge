@@ -14,28 +14,27 @@ use kindlebridge_functionfs::{
     FunctionFsFrameWriter,
 };
 use kindlebridge_schema::device_protocol::{
-    is_valid_session_id, DeviceCall, DeviceHello, DeviceReply, HostHello, ShellOpen, SyncReply,
-    SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE, APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE,
-    APP_START_FEATURE, APP_STOP_FEATURE, APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW,
-    DEFAULT_STREAM_WINDOW, EXEC_FEATURE, LEGACY_RPC_SERVICE, LOG_TAIL_FEATURE,
-    PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION, SHELL_STREAM_WINDOW,
-    SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE, SYNC_SERVICE,
+    is_valid_session_id, DeviceAppInstallParams, DeviceCall, DeviceHello, DeviceReply, HostHello,
+    ShellOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE, APP_RESTART_FEATURE,
+    APP_ROLLBACK_FEATURE, APP_START_FEATURE, APP_STOP_FEATURE, APP_UNINSTALL_FEATURE,
+    DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, EXEC_FEATURE, LOG_TAIL_FEATURE,
+    PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION, RPC_SERVICE,
+    SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE, SYNC_SERVICE,
 };
 #[cfg(test)]
 use kindlebridge_schema::device_protocol::{ServiceAccept, ServiceOpen, SYNC_CREDIT_BATCH_SIZE};
 use kindlebridge_schema::shell_protocol::{PacketSource, ShellPacket, ShellStreamState};
 use kindlebridge_schema::{
-    error_codes, methods, AppInstallParams, AppTargetParams, ExecParams, LogTailParams,
-    ProcessSignalParams, RpcError, SerialParams, SyncStatusParams, MAX_SYNC_BLOCK_SIZE,
+    error_codes, methods, AppTargetParams, ExecParams, LogTailParams, ProcessSignalParams,
+    RpcError, SerialParams, SyncStatusParams, MAX_SYNC_BLOCK_SIZE,
 };
 use kindlebridge_transport::{
     actor::{
         Connection, ConnectionError, FrameSink as ActorFrameSink, FrameSource as ActorFrameSource,
-        IncomingStream as ActorIncomingStream, Stream as ActorStream,
+        IncomingStream as ActorIncomingStream, RestartedSession, Stream as ActorStream,
     },
     TrafficClass,
 };
-#[cfg(test)]
 use kindlebridge_transport_tcp::ErrorClass;
 use kindlebridge_transport_tcp::{
     FrameIo, ShutdownMode, TcpFrameListener, TransportConfig, TransportError,
@@ -47,6 +46,7 @@ use kindlebridge_wire::{
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::app::AppSupervisor;
 use crate::exec::{self, ExecError};
 use crate::services;
 use crate::shell::{ShellEvent, ShellWorker, ShellWorkerError};
@@ -55,12 +55,27 @@ use crate::DeviceInfo;
 
 const SESSION_IO_TIMEOUT: Duration = Duration::from_secs(10 * 60 + 30);
 const DEFAULT_SYNC_ROOT: &str = "/mnt/us/kindlebridge-data";
-const DEFAULT_ACTIVATION_ROOT: &str = "/var/local/kindlebridge/activations";
+const DEFAULT_ACTIVATION_ROOT: &str = "/var/local/kindlebridge/apps";
 const DEFAULT_PROC_ROOT: &str = "/proc";
 const DEFAULT_LOG_PATH: &str = "/var/local/kindlebridge/usb.log";
 #[cfg(test)]
 const SYNC_PUSH_QUEUE_DEPTH: usize = 3;
 const MAX_CONCURRENT_SHELLS: usize = 4;
+const DEVICE_RUNTIME_FEATURES: &[&str] = &[
+    APP_INSTALL_FEATURE,
+    APP_LIST_FEATURE,
+    APP_RESTART_FEATURE,
+    APP_ROLLBACK_FEATURE,
+    APP_START_FEATURE,
+    APP_STOP_FEATURE,
+    APP_UNINSTALL_FEATURE,
+    EXEC_FEATURE,
+    LOG_TAIL_FEATURE,
+    PROCESS_LIST_FEATURE,
+    PROCESS_SIGNAL_FEATURE,
+    SHELL_V2_FEATURE,
+    SYNC_FEATURE,
+];
 
 #[cfg(test)]
 #[derive(Debug)]
@@ -225,6 +240,7 @@ pub struct ServerConfig {
     pub activation_root: PathBuf,
     pub proc_root: PathBuf,
     pub log_path: PathBuf,
+    app_supervisor: Arc<AppSupervisor>,
 }
 
 impl ServerConfig {
@@ -239,6 +255,7 @@ impl ServerConfig {
             activation_root: PathBuf::from(DEFAULT_ACTIVATION_ROOT),
             proc_root: PathBuf::from(DEFAULT_PROC_ROOT),
             log_path: PathBuf::from(DEFAULT_LOG_PATH),
+            app_supervisor: Arc::new(AppSupervisor::new()),
         }
     }
 
@@ -311,6 +328,7 @@ impl TcpServer {
             TcpActorSink(stream),
             &self.config,
             &self.sync_store,
+            false,
         )
     }
 
@@ -331,6 +349,7 @@ impl TcpServer {
                         TcpActorSink(stream),
                         &self.config,
                         &self.sync_store,
+                        false,
                     )
                 });
             if let Err(error) = result {
@@ -383,7 +402,7 @@ impl UsbServer {
             return Ok(false);
         };
         let mut stream = FunctionFsFrameStream::new(endpoints, transport_config(&self.config))?;
-        let state = negotiate_actor_session(&mut stream, &self.config)?;
+        let state = negotiate_usb_actor_session(&mut stream, &self.config)?;
         let (reader, writer) = stream.into_split();
         serve_actor_connection(
             state,
@@ -391,6 +410,7 @@ impl UsbServer {
             FunctionFsActorSink(writer),
             &self.config,
             &self.sync_store,
+            true,
         )?;
         Ok(true)
     }
@@ -402,7 +422,7 @@ impl UsbServer {
                 return Ok(());
             };
             let mut stream = FunctionFsFrameStream::new(endpoints, transport_config(&self.config))?;
-            let result = negotiate_actor_session(&mut stream, &self.config).and_then(|state| {
+            let result = negotiate_usb_actor_session(&mut stream, &self.config).and_then(|state| {
                 let (reader, writer) = stream.into_split();
                 serve_actor_connection(
                     state,
@@ -410,6 +430,7 @@ impl UsbServer {
                     FunctionFsActorSink(writer),
                     &self.config,
                     &self.sync_store,
+                    true,
                 )
             });
             if let Err(error) = result {
@@ -449,7 +470,21 @@ struct FunctionFsActorSource(FunctionFsFrameReader);
 
 impl ActorFrameSource for FunctionFsActorSource {
     fn read_frame(&mut self) -> Result<Frame, String> {
-        self.0.read_frame().map_err(|error| error.to_string())
+        loop {
+            match self.0.read_frame() {
+                Ok(frame) => return Ok(frame),
+                Err(error) if transport_error_allows_in_place_restart(&error) => loop {
+                    match self.0.resynchronize() {
+                        Ok(()) => break,
+                        Err(error) if transport_error_allows_in_place_restart(&error) => {
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                },
+                Err(error) => return Err(error.to_string()),
+            }
+        }
     }
 }
 
@@ -470,6 +505,63 @@ fn negotiate_actor_session(
     config: &ServerConfig,
 ) -> Result<SessionState, ServerError> {
     let hello_frame = stream.read_frame()?;
+    let RestartedSession {
+        state,
+        hello_response,
+    } = prepare_actor_session(hello_frame, config)?;
+    stream.write_frame(&hello_response)?;
+    stream.flush()?;
+    Ok(state)
+}
+
+/// Admit a new host session without requiring a composite USB re-enumeration.
+///
+/// Releasing WinUSB can abort the old FunctionFS endpoint request without
+/// producing a new ENABLE event. The next host first sends a bounded recovery
+/// fill and a PING marker, then its HELLO. Keep the newly reopened endpoint
+/// pair alive while discarding that stale prefix so the HELLO is not lost in a
+/// rapid open/error/reopen loop.
+fn negotiate_usb_actor_session(
+    stream: &mut dyn FrameIo,
+    config: &ServerConfig,
+) -> Result<SessionState, ServerError> {
+    loop {
+        let hello_frame = match stream.read_frame() {
+            Ok(frame) => frame,
+            Err(error) if transport_error_allows_in_place_restart(&error) => {
+                recover_frame_boundary(stream)?;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !is_fresh_hello(&hello_frame) {
+            continue;
+        }
+        let RestartedSession {
+            state,
+            hello_response,
+        } = match prepare_actor_session(hello_frame, config) {
+            Ok(session) => session,
+            Err(error) if server_error_allows_in_place_restart(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        match stream
+            .write_frame(&hello_response)
+            .and_then(|()| stream.flush())
+        {
+            Ok(()) => return Ok(state),
+            Err(error) if transport_error_allows_in_place_restart(&error) => {
+                recover_frame_boundary(stream)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn prepare_actor_session(
+    hello_frame: Frame,
+    config: &ServerConfig,
+) -> Result<RestartedSession, ServerError> {
     expect(&hello_frame, Command::Hello, 0)?;
     let host_hello: HostHello = decode(&hello_frame.payload, "host HELLO")?;
     validate_hello(&host_hello, config)?;
@@ -485,23 +577,21 @@ fn negotiate_actor_session(
         model: config.device.model.clone(),
         firmware: config.device.firmware.clone(),
         target: config.device.target.clone(),
-        features: vec![
-            APP_LIST_FEATURE.to_owned(),
-            EXEC_FEATURE.to_owned(),
-            LOG_TAIL_FEATURE.to_owned(),
-            PROCESS_LIST_FEATURE.to_owned(),
-            SHELL_V2_FEATURE.to_owned(),
-            SYNC_FEATURE.to_owned(),
-        ],
+        features: DEVICE_RUNTIME_FEATURES
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect(),
         initial_connection_window: config.connection_window,
     };
-    send(
-        stream,
-        &mut state,
-        frame(Command::Hello, 0, 0, encode(&hello)?)?,
+    let hello_response = frame(Command::Hello, 0, 0, encode(&hello)?)?;
+    state.process_outbound(
+        &hello_response.header,
         FrameContext::hello(config.connection_window),
     )?;
-    Ok(state)
+    Ok(RestartedSession {
+        state,
+        hello_response,
+    })
 }
 
 fn serve_actor_connection<R, W>(
@@ -510,12 +600,21 @@ fn serve_actor_connection<R, W>(
     sink: W,
     config: &ServerConfig,
     sync_store: &SyncStore,
+    restart_in_place: bool,
 ) -> Result<(), ServerError>
 where
     R: ActorFrameSource,
     W: ActorFrameSink,
 {
-    let (_connection, incoming) = Connection::start(state, source, sink);
+    let (_connection, incoming) = if restart_in_place {
+        let restart_config = config.clone();
+        Connection::start_restartable(state, source, sink, move |hello| {
+            prepare_actor_session(hello, &restart_config)
+                .map_err(|error| ConnectionError::Protocol(error.to_string()))
+        })
+    } else {
+        Connection::start(state, source, sink)
+    };
     let shells = Arc::new(AtomicUsize::new(0));
     loop {
         let incoming = match incoming.recv() {
@@ -529,7 +628,7 @@ where
         thread::spawn(move || {
             let service = incoming.service.clone();
             let result = match service.as_str() {
-                LEGACY_RPC_SERVICE => serve_actor_rpc(incoming, &config, &sync_store),
+                RPC_SERVICE => serve_actor_rpc(incoming, &config, &sync_store),
                 SYNC_SERVICE => serve_actor_sync(incoming, &config, &sync_store),
                 SHELL_V2_SERVICE => match ShellSlot::reserve(shells) {
                     Some(slot) => serve_actor_shell(incoming, slot),
@@ -925,13 +1024,12 @@ fn serve_session(
             model: config.device.model.clone(),
             firmware: config.device.firmware.clone(),
             target: config.device.target.clone(),
-            features: vec![
-                APP_LIST_FEATURE.to_owned(),
-                EXEC_FEATURE.to_owned(),
-                LOG_TAIL_FEATURE.to_owned(),
-                PROCESS_LIST_FEATURE.to_owned(),
-                SYNC_FEATURE.to_owned(),
-            ],
+            features: DEVICE_RUNTIME_FEATURES
+                .iter()
+                .copied()
+                .filter(|feature| *feature != SHELL_V2_FEATURE)
+                .map(str::to_owned)
+                .collect(),
             initial_connection_window: config.connection_window,
         };
         if let Err(error) = send(
@@ -991,7 +1089,7 @@ fn serve_session(
             state.process_inbound(&open_frame.header, FrameContext::default())?;
             let service: ServiceOpen = decode(&open_frame.payload, "OPEN")?;
             let stream_id = open_frame.header.stream_id;
-            if !matches!(service.service.as_str(), LEGACY_RPC_SERVICE | SYNC_SERVICE) {
+            if !matches!(service.service.as_str(), RPC_SERVICE | SYNC_SERVICE) {
                 send(
                     stream,
                     &mut state,
@@ -1026,7 +1124,7 @@ fn serve_session(
                 return Err(error);
             }
             let service_result = match service.service.as_str() {
-                LEGACY_RPC_SERVICE => serve_shell_stream(
+                RPC_SERVICE => serve_rpc_stream(
                     stream,
                     &mut state,
                     config,
@@ -1061,7 +1159,6 @@ fn serve_session(
     }
 }
 
-#[cfg(test)]
 fn server_error_allows_in_place_restart(error: &ServerError) -> bool {
     matches!(
         error,
@@ -1079,7 +1176,6 @@ fn is_fresh_hello(frame: &Frame) -> bool {
     frame.header.command == Command::Hello && frame.header.stream_id == 0
 }
 
-#[cfg(test)]
 fn transport_error_allows_in_place_restart(error: &TransportError) -> bool {
     if matches!(
         error,
@@ -1094,12 +1190,10 @@ fn transport_error_allows_in_place_restart(error: &TransportError) -> bool {
     )
 }
 
-#[cfg(test)]
 fn pause_before_in_place_restart() {
     thread::sleep(Duration::from_millis(50));
 }
 
-#[cfg(test)]
 fn recover_frame_boundary(stream: &mut dyn FrameIo) -> Result<(), ServerError> {
     loop {
         match stream.resynchronize() {
@@ -1113,7 +1207,7 @@ fn recover_frame_boundary(stream: &mut dyn FrameIo) -> Result<(), ServerError> {
 }
 
 #[cfg(test)]
-fn serve_shell_stream(
+fn serve_rpc_stream(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
     config: &ServerConfig,
@@ -1608,33 +1702,13 @@ fn dispatch(call: DeviceCall, config: &ServerConfig, sync_store: &SyncStore) -> 
         methods::APP_LIST => reply(dispatch_app_list(call.params, config)),
         methods::PROCESS_LIST => reply(dispatch_process_list(call.params, config)),
         methods::LOG_TAIL => reply(dispatch_log_tail(call.params, config)),
-        methods::APP_INSTALL => reply(unavailable_app_install(call.params, config)),
-        methods::APP_START => reply(unavailable_app_target(
-            call.params,
-            config,
-            APP_START_FEATURE,
-        )),
-        methods::APP_STOP => reply(unavailable_app_target(
-            call.params,
-            config,
-            APP_STOP_FEATURE,
-        )),
-        methods::APP_RESTART => reply(unavailable_app_target(
-            call.params,
-            config,
-            APP_RESTART_FEATURE,
-        )),
-        methods::APP_ROLLBACK => reply(unavailable_app_target(
-            call.params,
-            config,
-            APP_ROLLBACK_FEATURE,
-        )),
-        methods::APP_UNINSTALL => reply(unavailable_app_target(
-            call.params,
-            config,
-            APP_UNINSTALL_FEATURE,
-        )),
-        methods::PROCESS_SIGNAL => reply(unavailable_process_signal(call.params, config)),
+        methods::APP_INSTALL => reply(dispatch_app_install(call.params, config, sync_store)),
+        methods::APP_START => reply(dispatch_app_start(call.params, config)),
+        methods::APP_STOP => reply(dispatch_app_stop(call.params, config)),
+        methods::APP_RESTART => reply(dispatch_app_restart(call.params, config)),
+        methods::APP_ROLLBACK => reply(dispatch_app_rollback(call.params, config)),
+        methods::APP_UNINSTALL => reply(dispatch_app_uninstall(call.params, config)),
+        methods::PROCESS_SIGNAL => reply(dispatch_process_signal(call.params, config)),
         _ => DeviceReply::failure(RpcError::method_not_found(&call.method)),
     }
 }
@@ -1696,7 +1770,7 @@ fn dispatch_app_list(
 ) -> Result<impl Serialize, RpcError> {
     let params = decode_params::<SerialParams>(params, "expected serial")?;
     require_serial(&params.serial, config)?;
-    services::app_list(&config.activation_root)
+    services::app_list(&config.activation_root, &config.app_supervisor)
 }
 
 fn dispatch_process_list(
@@ -1705,7 +1779,43 @@ fn dispatch_process_list(
 ) -> Result<impl Serialize, RpcError> {
     let params = decode_params::<SerialParams>(params, "expected serial")?;
     require_serial(&params.serial, config)?;
-    services::process_list(&config.proc_root)
+    let mut list = services::process_list(&config.proc_root)?;
+    let managed = config.app_supervisor.managed_processes().map_err(|error| {
+        RpcError::new(
+            error_codes::INVALID_STATE,
+            "Application supervisor unavailable",
+        )
+        .with_data(serde_json::json!({ "detail": error.to_string() }))
+    })?;
+    for process in &mut list.processes {
+        process.app_id = managed.get(&process.pid).cloned();
+    }
+    Ok(list)
+}
+
+fn dispatch_process_signal(
+    params: serde_json::Value,
+    config: &ServerConfig,
+) -> Result<impl Serialize, RpcError> {
+    let params = decode_params::<ProcessSignalParams>(params, "expected serial, pid, and signal")?;
+    require_serial(&params.serial, config)?;
+    if let Some(app_id) = config
+        .app_supervisor
+        .app_id_for_pid(params.pid)
+        .map_err(|error| {
+            RpcError::new(
+                error_codes::INVALID_STATE,
+                "Application supervisor unavailable",
+            )
+            .with_data(serde_json::json!({ "detail": error.to_string() }))
+        })?
+    {
+        return Err(RpcError::invalid_params(format!(
+            "PID {} is managed by {app_id}; use app stop or app restart",
+            params.pid
+        )));
+    }
+    services::process_signal(&config.proc_root, params.pid, &params.signal)
 }
 
 fn dispatch_log_tail(
@@ -1717,38 +1827,93 @@ fn dispatch_log_tail(
     services::log_tail(&config.log_path, &params)
 }
 
-fn unavailable_app_install(
+fn dispatch_app_install(
     params: serde_json::Value,
     config: &ServerConfig,
-) -> Result<serde_json::Value, RpcError> {
-    let params = decode_params::<AppInstallParams>(params, "expected serial, app_id, and version")?;
+    sync_store: &SyncStore,
+) -> Result<impl Serialize, RpcError> {
+    let params = decode_params::<DeviceAppInstallParams>(
+        params,
+        "expected serial, remote_path, and file_hash",
+    )?;
     require_serial(&params.serial, config)?;
-    Err(RpcError::feature_unavailable(
-        &params.serial,
-        APP_INSTALL_FEATURE,
-    ))
+    let mut bundle = sync_store
+        .open_committed(&params.remote_path)
+        .map_err(StoreError::into_rpc)?;
+    services::app_install(
+        &mut bundle,
+        &params.file_hash,
+        &config.activation_root,
+        &config.device.target,
+        &config.device.firmware,
+        DEVICE_RUNTIME_FEATURES,
+        &config.app_supervisor,
+    )
 }
 
-fn unavailable_app_target(
+fn dispatch_app_start(
     params: serde_json::Value,
     config: &ServerConfig,
-    feature: &str,
-) -> Result<serde_json::Value, RpcError> {
+) -> Result<impl Serialize, RpcError> {
     let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
     require_serial(&params.serial, config)?;
-    Err(RpcError::feature_unavailable(&params.serial, feature))
+    services::app_start(
+        &config.activation_root,
+        &config.app_supervisor,
+        &params.app_id,
+    )
 }
 
-fn unavailable_process_signal(
+fn dispatch_app_stop(
     params: serde_json::Value,
     config: &ServerConfig,
-) -> Result<serde_json::Value, RpcError> {
-    let params = decode_params::<ProcessSignalParams>(params, "expected serial, pid, and signal")?;
+) -> Result<impl Serialize, RpcError> {
+    let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
     require_serial(&params.serial, config)?;
-    Err(RpcError::feature_unavailable(
-        &params.serial,
-        PROCESS_SIGNAL_FEATURE,
-    ))
+    services::app_stop(
+        &config.activation_root,
+        &config.app_supervisor,
+        &params.app_id,
+    )
+}
+
+fn dispatch_app_restart(
+    params: serde_json::Value,
+    config: &ServerConfig,
+) -> Result<impl Serialize, RpcError> {
+    let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
+    require_serial(&params.serial, config)?;
+    services::app_restart(
+        &config.activation_root,
+        &config.app_supervisor,
+        &params.app_id,
+    )
+}
+
+fn dispatch_app_rollback(
+    params: serde_json::Value,
+    config: &ServerConfig,
+) -> Result<impl Serialize, RpcError> {
+    let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
+    require_serial(&params.serial, config)?;
+    services::app_rollback(
+        &config.activation_root,
+        &config.app_supervisor,
+        &params.app_id,
+    )
+}
+
+fn dispatch_app_uninstall(
+    params: serde_json::Value,
+    config: &ServerConfig,
+) -> Result<impl Serialize, RpcError> {
+    let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
+    require_serial(&params.serial, config)?;
+    services::app_uninstall(
+        &config.activation_root,
+        &config.app_supervisor,
+        &params.app_id,
+    )
 }
 
 fn decode_params<T: serde::de::DeserializeOwned>(
@@ -1988,6 +2153,7 @@ fn send_credit(
     )
 }
 
+#[cfg(test)]
 fn send(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -1998,6 +2164,7 @@ fn send(
     flush_outbound(stream)
 }
 
+#[cfg(test)]
 fn send_buffered(
     stream: &mut dyn FrameIo,
     state: &mut SessionState,
@@ -2009,6 +2176,7 @@ fn send_buffered(
     Ok(())
 }
 
+#[cfg(test)]
 fn flush_outbound(stream: &mut dyn FrameIo) -> Result<(), ServerError> {
     stream.flush()?;
     Ok(())
@@ -2131,6 +2299,21 @@ mod tests {
     use super::*;
 
     const TEST_SESSION_ID: &str = "000102030405060708090a0b0c0d0e0f";
+
+    #[test]
+    fn rejects_a_mismatched_host_protocol() {
+        let config = ServerConfig::new(DeviceInfo::kt6("KT6-PROTOCOL-TEST"));
+        let hello = HostHello {
+            protocol_version: PROTOCOL_VERSION - 1,
+            session_id: TEST_SESSION_ID.to_owned(),
+            client_name: "kindlebridge-test".to_owned(),
+            initial_connection_window: DEFAULT_CONNECTION_WINDOW,
+        };
+        assert!(matches!(
+            validate_hello(&hello, &config),
+            Err(ServerError::InvalidHello)
+        ));
+    }
 
     #[test]
     fn shell_registry_allows_four_sessions_and_releases_slots() {
@@ -2396,6 +2579,43 @@ mod tests {
     }
 
     #[test]
+    fn actor_usb_hello_gate_discards_recovery_fill_and_ping() {
+        let config = ServerConfig::new(DeviceInfo::kt6("KT6-ACTOR-USB-RECOVERY"));
+        let hello = frame(
+            Command::Hello,
+            0,
+            0,
+            encode(&HostHello {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: TEST_SESSION_ID.to_owned(),
+                client_name: "actor-usb-recovery-test".to_owned(),
+                initial_connection_window: DEFAULT_CONNECTION_WINDOW,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let invalid_magic = TransportError::Io {
+            operation: kindlebridge_transport_tcp::IoOperation::ReadHeader,
+            source: io::Error::new(io::ErrorKind::InvalidData, "abandoned frame"),
+        };
+        let mut stream = ScriptedFrameIo {
+            reads: VecDeque::from([
+                Err(invalid_magic),
+                Ok(frame(Command::Ping, 0, 0, Vec::new()).unwrap()),
+                Ok(hello),
+            ]),
+            writes: Vec::new(),
+        };
+
+        negotiate_usb_actor_session(&mut stream, &config).unwrap();
+
+        assert_eq!(stream.writes.len(), 1);
+        assert_eq!(stream.writes[0].header.command, Command::Hello);
+        let reply: DeviceHello = decode(&stream.writes[0].payload, "device HELLO").unwrap();
+        assert_eq!(reply.session_id, TEST_SESSION_ID);
+    }
+
+    #[test]
     fn top_level_usb_recovery_returns_to_hello_before_reading_the_ping_marker() {
         let config = ServerConfig::new(DeviceInfo::kt6("KT6-USB-PING-RECOVERY"));
         let hello = || {
@@ -2604,7 +2824,7 @@ mod tests {
                 1,
                 0,
                 encode(&ServiceOpen {
-                    service: LEGACY_RPC_SERVICE.to_owned(),
+                    service: RPC_SERVICE.to_owned(),
                 })
                 .unwrap(),
             )
@@ -2895,81 +3115,8 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_mutations_report_the_exact_unadvertised_capability() {
-        let config = ServerConfig::new(DeviceInfo::kt6("KT6-LINK"));
-        let sync_store = SyncStore::new(std::env::temp_dir().join("kindlebridge-dispatch-test"));
-        for (method, params, feature) in [
-            (
-                methods::APP_INSTALL,
-                serde_json::json!({
-                    "serial": "KT6-LINK",
-                    "app_id": "org.example.reader",
-                    "version": "1.0.0"
-                }),
-                APP_INSTALL_FEATURE,
-            ),
-            (
-                methods::APP_START,
-                serde_json::json!({
-                    "serial": "KT6-LINK",
-                    "app_id": "org.example.reader"
-                }),
-                APP_START_FEATURE,
-            ),
-            (
-                methods::APP_STOP,
-                serde_json::json!({
-                    "serial": "KT6-LINK",
-                    "app_id": "org.example.reader"
-                }),
-                APP_STOP_FEATURE,
-            ),
-            (
-                methods::APP_RESTART,
-                serde_json::json!({
-                    "serial": "KT6-LINK",
-                    "app_id": "org.example.reader"
-                }),
-                APP_RESTART_FEATURE,
-            ),
-            (
-                methods::APP_ROLLBACK,
-                serde_json::json!({
-                    "serial": "KT6-LINK",
-                    "app_id": "org.example.reader"
-                }),
-                APP_ROLLBACK_FEATURE,
-            ),
-            (
-                methods::APP_UNINSTALL,
-                serde_json::json!({
-                    "serial": "KT6-LINK",
-                    "app_id": "org.example.reader"
-                }),
-                APP_UNINSTALL_FEATURE,
-            ),
-            (
-                methods::PROCESS_SIGNAL,
-                serde_json::json!({
-                    "serial": "KT6-LINK",
-                    "pid": 42,
-                    "signal": "TERM"
-                }),
-                PROCESS_SIGNAL_FEATURE,
-            ),
-        ] {
-            let error = dispatch(
-                DeviceCall {
-                    method: method.to_owned(),
-                    params,
-                },
-                &config,
-                &sync_store,
-            )
-            .into_result()
-            .unwrap_err();
-            assert_eq!(error.code, error_codes::FEATURE_UNAVAILABLE);
-            assert_eq!(error.data.unwrap()["feature"], feature);
-        }
+    fn application_mutation_features_are_advertised_together() {
+        assert!(DEVICE_RUNTIME_FEATURES.contains(&APP_ROLLBACK_FEATURE));
+        assert!(DEVICE_RUNTIME_FEATURES.contains(&APP_UNINSTALL_FEATURE));
     }
 }

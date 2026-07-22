@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::RpcError;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const SESSION_ID_HEX_LENGTH: usize = 32;
 pub const DEFAULT_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 pub const DEFAULT_STREAM_WINDOW: u32 = 8 * 1024 * 1024;
@@ -16,8 +16,7 @@ pub const SHELL_STREAM_WINDOW: u32 = 256 * 1024;
 /// deliberately independent from the larger connection credit window.
 pub const MAX_HOST_TO_DEVICE_PAYLOAD: u32 = 1024 * 1024;
 pub const SYNC_CREDIT_BATCH_SIZE: u32 = DEFAULT_STREAM_WINDOW / 2;
-/// Generic request/reply service retained for older daemons.
-pub const LEGACY_RPC_SERVICE: &str = "shell.v1";
+pub const RPC_SERVICE: &str = "rpc.v1";
 pub const SHELL_V2_SERVICE: &str = "shell.v2";
 pub const SYNC_SERVICE: &str = "sync.v1";
 pub const APP_INSTALL_FEATURE: &str = "app.install.v1";
@@ -150,6 +149,17 @@ pub struct DeviceCall {
     pub params: Value,
 }
 
+/// Device-internal app install request. The public host API accepts a local
+/// `bundle_path`; the shared host server uploads it and sends only this bounded
+/// staging reference across KBP.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceAppInstallParams {
+    pub serial: String,
+    pub remote_path: String,
+    pub file_hash: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DeviceReply {
@@ -263,5 +273,23 @@ mod tests {
     fn sync_credit_batch_keeps_half_the_stream_window_available() {
         assert_eq!(SYNC_CREDIT_BATCH_SIZE, 4 * 1024 * 1024);
         assert_eq!(SYNC_CREDIT_BATCH_SIZE * 2, DEFAULT_STREAM_WINDOW);
+    }
+
+    #[test]
+    fn device_app_install_uses_a_staged_file_not_claimed_metadata() {
+        let params: DeviceAppInstallParams = serde_json::from_value(json!({
+            "serial": "KT6",
+            "remote_path": "packages/install-abc.kbb",
+            "file_hash": "00".repeat(32),
+        }))
+        .unwrap();
+        assert_eq!(params.remote_path, "packages/install-abc.kbb");
+        assert!(serde_json::from_value::<DeviceAppInstallParams>(json!({
+            "serial": "KT6",
+            "remote_path": "packages/install-abc.kbb",
+            "file_hash": "00".repeat(32),
+            "app_id": "org.example.forged",
+        }))
+        .is_err());
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::BufReader;
 use std::process::{Command, Stdio};
@@ -6,6 +7,7 @@ use kindlebridge::{
     execute, AppArgs, AppCommand, DeviceArgs, DeviceCommand, LogArgs, LogCommand, ProcessArgs,
     ProcessCommand, ServerArgs, ServerCommand, SyncArgs, SyncCommand, TopLevelCommand,
 };
+use kindlebridge_bundle::{BuildConfig, BundleBuilder, BundleKind};
 use kindlebridge_fake_device::SERIAL;
 use kindlebridge_schema::{
     error_codes, methods, AppList, AppState, AppSummary, ClientError, DeviceFeatures, DeviceList,
@@ -47,11 +49,18 @@ fn all_v1_discovery_methods_work_over_stdio_and_cli_rpc() {
     assert_eq!(
         features.features,
         [
-            "app.v1",
+            "app.install.v1",
+            "app.list.v1",
+            "app.restart.v1",
+            "app.rollback.v1",
+            "app.start.v1",
+            "app.stop.v1",
+            "app.uninstall.v1",
             "exec.v1",
-            "log.v1",
-            "process.v1",
-            "shell.v1",
+            "log.tail.v1",
+            "process.list.v1",
+            "process.signal.v1",
+            "rpc.v1",
             "sync.v1"
         ]
     );
@@ -117,6 +126,8 @@ fn stateful_sync_app_process_and_log_flow_works_over_stdio() {
     let unique = format!("{}-{}", std::process::id(), SERIAL);
     let source = std::env::temp_dir().join(format!("kindlebridge-source-{unique}.bin"));
     let destination = std::env::temp_dir().join(format!("kindlebridge-pull-{unique}.bin"));
+    let app_v1 = std::env::temp_dir().join(format!("kindlebridge-app-v1-{unique}.kbb"));
+    let app_v2 = std::env::temp_dir().join(format!("kindlebridge-app-v2-{unique}.kbb"));
     let payload: Vec<u8> = (0_u16..4096).flat_map(u16::to_le_bytes).collect();
     fs::write(&source, &payload).unwrap();
 
@@ -164,12 +175,13 @@ fn stateful_sync_app_process_and_log_flow_works_over_stdio() {
     assert_eq!(fs::read(&destination).unwrap(), payload);
 
     let app_id = "org.kindlebridge.e2e";
+    write_test_bundle(&app_v1, app_id, "1.0.0", 1);
+    write_test_bundle(&app_v2, app_id, "2.0.0", 2);
     let installed = app_command(
         &mut client,
         AppCommand::Install {
             serial: SERIAL.to_owned(),
-            app_id: app_id.to_owned(),
-            version: "1.0.0".to_owned(),
+            bundle_path: app_v1.to_string_lossy().into_owned(),
         },
     );
     assert_eq!(installed.state, AppState::Stopped);
@@ -205,8 +217,7 @@ fn stateful_sync_app_process_and_log_flow_works_over_stdio() {
         &mut client,
         AppCommand::Install {
             serial: SERIAL.to_owned(),
-            app_id: app_id.to_owned(),
-            version: "2.0.0".to_owned(),
+            bundle_path: app_v2.to_string_lossy().into_owned(),
         },
     );
     assert_eq!(
@@ -310,8 +321,31 @@ fn stateful_sync_app_process_and_log_flow_works_over_stdio() {
 
     fs::remove_file(source).unwrap();
     fs::remove_file(destination).unwrap();
+    fs::remove_file(app_v1).unwrap();
+    fs::remove_file(app_v2).unwrap();
     drop(client);
     assert!(child.wait().unwrap().success());
+}
+
+fn write_test_bundle(path: &std::path::Path, app_id: &str, version: &str, release: u64) {
+    let mut config = BuildConfig::new(
+        BundleKind::Application,
+        app_id,
+        version,
+        release,
+        "kindlehf",
+    );
+    config.entrypoints = BTreeMap::from([("main".to_owned(), "bin/app".to_owned())]);
+    let mut builder = BundleBuilder::new(config);
+    builder
+        .add_file(
+            "bin/app",
+            format!("#!/bin/sh\necho {version}\n").into_bytes(),
+            true,
+        )
+        .unwrap();
+    let key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+    fs::write(path, builder.build(&key).unwrap()).unwrap();
 }
 
 fn app_command(
