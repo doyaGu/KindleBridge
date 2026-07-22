@@ -129,6 +129,79 @@ fn received_credit_is_returned_only_after_the_worker_consumes_data() {
 }
 
 #[test]
+fn consuming_a_terminal_frame_retires_only_that_actor_stream() {
+    let (device_tx, device_rx) = mpsc::channel();
+    let (host_tx, host_rx) = mpsc::channel();
+    let (connection, _incoming) = Connection::start(
+        online_host_state(),
+        ChannelSource(device_rx),
+        ChannelSink(host_tx),
+    );
+
+    let opening = {
+        let connection = connection.clone();
+        thread::spawn(move || {
+            connection.open("shell.v2", SHELL_STREAM_WINDOW, TrafficClass::Interactive)
+        })
+    };
+    let open = host_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let stream_id = open.header.stream_id;
+    device_tx
+        .send(json_frame(
+            Command::Accept,
+            stream_id,
+            0,
+            &ServiceAccept {
+                initial_stream_window: SHELL_STREAM_WINDOW,
+            },
+        ))
+        .unwrap();
+    let stream = opening.join().unwrap().unwrap();
+    assert_eq!(
+        host_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .header
+            .command,
+        Command::Credit
+    );
+
+    device_tx
+        .send(Frame::new(Header::new(Command::Close, stream_id, 1), Vec::new()).unwrap())
+        .unwrap();
+    assert_eq!(stream.recv().unwrap().header.command, Command::Close);
+
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = result_tx.send(stream.recv());
+    });
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("terminal actor stream was retained"),
+        Err(kindlebridge_transport::actor::ConnectionError::Disconnected)
+    );
+
+    let next_open = {
+        let connection = connection.clone();
+        thread::spawn(move || connection.open("rpc.v1", SHELL_STREAM_WINDOW, TrafficClass::Bulk))
+    };
+    let open = host_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    device_tx
+        .send(json_frame(
+            Command::Accept,
+            open.header.stream_id,
+            0,
+            &ServiceAccept {
+                initial_stream_window: SHELL_STREAM_WINDOW,
+            },
+        ))
+        .unwrap();
+    assert!(next_open.join().unwrap().is_ok());
+    assert!(connection.is_online());
+}
+
+#[test]
 fn data_from_an_idle_worker_is_submitted_before_close() {
     let (host_to_device_tx, host_to_device_rx) = mpsc::channel();
     let (device_to_host_tx, device_to_host_rx) = mpsc::channel();

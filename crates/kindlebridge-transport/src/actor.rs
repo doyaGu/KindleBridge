@@ -544,6 +544,8 @@ impl<W: FrameSink> Actor<W> {
             }
             if let Some(item) = self.scheduler.dequeue() {
                 let key = (item.frame.header.stream_id, item.frame.header.sequence);
+                let stream_id = item.frame.header.stream_id;
+                let terminal = matches!(item.frame.header.command, Command::Close | Command::Reset);
                 if let Err(error) = self
                     .sink
                     .write_frame(&item.frame)
@@ -556,6 +558,9 @@ impl<W: FrameSink> Actor<W> {
                     }
                 } else if let Some(response) = self.write_waiters.remove(&key) {
                     let _ = response.send(Ok(()));
+                }
+                if terminal {
+                    self.retire_stream(stream_id, ConnectionError::Disconnected);
                 }
             }
         }
@@ -963,36 +968,57 @@ impl<W: FrameSink> Actor<W> {
         stream_id: u32,
         response: SyncSender<Result<Frame, ConnectionError>>,
     ) -> Result<(), ConnectionError> {
-        let entry = self
-            .streams
-            .get_mut(&stream_id)
-            .ok_or(ConnectionError::UnknownStream(stream_id))?;
-        if entry.receiver.is_some() {
-            let error = ConnectionError::ReceivePending(stream_id);
-            let _ = response.send(Err(error.clone()));
-            return Err(error);
-        }
-        if let Some(frame) = entry.inbox.pop_front() {
-            entry.inbox_bytes = entry.inbox_bytes.saturating_sub(frame.payload.len());
-            self.restore_consumed_credit(&frame)?;
-            let _ = response.send(Ok(frame));
-        } else {
-            entry.receiver = Some(response);
+        let frame = {
+            let entry = self
+                .streams
+                .get_mut(&stream_id)
+                .ok_or(ConnectionError::UnknownStream(stream_id))?;
+            if entry.receiver.is_some() {
+                let error = ConnectionError::ReceivePending(stream_id);
+                let _ = response.send(Err(error.clone()));
+                return Err(error);
+            }
+            match entry.inbox.pop_front() {
+                Some(frame) => {
+                    entry.inbox_bytes = entry.inbox_bytes.saturating_sub(frame.payload.len());
+                    frame
+                }
+                None => {
+                    entry.receiver = Some(response);
+                    return Ok(());
+                }
+            }
+        };
+        let terminal = matches!(frame.header.command, Command::Close | Command::Reset);
+        self.restore_consumed_credit(&frame)?;
+        let _ = response.send(Ok(frame));
+        if terminal {
+            self.retire_stream(stream_id, ConnectionError::Disconnected);
         }
         Ok(())
     }
 
     fn deliver(&mut self, frame: Frame) -> Result<(), ConnectionError> {
         let stream_id = frame.header.stream_id;
+        let terminal = matches!(frame.header.command, Command::Close | Command::Reset);
+        let receiver = self
+            .streams
+            .get_mut(&stream_id)
+            .ok_or(ConnectionError::UnknownStream(stream_id))?
+            .receiver
+            .take();
+        if let Some(receiver) = receiver {
+            self.restore_consumed_credit(&frame)?;
+            let _ = receiver.send(Ok(frame));
+            if terminal {
+                self.retire_stream(stream_id, ConnectionError::Disconnected);
+            }
+            return Ok(());
+        }
         let entry = self
             .streams
             .get_mut(&stream_id)
-            .ok_or(ConnectionError::UnknownStream(stream_id))?;
-        if let Some(receiver) = entry.receiver.take() {
-            self.restore_consumed_credit(&frame)?;
-            let _ = receiver.send(Ok(frame));
-            return Ok(());
-        }
+            .expect("stream existence was checked");
         entry.inbox_bytes = entry
             .inbox_bytes
             .checked_add(frame.payload.len())
@@ -1002,6 +1028,31 @@ impl<W: FrameSink> Actor<W> {
         }
         entry.inbox.push_back(frame);
         Ok(())
+    }
+
+    fn retire_stream(&mut self, stream_id: u32, error: ConnectionError) {
+        if let Some(mut entry) = self.streams.remove(&stream_id) {
+            if let Some(opener) = entry.opener.take() {
+                let _ = opener.send(Err(error.clone()));
+            }
+            if let Some(receiver) = entry.receiver.take() {
+                let _ = receiver.send(Err(error.clone()));
+            }
+            if let Some(pending) = entry.pending_send.take() {
+                let _ = pending.response.send(Err(error.clone()));
+            }
+        }
+        let waiting: Vec<_> = self
+            .write_waiters
+            .keys()
+            .filter(|(pending_stream_id, _)| *pending_stream_id == stream_id)
+            .copied()
+            .collect();
+        for key in waiting {
+            if let Some(response) = self.write_waiters.remove(&key) {
+                let _ = response.send(Err(error.clone()));
+            }
+        }
     }
 
     fn restore_consumed_credit(&mut self, frame: &Frame) -> Result<(), ConnectionError> {
