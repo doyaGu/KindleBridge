@@ -12,6 +12,7 @@ for script in \
     packaging/mrpi/payload/kindlebridge/bin/usb-gadget-manager.sh \
     packaging/mrpi/payload/extensions/kindlebridge/bin/kindlebridge.sh \
     scripts/archive/unsafe-kt6-usb-lab.sh \
+    scripts/hardware/usb-mode-cycle-gate.sh \
     tests/fixtures/usb-mode/fake-command.sh \
     tests/fixtures/usb-mode/kindlebridge-launcher \
     tests/fixtures/usb-mode/kindlebridged \
