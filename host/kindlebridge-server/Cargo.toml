@@ -12,6 +12,7 @@ clap = { version = "4.5", features = ["derive"] }
 getrandom = "0.2"
 interprocess = "=2.4.2"
 kindlebridge-bundle = { path = "../../crates/kindlebridge-bundle", default-features = false, features = ["verify"] }
+kindlebridge-local = { path = "../kindlebridge-local" }
 kindlebridge-schema = { path = "../../crates/kindlebridge-schema" }
 kindlebridge-transport = { path = "../../crates/kindlebridge-transport" }
 kindlebridge-transport-tcp = { path = "../../crates/kindlebridge-transport-tcp" }

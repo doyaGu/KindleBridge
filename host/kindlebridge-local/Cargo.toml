@@ -1,0 +1,12 @@
+[package]
+name = "kindlebridge-local"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+interprocess = "=2.4.2"
+
+[lints]
+workspace = true

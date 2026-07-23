@@ -521,6 +521,7 @@ dependencies = [
  "crossterm",
  "interprocess",
  "kindlebridge-bundle",
+ "kindlebridge-local",
  "kindlebridge-schema",
  "serde",
  "serde_json",
@@ -597,6 +598,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kindlebridge-local"
+version = "0.1.0-dev.42"
+dependencies = [
+ "interprocess",
+]
+
+[[package]]
 name = "kindlebridge-schema"
 version = "0.1.0-dev.42"
 dependencies = [
@@ -617,6 +625,7 @@ dependencies = [
  "getrandom 0.2.17",
  "interprocess",
  "kindlebridge-bundle",
+ "kindlebridge-local",
  "kindlebridge-schema",
  "kindlebridge-transport",
  "kindlebridge-transport-tcp",
