@@ -650,7 +650,6 @@ impl PushTransfer {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn hash_state(&self) -> blake3::Hasher {
         self.hasher.clone()
     }

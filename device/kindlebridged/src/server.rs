@@ -3,7 +3,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-#[cfg(test)]
 use std::sync::mpsc::{self, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread;
@@ -58,7 +57,6 @@ const DEFAULT_SYNC_ROOT: &str = "/mnt/us/kindlebridge-data";
 const DEFAULT_ACTIVATION_ROOT: &str = "/var/local/kindlebridge/apps";
 const DEFAULT_PROC_ROOT: &str = "/proc";
 const DEFAULT_LOG_PATH: &str = "/var/local/kindlebridge/usb.log";
-#[cfg(test)]
 const SYNC_PUSH_QUEUE_DEPTH: usize = 3;
 const MAX_CONCURRENT_SHELLS: usize = 4;
 const DEVICE_RUNTIME_FEATURES: &[&str] = &[
@@ -77,7 +75,6 @@ const DEVICE_RUNTIME_FEATURES: &[&str] = &[
     SYNC_FEATURE,
 ];
 
-#[cfg(test)]
 #[derive(Debug)]
 enum PipelineFailure<E> {
     Stage(E),
@@ -85,13 +82,11 @@ enum PipelineFailure<E> {
     WorkerPanicked,
 }
 
-#[cfg(test)]
 struct PipelineOutcome<A, E> {
     result: Result<(), PipelineFailure<E>>,
     last_written: Option<A>,
 }
 
-#[cfg(test)]
 fn run_bounded_pipeline<C, T, A, E, Read, Write, Stored, MustDrain>(
     context: &mut C,
     mut read: Read,
@@ -886,26 +881,108 @@ fn actor_sync_push(
     };
     stream.send_data(encode(&ready)?, false)?;
     let block_size = block_size as usize;
-    loop {
-        let data = actor_data(&mut stream)?;
-        if data.payload.len() > block_size {
-            stream.reset("sync DATA exceeds negotiated block size")?;
-            return Ok(());
-        }
-        let is_last = data.header.flags & FLAG_END_STREAM != 0;
-        if transfer.is_complete() {
+    let digest = if transfer.is_complete() {
+        loop {
+            let data = actor_data(&mut stream)?;
+            if data.payload.len() > block_size {
+                stream.reset("sync DATA exceeds negotiated block size")?;
+                return Ok(());
+            }
             if !data.payload.is_empty() {
                 stream.reset("completed sync push accepts only an empty final DATA")?;
                 return Ok(());
             }
-        } else {
-            transfer.write_chunk(&data.payload)?;
+            if data.header.flags & FLAG_END_STREAM != 0 {
+                break;
+            }
         }
-        if is_last {
-            break;
+        None
+    } else {
+        struct ReceiveContext<'a> {
+            stream: &'a mut ActorStream,
+            block_size: usize,
+            end_stream_received: bool,
         }
-    }
-    let status = match transfer.finish() {
+
+        let hash_state = transfer.hash_state();
+        let mut context = ReceiveContext {
+            stream: &mut stream,
+            block_size,
+            end_stream_received: false,
+        };
+        // A small bounded queue overlaps USB receive, BLAKE3 and backing-store
+        // writes. Payloads are shared with the hash worker, so the pipeline
+        // retains at most three blocks without making another full-size copy.
+        let (pipeline, digest_result) = thread::scope(|scope| {
+            let (hash_tx, hash_rx) = mpsc::sync_channel::<Arc<[u8]>>(0);
+            let hash_worker = scope.spawn(move || {
+                let mut hasher = hash_state;
+                while let Ok(payload) = hash_rx.recv() {
+                    hasher.update(&payload);
+                }
+                hasher.finalize()
+            });
+            let pipeline = run_bounded_pipeline(
+                &mut context,
+                |context| {
+                    if context.end_stream_received {
+                        return Ok(None);
+                    }
+                    let data = actor_data(context.stream)?;
+                    if data.payload.len() > context.block_size {
+                        return Err(ServerError::UnexpectedFrame(
+                            "sync DATA exceeds negotiated block size",
+                        ));
+                    }
+                    let is_last = data.header.flags & FLAG_END_STREAM != 0;
+                    context.end_stream_received = is_last;
+                    Ok(Some(Arc::<[u8]>::from(data.payload)))
+                },
+                |payload| {
+                    hash_tx
+                        .send(Arc::clone(&payload))
+                        .map_err(|_| ServerError::UnexpectedFrame("sync hash worker stopped"))?;
+                    let frame_start = transfer.offset();
+                    transfer.write_chunk_without_hash(&payload)?;
+                    Ok(frame_start)
+                },
+                |_context, _stored| Ok(()),
+                |_context| false,
+            );
+            drop(hash_tx);
+            let digest = hash_worker
+                .join()
+                .map_err(|_| ServerError::UnexpectedFrame("sync hash worker panicked"));
+            (pipeline, digest)
+        });
+        let last_frame_start = pipeline.last_written;
+        let receive_result = match pipeline.result {
+            Ok(()) => Ok(()),
+            Err(PipelineFailure::Stage(error)) => Err(error),
+            Err(PipelineFailure::WorkerStopped) => Err(ServerError::UnexpectedFrame(
+                "sync storage worker stopped before the transfer completed",
+            )),
+            Err(PipelineFailure::WorkerPanicked) => {
+                Err(ServerError::UnexpectedFrame("sync storage worker panicked"))
+            }
+        };
+        match receive_result.and(digest_result) {
+            Ok(digest) => Some(digest),
+            Err(error) => {
+                if let Some(offset) = last_frame_start {
+                    transfer.rollback_for_resume(offset)?;
+                } else {
+                    transfer.checkpoint()?;
+                }
+                return Err(error);
+            }
+        }
+    };
+    let status = match digest {
+        Some(digest) => transfer.finish_with_digest(digest),
+        None => transfer.finish(),
+    };
+    let status = match status {
         Ok(status) => status,
         Err(error) => return actor_sync_failure(&stream, error.into_rpc()),
     };
