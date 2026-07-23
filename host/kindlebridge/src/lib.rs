@@ -245,8 +245,8 @@ pub enum CliError {
     InvalidResult { kind: &'static str },
     #[error("block size must be between 1 and 1048576 bytes; omit --block-size for the latency-safe USB default")]
     InvalidBlockSize,
-    #[error("device path must be relative or below {DEVICE_SYNC_ROOT}: {0}")]
-    RemotePathOutsideSyncRoot(String),
+    #[error("invalid device path {path:?}: {reason}")]
+    InvalidRemotePath { path: String, reason: String },
     #[error("could not resolve the current host directory: {0}")]
     CurrentDirectory(#[source] std::io::Error),
     #[error("invalid update binary: {0}")]

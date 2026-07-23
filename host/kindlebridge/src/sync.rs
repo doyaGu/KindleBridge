@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand};
 use kindlebridge_schema::{
-    SyncEntryKind, SyncListParams, SyncListResult, SyncMkdirParams, SyncMkdirResult,
-    SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams,
-    TransferState, DEFAULT_SYNC_BLOCK_SIZE, MAX_SYNC_BLOCK_SIZE,
+    LogicalSyncPath, SyncEntryKind, SyncListParams, SyncListResult, SyncMkdirParams,
+    SyncMkdirResult, SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus,
+    SyncStatusParams, TransferState, DEFAULT_SYNC_BLOCK_SIZE, MAX_SYNC_BLOCK_SIZE,
 };
 use serde_json::json;
 
@@ -91,7 +91,7 @@ pub(super) fn execute<C: RpcCaller>(
                         caller,
                         serial,
                         Path::new(&local_path),
-                        &remote_path,
+                        remote_path.as_str(),
                         block_size,
                         json_output,
                     );
@@ -106,7 +106,7 @@ pub(super) fn execute<C: RpcCaller>(
                 &SyncPushParams {
                     serial: serial.clone(),
                     local_path: local_path.clone(),
-                    remote_path: remote_path.clone(),
+                    remote_path: remote_path.as_str().to_owned(),
                     transfer_id: resume.clone(),
                     block_size,
                 },
@@ -119,7 +119,7 @@ pub(super) fn execute<C: RpcCaller>(
                     "pushed",
                     result.accepted_offset,
                     "to",
-                    &remote_path,
+                    remote_path.as_str(),
                     &result.transfer_id,
                     started.elapsed(),
                     resume.is_some(),
@@ -141,7 +141,7 @@ pub(super) fn execute<C: RpcCaller>(
                 return sync_pull_directory(
                     caller,
                     serial,
-                    &remote_path,
+                    remote_path.as_str(),
                     Path::new(&local_path),
                     *block_size,
                     json_output,
@@ -152,7 +152,7 @@ pub(super) fn execute<C: RpcCaller>(
                 caller,
                 &SyncPullParams {
                     serial: serial.clone(),
-                    remote_path: remote_path.clone(),
+                    remote_path: remote_path.as_str().to_owned(),
                     local_path: local_path.clone(),
                     transfer_id: resume.clone(),
                     block_size: *block_size,
@@ -465,17 +465,27 @@ fn validate_block_size(block_size: usize) -> Result<(), CliError> {
     }
 }
 
-fn normalize_remote_path(path: &str) -> Result<String, CliError> {
-    let path = path.replace('\\', "/");
-    if let Some(relative) = path.strip_prefix(&format!("{DEVICE_SYNC_ROOT}/")) {
+fn normalize_remote_path(input: &str) -> Result<LogicalSyncPath, CliError> {
+    let path = input.replace('\\', "/");
+    let logical = if let Some(relative) = path.strip_prefix(&format!("{DEVICE_SYNC_ROOT}/")) {
         if !relative.is_empty() {
-            return Ok(relative.to_owned());
+            relative
+        } else {
+            path.as_str()
         }
+    } else {
+        path.as_str()
+    };
+    if logical.starts_with('/') {
+        return Err(CliError::InvalidRemotePath {
+            path: input.to_owned(),
+            reason: format!("absolute paths must be below {DEVICE_SYNC_ROOT}"),
+        });
     }
-    if path.starts_with('/') {
-        return Err(CliError::RemotePathOutsideSyncRoot(path));
-    }
-    Ok(path)
+    LogicalSyncPath::parse(logical.to_owned()).map_err(|error| CliError::InvalidRemotePath {
+        path: input.to_owned(),
+        reason: error.to_string(),
+    })
 }
 
 fn format_transfer_summary(
@@ -520,16 +530,26 @@ mod tests {
     #[test]
     fn remote_path_accepts_logical_and_sync_root_forms_only() {
         assert_eq!(
-            normalize_remote_path("apps\\reader.kbb").unwrap(),
-            "apps/reader.kbb"
+            normalize_remote_path("apps\\reader.kbb").unwrap().as_str(),
+            "apps/reader.kbb",
         );
         assert_eq!(
-            normalize_remote_path("/mnt/us/kindlebridge-data/apps/reader.kbb").unwrap(),
-            "apps/reader.kbb"
+            normalize_remote_path("/mnt/us/kindlebridge-data/apps/reader.kbb")
+                .unwrap()
+                .as_str(),
+            "apps/reader.kbb",
         );
         assert!(matches!(
             normalize_remote_path("/mnt/us/other/reader.kbb"),
-            Err(CliError::RemotePathOutsideSyncRoot(_))
+            Err(CliError::InvalidRemotePath { path, reason })
+                if path == "/mnt/us/other/reader.kbb"
+                    && reason == "absolute paths must be below /mnt/us/kindlebridge-data"
+        ));
+        assert!(matches!(
+            normalize_remote_path("apps/../reader.kbb"),
+            Err(CliError::InvalidRemotePath { path, reason })
+                if path == "apps/../reader.kbb"
+                    && reason == "path contains an empty, dot, or dot-dot component"
         ));
     }
 }
