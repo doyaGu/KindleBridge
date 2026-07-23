@@ -138,6 +138,15 @@ does not expose it to the host until its instance-bound heartbeat has remained
 healthy for ten seconds. Three startup failures restore the previous slot
 before USB is bound.
 
+After a staged slot reaches that startup-heartbeat threshold, KUAL exposes a
+one-shot **Roll back daemon update** action. It also requires USB to be
+unplugged, stops the active daemon, restores the last confirmed slot, and then
+starts development mode again. Starting another stage invalidates the older
+rollback point because the inactive slot is about to be overwritten. The
+heartbeat threshold verifies process startup and liveness; it does not claim
+that a host has completed a KBP command, so development builds should still be
+accepted from the host after activation.
+
 There is deliberately no host-triggered live daemon activation. The launcher
 may restart the currently selected daemon after a sustained liveness failure,
 but changing A/B slots remains an unplugged, pre-bind operation. The daemon is

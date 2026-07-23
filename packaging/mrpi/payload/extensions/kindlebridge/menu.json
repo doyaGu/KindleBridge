@@ -43,6 +43,14 @@
           "exitmenu": false,
           "refresh": false,
           "status": false
+        },
+        {
+          "name": "Roll back daemon update",
+          "action": "./bin/kindlebridge.sh",
+          "params": "rollback-daemon",
+          "exitmenu": false,
+          "refresh": false,
+          "status": false
         }
       ]
     }

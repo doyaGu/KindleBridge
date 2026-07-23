@@ -36,6 +36,7 @@ failure_code() {
             ;;
         *"stock USB owner is not ready"*) echo E-STOCK ;;
         *"no staged daemon update"*) echo E-NOUPDATE ;;
+        *"no confirmed daemon update to roll back"*) echo E-NOROLLBACK ;;
         *) echo E-OTHER ;;
     esac
 }
@@ -81,6 +82,10 @@ Wait 5 seconds, then retry."
             show "No daemon update is staged.
 Stage one from the computer first."
             ;;
+        E-NOROLLBACK)
+            show "No previous daemon update
+is available to roll back."
+            ;;
         *)
             show "$action failed (E-OTHER).
 Open status for recovery steps."
@@ -123,6 +128,10 @@ Wait 5 seconds, then retry."
         E-NOUPDATE)
             show "Last action: E-NOUPDATE.
 No daemon update was staged."
+            ;;
+        E-NOROLLBACK)
+            show "Last action: E-NOROLLBACK.
+No previous update is available."
             ;;
         *)
             show "Last action failed: E-OTHER.
@@ -225,7 +234,7 @@ export_diagnostics() {
 ACTION=${1:-}
 case "$ACTION" in
     export-diagnostics) ;;
-    start|stop|status|apply-staged)
+    start|stop|status|apply-staged|rollback-daemon)
         test -x "$MANAGER" || {
             show "KindleBridge is not installed correctly.
 Run the MRPI installer again."
@@ -353,6 +362,22 @@ Keep USB unplugged."
 Connect USB to the computer."
         else
             show_failure "Staged daemon update" "$output"
+            exit 1
+        fi
+        ;;
+    rollback-daemon)
+        if ! output=$(sh "$MANAGER" preflight rollback-daemon 2>&1); then
+            show_failure "Daemon rollback" "$output"
+            exit 1
+        fi
+        show "Rolling back daemon update...
+Keep USB unplugged."
+        if output=$(sh "$MANAGER" rollback-daemon 2>&1); then
+            rm -f "$ERROR_LOG"
+            show "Previous developer version is ready.
+Connect USB to the computer."
+        else
+            show_failure "Daemon rollback" "$output"
             exit 1
         fi
         ;;

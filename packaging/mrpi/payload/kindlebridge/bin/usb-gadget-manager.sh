@@ -867,8 +867,36 @@ apply_staged_preflight() {
     require_unplugged "$udc" 'applying staged daemon update'
 }
 
+rollback_daemon_command() {
+    rollback_daemon_preflight || return 1
+    if test -d "$STATE"; then
+        stop_command || return 1
+    fi
+    "$LAUNCHER" rollback --root "$RUNTIME" || return 1
+    start_bridge 0
+}
+
+rollback_daemon_preflight() {
+    test -f "$RUNTIME/launcher/previous-slot" || {
+        echo "no confirmed daemon update to roll back" >&2
+        return 1
+    }
+    test "$(id -u)" = 0 || { echo "must run as root" >&2; return 1; }
+    if test -d "$STATE"; then
+        udc=$(read_state udc "$DEFAULT_UDC")
+    else
+        udc=$(ls "$UDC_CLASS" | head -n 1)
+        test -n "$udc" || udc=$DEFAULT_UDC
+    fi
+    test -d "$UDC_CLASS/$udc" || {
+        echo "USB controller is unavailable: $udc" >&2
+        return 1
+    }
+    require_unplugged "$udc" 'rolling back daemon update'
+}
+
 usage() {
-    echo "usage: $0 start [TIMEOUT_SECONDS|0] | stop | status | apply-staged | preflight apply-staged" >&2
+    echo "usage: $0 start [TIMEOUT_SECONDS|0] | stop | status | apply-staged | rollback-daemon | preflight apply-staged|rollback-daemon" >&2
     exit 2
 }
 
@@ -877,10 +905,12 @@ case "${1:-}" in
     stop) test "$#" -eq 1 || usage; stop_command ;;
     status) test "$#" -eq 1 || usage; status ;;
     apply-staged) test "$#" -eq 1 || usage; apply_staged_command ;;
+    rollback-daemon) test "$#" -eq 1 || usage; rollback_daemon_command ;;
     preflight)
         test "$#" -eq 2 || usage
         case "$2" in
             apply-staged) apply_staged_preflight ;;
+            rollback-daemon) rollback_daemon_preflight ;;
             *) usage ;;
         esac
         ;;

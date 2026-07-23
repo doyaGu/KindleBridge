@@ -40,6 +40,13 @@ without another mode transition. KindleBridge start fails closed if USBNetLite's
 NCM or RNDIS function owns the gadget and explains how to hand USB back first.
 Staged activation runs a read-only unplugged-cable preflight before showing
 progress and repeats the check immediately before changing USB or daemon state.
+Once the staged daemon sustains its startup heartbeat, the menu can restore the
+previous confirmed daemon slot exactly once. Rollback also performs the cable
+preflight twice, consumes the rollback point instead of toggling forward, and
+cancels any stale staged pointer before development mode restarts. Staging a
+new candidate invalidates an older rollback point because it overwrites that
+inactive slot. Startup heartbeat health is not a substitute for host-side KBP
+acceptance testing.
 The first development install may still be copied over a rescue network without
 coupling KindleBridge to its provider.
 

@@ -578,6 +578,8 @@ test "$MANAGER_RC" -eq 0 || { cat "$CASE_ROOT/apply-output" >&2; fail 'offline s
 remember_daemon
 assert_equal B "$(cat "$CONTROL_ROOT/runtime/current")" \
     'offline activation did not select the staged slot'
+assert_equal A "$(cat "$CONTROL_ROOT/runtime/launcher/previous-slot")" \
+    'confirmed activation did not retain the previous daemon slot'
 test ! -f "$CONTROL_ROOT/runtime/next" || fail 'offline activation left the next pointer'
 test ! -f "$CONTROL_ROOT/runtime/launcher/pending-slot" ||
     fail 'USB was bound before the launcher confirmed or rolled back the staged slot'
@@ -588,6 +590,45 @@ assert_equal 11211000.usb "$(cat "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgad
 grep -q 'selected staged slot B; activation will be verified before USB bind' \
     "$CASE_ROOT/var/local/kindlebridge/usb.log" || fail 'staged slot selection was not recorded'
 pass 'staged daemon activates only during an unplugged USB lifecycle'
+
+setup_case rollback_daemon_rechecks_cable
+mkdir -p "$CONTROL_ROOT/runtime/launcher"
+printf '%s\n' B >"$CONTROL_ROOT/runtime/current"
+printf '%s\n' A >"$CONTROL_ROOT/runtime/launcher/previous-slot"
+run_manager "$CASE_ROOT/preflight-output" preflight rollback-daemon
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/preflight-output" >&2
+    fail 'offline daemon-rollback preflight failed'
+}
+printf '%s\n' 1 >"$CASE_ROOT/sys/class/udc/11211000.usb/connected"
+run_manager "$CASE_ROOT/rollback-output" rollback-daemon
+test "$MANAGER_RC" -ne 0 || fail 'connected daemon rollback unexpectedly succeeded after preflight'
+grep -q 'Unplug USB before rolling back daemon update' "$CASE_ROOT/rollback-output" ||
+    fail 'daemon rollback did not report its entry-point cable check'
+assert_equal B "$(cat "$CONTROL_ROOT/runtime/current")" \
+    'connected daemon rollback changed the current slot'
+assert_equal A "$(cat "$CONTROL_ROOT/runtime/launcher/previous-slot")" \
+    'connected daemon rollback consumed the rollback point'
+assert_file_empty "$CASE_ROOT/trace" 'connected daemon rollback issued a mutating command'
+pass 'daemon rollback rechecks the cable before mutation'
+
+setup_case rollback_daemon
+mkdir -p "$CONTROL_ROOT/runtime/launcher"
+printf '%s\n' B >"$CONTROL_ROOT/runtime/current"
+printf '%s\n' A >"$CONTROL_ROOT/runtime/launcher/previous-slot"
+run_manager "$CASE_ROOT/rollback-output" rollback-daemon
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/rollback-output" >&2
+    fail 'offline daemon rollback failed'
+}
+remember_daemon
+assert_equal A "$(cat "$CONTROL_ROOT/runtime/current")" \
+    'daemon rollback did not restore the previous slot'
+test ! -f "$CONTROL_ROOT/runtime/launcher/previous-slot" ||
+    fail 'daemon rollback did not consume its one-shot rollback point'
+assert_equal active "$(sh "$MANAGER" status | sed -n '1p')" \
+    'daemon rollback did not restart development mode'
+pass 'daemon rollback restores the confirmed previous slot once'
 
 setup_case readiness_gate
 export KINDLEBRIDGE_TEST_NO_HEARTBEAT=1
@@ -729,6 +770,18 @@ assert_equal A "$(cat "$CONTROL_ROOT/runtime/current")" \
 assert_equal B "$(cat "$CONTROL_ROOT/runtime/next")" \
     'connected staged update discarded the pending daemon slot'
 assert_file_empty "$CASE_ROOT/trace" 'connected staged update issued a mutating command'
+mkdir -p "$CONTROL_ROOT/runtime/launcher"
+printf '%s\n' A >"$CONTROL_ROOT/runtime/launcher/previous-slot"
+if sh "$KUAL_WRAPPER" rollback-daemon >"$CASE_ROOT/kual-rollback-connected-output" 2>&1; then
+    fail 'KUAL connected daemon rollback unexpectedly succeeded'
+fi
+grep -q 'E-CABLE' "$KUAL_CAPTURE" ||
+    fail 'KUAL did not classify the connected daemon-rollback failure'
+if grep -q 'Rolling back daemon update' "$CASE_ROOT/kual-rollback-connected-output"; then
+    fail 'KUAL announced daemon rollback before checking that USB was unplugged'
+fi
+assert_equal A "$(cat "$CONTROL_ROOT/runtime/launcher/previous-slot")" \
+    'KUAL connected daemon rollback consumed the rollback point'
 printf '%s\n' 0 >"$CASE_ROOT/sys/class/udc/11211000.usb/connected"
 mkdir -p "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/functions/ncm.usbnetlite"
 ln -s "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/functions/ncm.usbnetlite" \
@@ -768,16 +821,19 @@ unset KUAL KUAL_CAPTURE
 pass 'KUAL status preserves failures and exports diagnostics'
 
 exitmenu_count=$(grep -c '"exitmenu": false' "$KUAL_MENU")
-assert_equal 5 "$exitmenu_count" 'not every KUAL action preserves the menu'
+assert_equal 6 "$exitmenu_count" 'not every KUAL action preserves the menu'
 grep -q 'Switch to development mode' "$KUAL_MENU" || fail 'KUAL development action is ambiguous'
 grep -q 'Switch to USB file transfer' "$KUAL_MENU" || fail 'KUAL file-transfer action is ambiguous'
 grep -q '"params": "apply-staged"' "$KUAL_MENU" || fail 'KUAL has no staged-update action'
+grep -q '"params": "rollback-daemon"' "$KUAL_MENU" || fail 'KUAL has no daemon-rollback action'
 if grep -q 'runtime/next.*-f' "$KUAL_MENU"; then
     fail 'KUAL hides the staged-update action behind a cache-stale external marker'
 fi
 grep -q 'start 0' "$KUAL_WRAPPER" || fail 'KUAL start still has a safety timeout'
 grep -q 'preflight apply-staged' "$KUAL_WRAPPER" ||
     fail 'KUAL staged activation has no read-only cable preflight'
+grep -q 'preflight rollback-daemon' "$KUAL_WRAPPER" ||
+    fail 'KUAL daemon rollback has no read-only cable preflight'
 grep -q 'Export diagnostics' "$KUAL_MENU" || fail 'KUAL has no diagnostics export action'
 grep -q 'E-DAEMON' "$KUAL_WRAPPER" || fail 'KUAL daemon failures do not fit on screen as a short code'
 grep -q 'last-error.log' "$KUAL_WRAPPER" || fail 'KUAL does not preserve the full failure detail'

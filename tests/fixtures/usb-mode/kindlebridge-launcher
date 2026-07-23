@@ -11,10 +11,25 @@ if test "$command" = select-staged; then
     test ! -f "$root/run/daemon.pid" || exit 1
     slot=$(cat "$root/next")
     mkdir -p "$root/launcher"
+    cat "$root/current" >"$root/launcher/pending-previous"
     printf 'test pending slot %s\n' "$slot" >"$root/launcher/pending-slot"
     printf '%s\n' "$slot" >"$root/current"
     rm -f "$root/next"
     printf 'selected staged slot %s\n' "$slot"
+    exit 0
+fi
+
+if test "$command" = rollback; then
+    test "$#" -eq 0 || exit 2
+    test ! -f "$root/run/daemon.pid" || exit 1
+    test -f "$root/launcher/previous-slot" || {
+        echo "no confirmed daemon update to roll back" >&2
+        exit 1
+    }
+    slot=$(cat "$root/launcher/previous-slot")
+    printf '%s\n' "$slot" >"$root/current"
+    rm -f "$root/launcher/previous-slot"
+    printf 'restored daemon slot %s\n' "$slot"
     exit 0
 fi
 
@@ -35,6 +50,9 @@ start_child() {
         printf 'KINDLEBRIDGE_HEARTBEAT_V1\ninstance=test-%s-%s\ntimestamp_ms=%s\n' \
             "$$" "$child" "$timestamp_ms" \
             >"$root/run/heartbeat"
+        if test -f "$root/launcher/pending-previous"; then
+            mv "$root/launcher/pending-previous" "$root/launcher/previous-slot"
+        fi
         rm -f "$root/launcher/pending-slot"
     fi
     printf '%s\n' "$child" >"$root/run/daemon.pid"
