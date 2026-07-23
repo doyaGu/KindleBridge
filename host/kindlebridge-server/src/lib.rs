@@ -17,22 +17,25 @@ use std::thread;
 use base64::engine::general_purpose::STANDARD as BASE64;
 #[cfg(test)]
 use base64::Engine;
+use kindlebridge_schema::host_rpc::{self, RpcMethod as HostRpcMethod};
 use kindlebridge_schema::shell_protocol::ShellPacket;
-#[cfg(test)]
-use kindlebridge_schema::ShellOpenResult;
 use kindlebridge_schema::{
-    error_codes, methods, parse_request_value, read_frame, write_json_frame, AppInstallParams,
-    AppList, AppLogParams, AppLogSnapshot, AppSummary, AppTargetParams, DeviceFeatures,
-    DeviceFeaturesParams, DeviceList, DeviceSummary, ExecParams, ExecResult, FramingError,
-    LogSnapshot, LogTailParams, ProcessList, ProcessSignalParams, ProcessSummary, RequestId,
-    RpcError, RpcRequest, RpcResponse, SerialParams, ServerVersion, ShellOpenParams,
+    error_codes, parse_request_value, read_frame, write_json_frame, AppInstallParams, AppList,
+    AppLogParams, AppLogSnapshot, AppSummary, AppTargetParams, DeviceFeatures, DeviceList,
+    DeviceSummary, EmptyParams, ExecParams, ExecResult, FramingError, LogSnapshot, LogTailParams,
+    PingResult, ProcessList, ProcessSignalParams, ProcessSummary, RequestId, RpcError, RpcRequest,
+    RpcResponse, SerialParams, ServerStatus, ServerStopResult, ServerVersion, ShellOpenParams,
     SyncListParams, SyncListResult, SyncMkdirParams, SyncMkdirResult, SyncProgress,
     SyncProgressPhase, SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus,
     SyncStatusParams, TransferDirection, DEFAULT_MAX_CONTENT_LENGTH,
 };
+#[cfg(test)]
+use kindlebridge_schema::{methods, ShellOpenResult};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -758,68 +761,64 @@ pub fn handle_request(request: RpcRequest, provider: &dyn DeviceProvider) -> Opt
 
 fn dispatch(request: &RpcRequest, provider: &dyn DeviceProvider) -> Result<Value, RpcError> {
     match request.method.as_str() {
-        methods::SERVER_PING => {
-            require_empty_params(request.params.as_ref())?;
-            Ok(json!({ "ok": true }))
+        method if method == host_rpc::ServerPing::METHOD => {
+            require_empty_method::<host_rpc::ServerPing>(request)?;
+            to_method_value::<host_rpc::ServerPing>(PingResult { ok: true })
         }
-        methods::SERVER_VERSION => {
-            require_empty_params(request.params.as_ref())?;
-            serde_json::to_value(ServerVersion {
+        method if method == host_rpc::ServerVersion::METHOD => {
+            require_empty_method::<host_rpc::ServerVersion>(request)?;
+            to_method_value::<host_rpc::ServerVersion>(ServerVersion {
                 name: "kindlebridge-server".to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 api_version: kindlebridge_schema::API_VERSION.to_owned(),
             })
-            .map_err(|_| RpcError::internal_error())
         }
-        methods::SERVER_STATUS => {
-            require_empty_params(request.params.as_ref())?;
-            Ok(json!({ "running": true, "pid": std::process::id() }))
+        method if method == host_rpc::ServerStatus::METHOD => {
+            require_empty_method::<host_rpc::ServerStatus>(request)?;
+            to_method_value::<host_rpc::ServerStatus>(ServerStatus {
+                running: true,
+                pid: std::process::id(),
+            })
         }
-        methods::SERVER_STOP => {
-            require_empty_params(request.params.as_ref())?;
+        method if method == host_rpc::ServerStop::METHOD => {
+            require_empty_method::<host_rpc::ServerStop>(request)?;
             SERVER_STOP_REQUESTED.store(true, Ordering::Release);
-            Ok(json!({ "stopping": true }))
+            to_method_value::<host_rpc::ServerStop>(ServerStopResult { stopping: true })
         }
-        methods::DEVICE_LIST => {
-            require_empty_params(request.params.as_ref())?;
+        method if method == host_rpc::DeviceList::METHOD => {
+            require_empty_method::<host_rpc::DeviceList>(request)?;
             let devices = provider.list()?;
-            serde_json::to_value(DeviceList { devices }).map_err(|_| RpcError::internal_error())
+            to_method_value::<host_rpc::DeviceList>(DeviceList { devices })
         }
-        methods::DEVICE_FEATURES => {
-            let value = request
-                .params
-                .clone()
-                .ok_or_else(|| RpcError::invalid_params("missing params object"))?;
-            let params: DeviceFeaturesParams = serde_json::from_value(value)
-                .map_err(|_| RpcError::invalid_params("expected { serial: string }"))?;
+        method if method == host_rpc::DeviceFeatures::METHOD => {
+            let params = parse_method_params::<host_rpc::DeviceFeatures>(
+                request,
+                "expected { serial: string }",
+            )?;
             if params.serial.is_empty() {
                 return Err(RpcError::invalid_params("serial must not be empty"));
             }
             let features = provider
                 .features(&params.serial)?
                 .ok_or_else(|| RpcError::device_not_found(&params.serial))?;
-            serde_json::to_value(features).map_err(|_| RpcError::internal_error())
+            to_method_value::<host_rpc::DeviceFeatures>(features)
         }
-        methods::DEVICE_PING => {
-            let params = parse_params::<SerialParams>(request, "device ping params")?;
+        method if method == host_rpc::DevicePing::METHOD => {
+            let params =
+                parse_method_params::<host_rpc::DevicePing>(request, "device ping params")?;
             if params.serial.is_empty() {
                 return Err(RpcError::invalid_params("serial must not be empty"));
             }
             if !provider.ping(&params.serial)? {
                 return Err(RpcError::device_not_found(&params.serial));
             }
-            Ok(json!({ "ok": true }))
+            to_method_value::<host_rpc::DevicePing>(PingResult { ok: true })
         }
-        methods::EXEC_RUN => {
-            let value = request
-                .params
-                .clone()
-                .ok_or_else(|| RpcError::invalid_params("missing params object"))?;
-            let params: ExecParams = serde_json::from_value(value).map_err(|_| {
-                RpcError::invalid_params(
-                    "expected serial, non-empty argv, cwd, environment, timeout_ms",
-                )
-            })?;
+        method if method == host_rpc::ExecRun::METHOD => {
+            let params = parse_method_params::<host_rpc::ExecRun>(
+                request,
+                "expected serial, non-empty argv, cwd, environment, timeout_ms",
+            )?;
             if params.serial.is_empty() || params.argv.is_empty() || params.timeout_ms == 0 {
                 return Err(RpcError::invalid_params(
                     "serial and argv must be non-empty; timeout_ms must be positive",
@@ -834,67 +833,76 @@ fn dispatch(request: &RpcRequest, provider: &dyn DeviceProvider) -> Result<Value
             let result = provider
                 .exec(&params)?
                 .ok_or_else(|| RpcError::device_not_found(&params.serial))?;
-            serde_json::to_value(result).map_err(|_| RpcError::internal_error())
+            to_method_value::<host_rpc::ExecRun>(result)
         }
-        methods::SYNC_PUSH => {
-            let params = parse_params::<SyncPushParams>(request, "sync push params")?;
-            to_value(provider.sync_push(params)?)
+        method if method == host_rpc::SyncPush::METHOD => {
+            let params = parse_method_params::<host_rpc::SyncPush>(request, "sync push params")?;
+            to_method_value::<host_rpc::SyncPush>(provider.sync_push(params)?)
         }
-        methods::SYNC_PULL => {
-            let params = parse_params::<SyncPullParams>(request, "sync pull params")?;
-            to_value(provider.sync_pull(params)?)
+        method if method == host_rpc::SyncPull::METHOD => {
+            let params = parse_method_params::<host_rpc::SyncPull>(request, "sync pull params")?;
+            to_method_value::<host_rpc::SyncPull>(provider.sync_pull(params)?)
         }
-        methods::SYNC_STATUS => {
-            let params = parse_params::<SyncStatusParams>(request, "sync status params")?;
-            to_value(provider.sync_status(&params)?)
+        method if method == host_rpc::SyncStatus::METHOD => {
+            let params =
+                parse_method_params::<host_rpc::SyncStatus>(request, "sync status params")?;
+            to_method_value::<host_rpc::SyncStatus>(provider.sync_status(&params)?)
         }
-        methods::SYNC_LIST => {
-            let params = parse_params::<SyncListParams>(request, "sync list params")?;
-            to_value(provider.sync_list(&params)?)
+        method if method == host_rpc::SyncList::METHOD => {
+            let params = parse_method_params::<host_rpc::SyncList>(request, "sync list params")?;
+            to_method_value::<host_rpc::SyncList>(provider.sync_list(&params)?)
         }
-        methods::SYNC_MKDIR => {
-            let params = parse_params::<SyncMkdirParams>(request, "sync mkdir params")?;
-            to_value(provider.sync_mkdir(&params)?)
+        method if method == host_rpc::SyncMkdir::METHOD => {
+            let params = parse_method_params::<host_rpc::SyncMkdir>(request, "sync mkdir params")?;
+            to_method_value::<host_rpc::SyncMkdir>(provider.sync_mkdir(&params)?)
         }
-        methods::APP_INSTALL => {
-            let params = parse_params::<AppInstallParams>(request, "app install params")?;
-            to_value(provider.app_install(params)?)
+        method if method == host_rpc::AppInstall::METHOD => {
+            let params =
+                parse_method_params::<host_rpc::AppInstall>(request, "app install params")?;
+            to_method_value::<host_rpc::AppInstall>(provider.app_install(params)?)
         }
-        methods::APP_START
-        | methods::APP_STOP
-        | methods::APP_RESTART
-        | methods::APP_ROLLBACK
-        | methods::APP_UNINSTALL => {
-            let params = parse_params::<AppTargetParams>(request, "app target params")?;
-            let result = match request.method.as_str() {
-                methods::APP_START => provider.app_start(&params),
-                methods::APP_STOP => provider.app_stop(&params),
-                methods::APP_RESTART => provider.app_restart(&params),
-                methods::APP_ROLLBACK => provider.app_rollback(&params),
-                methods::APP_UNINSTALL => provider.app_uninstall(&params),
-                _ => unreachable!(),
-            }?;
-            to_value(result)
+        method if method == host_rpc::AppStart::METHOD => {
+            let params = parse_method_params::<host_rpc::AppStart>(request, "app target params")?;
+            to_method_value::<host_rpc::AppStart>(provider.app_start(&params)?)
         }
-        methods::APP_LIST => {
-            let params = parse_params::<SerialParams>(request, "serial params")?;
-            to_value(provider.app_list(&params)?)
+        method if method == host_rpc::AppStop::METHOD => {
+            let params = parse_method_params::<host_rpc::AppStop>(request, "app target params")?;
+            to_method_value::<host_rpc::AppStop>(provider.app_stop(&params)?)
         }
-        methods::APP_LOG => {
-            let params = parse_params::<AppLogParams>(request, "app log params")?;
-            to_value(provider.app_log(&params)?)
+        method if method == host_rpc::AppRestart::METHOD => {
+            let params = parse_method_params::<host_rpc::AppRestart>(request, "app target params")?;
+            to_method_value::<host_rpc::AppRestart>(provider.app_restart(&params)?)
         }
-        methods::PROCESS_LIST => {
-            let params = parse_params::<SerialParams>(request, "serial params")?;
-            to_value(provider.process_list(&params)?)
+        method if method == host_rpc::AppRollback::METHOD => {
+            let params =
+                parse_method_params::<host_rpc::AppRollback>(request, "app target params")?;
+            to_method_value::<host_rpc::AppRollback>(provider.app_rollback(&params)?)
         }
-        methods::PROCESS_SIGNAL => {
-            let params = parse_params::<ProcessSignalParams>(request, "process signal params")?;
-            to_value(provider.process_signal(&params)?)
+        method if method == host_rpc::AppUninstall::METHOD => {
+            let params =
+                parse_method_params::<host_rpc::AppUninstall>(request, "app target params")?;
+            to_method_value::<host_rpc::AppUninstall>(provider.app_uninstall(&params)?)
         }
-        methods::LOG_TAIL => {
-            let params = parse_params::<LogTailParams>(request, "log tail params")?;
-            to_value(provider.log_tail(&params)?)
+        method if method == host_rpc::AppList::METHOD => {
+            let params = parse_method_params::<host_rpc::AppList>(request, "serial params")?;
+            to_method_value::<host_rpc::AppList>(provider.app_list(&params)?)
+        }
+        method if method == host_rpc::AppLog::METHOD => {
+            let params = parse_method_params::<host_rpc::AppLog>(request, "app log params")?;
+            to_method_value::<host_rpc::AppLog>(provider.app_log(&params)?)
+        }
+        method if method == host_rpc::ProcessList::METHOD => {
+            let params = parse_method_params::<host_rpc::ProcessList>(request, "serial params")?;
+            to_method_value::<host_rpc::ProcessList>(provider.process_list(&params)?)
+        }
+        method if method == host_rpc::ProcessSignal::METHOD => {
+            let params =
+                parse_method_params::<host_rpc::ProcessSignal>(request, "process signal params")?;
+            to_method_value::<host_rpc::ProcessSignal>(provider.process_signal(&params)?)
+        }
+        method if method == host_rpc::LogTail::METHOD => {
+            let params = parse_method_params::<host_rpc::LogTail>(request, "log tail params")?;
+            to_method_value::<host_rpc::LogTail>(provider.log_tail(&params)?)
         }
         _ => Err(RpcError::method_not_found(&request.method)),
     }
@@ -925,8 +933,27 @@ fn parse_params<T: DeserializeOwned>(request: &RpcRequest, expected: &str) -> Re
     serde_json::from_value(value).map_err(|_| RpcError::invalid_params(expected))
 }
 
+fn parse_method_params<M: HostRpcMethod>(
+    request: &RpcRequest,
+    expected: &str,
+) -> Result<M::Params, RpcError> {
+    parse_params(request, expected)
+}
+
 fn to_value<T: Serialize>(value: T) -> Result<Value, RpcError> {
     serde_json::to_value(value).map_err(|_| RpcError::internal_error())
+}
+
+fn to_method_value<M: HostRpcMethod>(value: M::Result) -> Result<Value, RpcError> {
+    to_value(value)
+}
+
+fn require_empty_method<M>(request: &RpcRequest) -> Result<M::Params, RpcError>
+where
+    M: HostRpcMethod<Params = EmptyParams>,
+{
+    require_empty_params(request.params.as_ref())?;
+    Ok(EmptyParams {})
 }
 
 fn require_empty_params(params: Option<&Value>) -> Result<(), RpcError> {
