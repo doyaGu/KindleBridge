@@ -191,7 +191,7 @@ Cargo package is an internal build identifier, not a product release.
   during 128 MiB transfers: push P95 was 33.26 ms at 21.86 MiB/s and pull P95
   was 16.99 ms at 18.73 MiB/s, both below the 50 ms limit. The control request
   is token-matched, bounded to five seconds, and failed cleanly across session
-  loss. The shell USB-lifecycle suite defines 30 deterministic cases, including exact
+  loss. The shell USB-lifecycle suite defines 33 deterministic cases, including exact
   managed-entrypoint ownership, idempotent actions, controlled supervisor
   shutdown, and manual crash-fuse recovery. Nine additional MRPI installer and
   installer/uninstaller scenarios cover fresh and inactive installs, active, unknown and
