@@ -13,5 +13,8 @@ kindlebridge-wire = { path = "../../crates/kindlebridge-wire" }
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["event", "fs"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+kindlebridge-linux-aio = { path = "../../crates/kindlebridge-linux-aio" }
+
 [lints]
 workspace = true

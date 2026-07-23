@@ -581,6 +581,7 @@ dependencies = [
 name = "kindlebridge-functionfs"
 version = "0.1.0-dev.34"
 dependencies = [
+ "kindlebridge-linux-aio",
  "kindlebridge-transport-tcp",
  "kindlebridge-wire",
  "rustix 1.1.4",
@@ -592,6 +593,13 @@ version = "0.1.0-dev.34"
 dependencies = [
  "blake3",
  "clap",
+]
+
+[[package]]
+name = "kindlebridge-linux-aio"
+version = "0.1.0-dev.34"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

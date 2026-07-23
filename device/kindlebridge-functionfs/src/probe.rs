@@ -10,6 +10,9 @@ use std::{
     thread,
 };
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
+
 #[cfg(unix)]
 use rustix::{
     event::{poll, PollFd, PollFlags, Timespec},
@@ -34,6 +37,8 @@ pub const MAX_FRAME_COUNT: u64 = 100_000;
 // 63 KiB requests become order-4 allocations and fail once normal uptime has
 // fragmented memory, even when tens of MiB remain free.
 pub const MAX_FUNCTIONFS_IO: usize = 16 * 1024;
+#[cfg(target_os = "linux")]
+const FUNCTIONFS_AIO_DEPTH: usize = 8;
 #[cfg(unix)]
 const CONTROL_POLL_SLICE: Timespec = Timespec {
     tv_sec: 0,
@@ -92,6 +97,11 @@ impl<T> FunctionFsIo<T> {
 
     pub fn into_inner(self) -> T {
         self.0
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn get_mut(&mut self) -> &mut T {
+        &mut self.0
     }
 }
 
@@ -264,6 +274,19 @@ impl FunctionFsFrameReader {
 
 impl FunctionFsFrameWriter {
     pub fn write_frame(&mut self, frame: &Frame) -> Result<(), TransportError> {
+        #[cfg(target_os = "linux")]
+        {
+            let encoded = self.writer.encode_frame(frame)?;
+            self.writer
+                .get_mut()
+                .get_mut()
+                .write_all_aio(&encoded)
+                .map_err(|source| TransportError::Io {
+                    operation: IoOperation::WritePayload,
+                    source,
+                })
+        }
+        #[cfg(not(target_os = "linux"))]
         self.writer.write_frame_contiguous(frame)
     }
 
@@ -338,10 +361,37 @@ impl Read for FunctionFsReadEndpoint {
 #[derive(Debug)]
 pub struct FunctionFsWriteEndpoint {
     file: File,
+    #[cfg(target_os = "linux")]
+    aio: Option<kindlebridge_linux_aio::Context>,
     #[cfg(unix)]
     control: Arc<FunctionFsControl>,
     #[cfg(unix)]
     generation: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl FunctionFsWriteEndpoint {
+    fn write_all_aio(&mut self, buffer: &[u8]) -> std::io::Result<()> {
+        ensure_control_active(&self.control, self.generation)?;
+        if let Some(context) = self.aio.as_mut() {
+            match context.write_all(
+                self.file.as_fd(),
+                buffer,
+                MAX_FUNCTIONFS_IO,
+                FUNCTIONFS_AIO_DEPTH,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) if !error.submitted() => {
+                    self.aio = None;
+                }
+                Err(error) => return Err(error.into_io_error()),
+            }
+        }
+        for chunk in buffer.chunks(MAX_FUNCTIONFS_IO) {
+            Write::write_all(self, chunk)?;
+        }
+        Ok(())
+    }
 }
 
 impl Write for FunctionFsWriteEndpoint {
@@ -913,6 +963,8 @@ fn open_write_endpoint(
     #[cfg(unix)]
     return Ok(FunctionFsWriteEndpoint {
         file,
+        #[cfg(target_os = "linux")]
+        aio: kindlebridge_linux_aio::Context::new(FUNCTIONFS_AIO_DEPTH).ok(),
         generation: control.endpoint_generation(),
         control,
     });
