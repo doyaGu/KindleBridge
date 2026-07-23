@@ -241,6 +241,12 @@ pub struct ServerConfig {
 impl ServerConfig {
     #[must_use]
     pub fn new(device: DeviceInfo) -> Self {
+        let applications = ApplicationManager::new(
+            DEFAULT_ACTIVATION_ROOT,
+            device.target.clone(),
+            device.firmware.clone(),
+            DEVICE_RUNTIME_FEATURES,
+        );
         Self {
             device,
             allowed_peer: None,
@@ -249,7 +255,7 @@ impl ServerConfig {
             sync_root: PathBuf::from(DEFAULT_SYNC_ROOT),
             proc_root: PathBuf::from(DEFAULT_PROC_ROOT),
             log_path: PathBuf::from(DEFAULT_LOG_PATH),
-            applications: ApplicationManager::new(DEFAULT_ACTIVATION_ROOT),
+            applications,
         }
     }
 
@@ -267,7 +273,12 @@ impl ServerConfig {
 
     #[must_use]
     pub fn activation_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.applications = ApplicationManager::new(root);
+        self.applications = ApplicationManager::new(
+            root,
+            self.device.target.clone(),
+            self.device.firmware.clone(),
+            DEVICE_RUNTIME_FEATURES,
+        );
         self
     }
 
@@ -1261,10 +1272,7 @@ fn dispatch_process_list(
     let params = decode_params::<SerialParams>(params, "expected serial")?;
     require_serial(&params.serial, config)?;
     let mut list = services::process_list(&config.proc_root)?;
-    let managed = config.applications.managed_processes()?;
-    for process in &mut list.processes {
-        process.app_id = managed.get(&process.pid).cloned();
-    }
+    config.applications.annotate_processes(&mut list)?;
     Ok(list)
 }
 
@@ -1274,12 +1282,9 @@ fn dispatch_process_signal(
 ) -> Result<impl Serialize, RpcError> {
     let params = decode_params::<ProcessSignalParams>(params, "expected serial, pid, and signal")?;
     require_serial(&params.serial, config)?;
-    if let Some(app_id) = config.applications.app_id_for_pid(params.pid)? {
-        return Err(RpcError::invalid_params(format!(
-            "PID {} is managed by {app_id}; use app stop or app restart",
-            params.pid
-        )));
-    }
+    config
+        .applications
+        .reject_managed_process_signal(params.pid)?;
     services::process_signal(&config.proc_root, params.pid, &params.signal)
 }
 
@@ -1305,13 +1310,7 @@ fn dispatch_app_install(
     let mut bundle = sync_store
         .open_committed(&params.remote_path)
         .map_err(StoreError::into_rpc)?;
-    config.applications.install(
-        &mut bundle,
-        &params.file_hash,
-        &config.device.target,
-        &config.device.firmware,
-        DEVICE_RUNTIME_FEATURES,
-    )
+    config.applications.install(&mut bundle, &params.file_hash)
 }
 
 fn dispatch_app_start(

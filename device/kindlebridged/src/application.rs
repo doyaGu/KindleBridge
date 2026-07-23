@@ -4,13 +4,12 @@
 //! same operation lock and process supervisor, so activation changes cannot
 //! race lifecycle operations across KBP connections.
 
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use kindlebridge_schema::{
-    error_codes, AppList, AppLogParams, AppLogSnapshot, AppSummary, RpcError,
+    error_codes, AppList, AppLogParams, AppLogSnapshot, AppSummary, ProcessList, RpcError,
 };
 
 use crate::app::AppSupervisor;
@@ -24,16 +23,34 @@ pub struct ApplicationManager {
 #[derive(Debug)]
 struct ApplicationManagerInner {
     activation_root: PathBuf,
+    profile: ApplicationProfile,
     operations: Mutex<()>,
     supervisor: AppSupervisor,
 }
 
+#[derive(Debug)]
+struct ApplicationProfile {
+    target: String,
+    firmware: String,
+    available_features: Vec<&'static str>,
+}
+
 impl ApplicationManager {
     #[must_use]
-    pub fn new(activation_root: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        activation_root: impl Into<PathBuf>,
+        target: impl Into<String>,
+        firmware: impl Into<String>,
+        available_features: &[&'static str],
+    ) -> Self {
         Self {
             inner: Arc::new(ApplicationManagerInner {
                 activation_root: activation_root.into(),
+                profile: ApplicationProfile {
+                    target: target.into(),
+                    firmware: firmware.into(),
+                    available_features: available_features.to_vec(),
+                },
                 operations: Mutex::new(()),
                 supervisor: AppSupervisor::new(),
             }),
@@ -49,18 +66,15 @@ impl ApplicationManager {
         &self,
         bundle: &mut File,
         expected_file_hash: &str,
-        target: &str,
-        firmware: &str,
-        available_features: &[&str],
     ) -> Result<AppSummary, RpcError> {
         let _operation = self.lock_install_operation()?;
         services::app_install(
             bundle,
             expected_file_hash,
             self.activation_root(),
-            target,
-            firmware,
-            available_features,
+            &self.inner.profile.target,
+            &self.inner.profile.firmware,
+            &self.inner.profile.available_features,
             &self.inner.supervisor,
         )
     }
@@ -71,6 +85,7 @@ impl ApplicationManager {
     }
 
     pub fn log(&self, params: &AppLogParams) -> Result<AppLogSnapshot, RpcError> {
+        let _operation = self.lock_operation()?;
         services::app_log(self.activation_root(), &self.inner.supervisor, params)
     }
 
@@ -99,18 +114,30 @@ impl ApplicationManager {
         services::app_uninstall(self.activation_root(), &self.inner.supervisor, app_id)
     }
 
-    pub fn managed_processes(&self) -> Result<BTreeMap<u32, String>, RpcError> {
-        self.inner
+    pub fn annotate_processes(&self, processes: &mut ProcessList) -> Result<(), RpcError> {
+        let managed = self
+            .inner
             .supervisor
             .managed_processes()
-            .map_err(supervisor_unavailable)
+            .map_err(supervisor_unavailable)?;
+        for process in &mut processes.processes {
+            process.app_id = managed.get(&process.pid).cloned();
+        }
+        Ok(())
     }
 
-    pub fn app_id_for_pid(&self, pid: u32) -> Result<Option<String>, RpcError> {
-        self.inner
+    pub fn reject_managed_process_signal(&self, pid: u32) -> Result<(), RpcError> {
+        let app_id = self
+            .inner
             .supervisor
             .app_id_for_pid(pid)
-            .map_err(supervisor_unavailable)
+            .map_err(supervisor_unavailable)?;
+        if let Some(app_id) = app_id {
+            return Err(RpcError::invalid_params(format!(
+                "PID {pid} is managed by {app_id}; use app stop or app restart"
+            )));
+        }
+        Ok(())
     }
 
     fn lock_operation(&self) -> Result<MutexGuard<'_, ()>, RpcError> {
@@ -155,7 +182,7 @@ mod tests {
 
     #[test]
     fn clones_share_application_domain_state() {
-        let manager = ApplicationManager::new("/tmp/kindlebridge-apps");
+        let manager = ApplicationManager::new("/tmp/kindlebridge-apps", "kindlehf", "5.17.1", &[]);
         let clone = manager.clone();
 
         assert_eq!(clone.activation_root(), manager.activation_root());
