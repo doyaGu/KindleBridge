@@ -15,6 +15,7 @@ pub mod probe;
 pub mod server;
 mod services;
 pub mod shell;
+mod shell_stream;
 pub mod sync;
 mod sync_stream;
 

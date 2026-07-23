@@ -2,8 +2,6 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -13,11 +11,10 @@ use kindlebridge_functionfs::{
 };
 use kindlebridge_schema::device_protocol::{
     is_valid_session_id, DeviceAppInstallParams, DeviceCall, DeviceHello, DeviceReply, HostHello,
-    ShellOpen, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, PROTOCOL_VERSION, RPC_SERVICE,
-    SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE, SYNC_SERVICE,
+    DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, PROTOCOL_VERSION, RPC_SERVICE,
+    SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE, SYNC_SERVICE,
 };
 use kindlebridge_schema::device_rpc::{self as rpc_method, RpcMethod};
-use kindlebridge_schema::shell_protocol::{PacketSource, ShellPacket, ShellStreamState};
 use kindlebridge_schema::{
     error_codes, AppList, AppLogParams, AppLogSnapshot, AppSummary, AppTargetParams, ExecParams,
     ExecResult, LogSnapshot, LogTailParams, ProcessList, ProcessSignalParams, ProcessSummary,
@@ -45,7 +42,7 @@ use thiserror::Error;
 use crate::application::ApplicationManager;
 use crate::exec::{self, ExecError};
 use crate::services;
-use crate::shell::{ShellEvent, ShellWorker, ShellWorkerError};
+use crate::shell_stream::{ShellStreamError, ShellStreams};
 use crate::sync::{StoreError, SyncStore};
 use crate::DeviceInfo;
 
@@ -54,7 +51,6 @@ const DEFAULT_SYNC_ROOT: &str = "/mnt/us/kindlebridge-data";
 const DEFAULT_ACTIVATION_ROOT: &str = "/var/local/kindlebridge/apps";
 const DEFAULT_PROC_ROOT: &str = "/proc";
 const DEFAULT_LOG_PATH: &str = "/var/local/kindlebridge/usb.log";
-const MAX_CONCURRENT_SHELLS: usize = 4;
 const DEVICE_RUNTIME_FEATURES: &[&str] = &[
     rpc_method::AppInstall::FEATURE,
     rpc_method::AppList::FEATURE,
@@ -467,7 +463,7 @@ where
     } else {
         Connection::start(state, source, sink)
     };
-    let shells = Arc::new(AtomicUsize::new(0));
+    let shells = ShellStreams::default();
     loop {
         let incoming = match incoming.recv() {
             Ok(incoming) => incoming,
@@ -476,18 +472,13 @@ where
         };
         let config = config.clone();
         let sync_store = sync_store.clone();
-        let shells = Arc::clone(&shells);
+        let shells = shells.clone();
         thread::spawn(move || {
             let service = incoming.service.clone();
             let result = match service.as_str() {
                 RPC_SERVICE => serve_actor_rpc(incoming, &config, &sync_store),
                 SYNC_SERVICE => crate::sync_stream::serve(incoming, &sync_store),
-                SHELL_V2_SERVICE => match ShellSlot::reserve(shells) {
-                    Some(slot) => serve_actor_shell(incoming, slot),
-                    None => incoming
-                        .reject("at most four shell sessions may be active")
-                        .map_err(ServerError::Connection),
-                },
+                SHELL_V2_SERVICE => shells.serve(incoming).map_err(ServerError::from),
                 _ => incoming
                     .reject(format!("unsupported service {service}"))
                     .map_err(ServerError::Connection),
@@ -496,25 +487,6 @@ where
                 eprintln!("KindleBridge {service} stream ended: {error}");
             }
         });
-    }
-}
-
-struct ShellSlot(Arc<AtomicUsize>);
-
-impl ShellSlot {
-    fn reserve(active: Arc<AtomicUsize>) -> Option<Self> {
-        active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                (value < MAX_CONCURRENT_SHELLS).then_some(value + 1)
-            })
-            .ok()
-            .map(|_| Self(active))
-    }
-}
-
-impl Drop for ShellSlot {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -541,125 +513,6 @@ fn serve_actor_rpc(
     }
     stream.send_data(response, true)?;
     stream.close()?;
-    Ok(())
-}
-
-fn serve_actor_shell(incoming: ActorIncomingStream, _slot: ShellSlot) -> Result<(), ServerError> {
-    let mut stream = incoming.accept(SHELL_STREAM_WINDOW, TrafficClass::Interactive)?;
-    let open_frame = actor_data(&mut stream)?;
-    if open_frame.header.flags & FLAG_END_STREAM != 0 {
-        stream.reset("shell open metadata must not end the stream")?;
-        return Ok(());
-    }
-    let open: ShellOpen = match decode(&open_frame.payload, "shell open") {
-        Ok(open) => open,
-        Err(error) => {
-            stream.reset(error.to_string())?;
-            return Ok(());
-        }
-    };
-    let mut worker = match ShellWorker::spawn(open.clone()) {
-        Ok(worker) => worker,
-        Err(error) => {
-            stream.reset(error.to_string())?;
-            return Ok(());
-        }
-    };
-    let input = worker.input();
-    let input_stream = stream.clone();
-    let stream_stopped = Arc::new(AtomicBool::new(false));
-    let input_stopped = Arc::clone(&stream_stopped);
-    let input_thread = thread::spawn(move || {
-        let mut protocol = ShellStreamState::new(open.mode);
-        loop {
-            let frame = match input_stream.recv() {
-                Ok(frame) => frame,
-                Err(_) => {
-                    input_stopped.store(true, Ordering::Release);
-                    let _ = input.hangup();
-                    break;
-                }
-            };
-            match frame.header.command {
-                Command::Data => {
-                    let packet = match ShellPacket::decode(&frame.payload, PacketSource::Host) {
-                        Ok(packet) => packet,
-                        Err(error) => {
-                            input_stopped.store(true, Ordering::Release);
-                            let _ = input_stream.reset(error.to_string());
-                            let _ = input.hangup();
-                            break;
-                        }
-                    };
-                    if let Err(error) = protocol.accept(&packet) {
-                        input_stopped.store(true, Ordering::Release);
-                        let _ = input_stream.reset(error.to_string());
-                        let _ = input.hangup();
-                        break;
-                    }
-                    let result = match packet {
-                        ShellPacket::Stdin(bytes) => input.write_stdin(bytes),
-                        ShellPacket::CloseStdin => input.close_input(),
-                        ShellPacket::Resize(size) => input.resize(size),
-                        _ => unreachable!("host packet direction was validated"),
-                    };
-                    if result.is_err() {
-                        input_stopped.store(true, Ordering::Release);
-                        let _ = input_stream.reset("shell process input stopped");
-                        break;
-                    }
-                }
-                Command::Reset | Command::Close => {
-                    input_stopped.store(true, Ordering::Release);
-                    let _ = input.hangup();
-                    break;
-                }
-                _ => {
-                    input_stopped.store(true, Ordering::Release);
-                    let _ = input_stream.reset("unexpected shell stream frame");
-                    let _ = input.hangup();
-                    break;
-                }
-            }
-        }
-    });
-
-    loop {
-        match worker.recv_timeout(Duration::from_secs(1)) {
-            Ok(ShellEvent::Stdout(bytes)) => {
-                if stream_stopped.load(Ordering::Acquire) {
-                    break;
-                }
-                stream.send_data(ShellPacket::Stdout(bytes).encode()?, false)?;
-            }
-            Ok(ShellEvent::Stderr(bytes)) => {
-                if stream_stopped.load(Ordering::Acquire) {
-                    break;
-                }
-                stream.send_data(ShellPacket::Stderr(bytes).encode()?, false)?;
-            }
-            Ok(ShellEvent::Exit(status)) => {
-                if stream_stopped.load(Ordering::Acquire) {
-                    break;
-                }
-                let result = stream.send_data(ShellPacket::Exit(status).encode()?, true);
-                let _ = stream.cancel_receive();
-                result?;
-                stream.close()?;
-                break;
-            }
-            Err(ShellWorkerError::ReceiveTimeout) => {}
-            Err(error) => {
-                if stream_stopped.load(Ordering::Acquire) {
-                    break;
-                }
-                let _ = stream.cancel_receive();
-                stream.reset(error.to_string())?;
-                break;
-            }
-        }
-    }
-    let _ = input_thread.join();
     Ok(())
 }
 
@@ -1074,9 +927,7 @@ pub enum ServerError {
     #[error(transparent)]
     Connection(#[from] ConnectionError),
     #[error(transparent)]
-    Shell(#[from] ShellWorkerError),
-    #[error(transparent)]
-    ShellPacket(#[from] kindlebridge_schema::shell_protocol::ShellPacketError),
+    ShellStream(#[from] ShellStreamError),
     #[error("invalid {label} payload: {source}")]
     InvalidPayload {
         label: &'static str,
@@ -1100,12 +951,9 @@ pub enum ServerError {
 
 #[cfg(test)]
 mod tests {
+    use kindlebridge_schema::methods;
     use std::collections::{BTreeMap, VecDeque};
     use std::io;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::Arc;
-
-    use kindlebridge_schema::methods;
 
     use super::*;
 
@@ -1124,18 +972,6 @@ mod tests {
             validate_hello(&hello, &config),
             Err(ServerError::InvalidHello)
         ));
-    }
-
-    #[test]
-    fn shell_registry_allows_four_sessions_and_releases_slots() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let mut slots = Vec::new();
-        for _ in 0..MAX_CONCURRENT_SHELLS {
-            slots.push(ShellSlot::reserve(Arc::clone(&active)).unwrap());
-        }
-        assert!(ShellSlot::reserve(Arc::clone(&active)).is_none());
-        slots.pop();
-        assert!(ShellSlot::reserve(active).is_some());
     }
 
     struct ScriptedFrameIo {
