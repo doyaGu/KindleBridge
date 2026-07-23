@@ -36,7 +36,7 @@ use thiserror::Error;
 
 #[cfg(test)]
 use client_runtime::{
-    cancel_sync_jobs, handle_shell_open, handle_stream_notification, handle_sync_open,
+    handle_shell_open, handle_stream_notification, handle_sync_open, ClientRuntime,
 };
 use runtime::RuntimeState;
 
@@ -1072,19 +1072,38 @@ mod tests {
     }
 
     #[test]
-    fn client_teardown_cancels_and_removes_all_sync_jobs() {
+    fn client_runtime_shutdown_is_idempotent_and_clears_all_work() {
+        let shell = Arc::new(FakeShell::new([]));
         let first = Arc::new(SyncObserver::default());
         let second = Arc::new(SyncObserver::default());
-        let jobs = Arc::new(Mutex::new(HashMap::from([
-            ("first".to_owned(), Arc::clone(&first)),
-            ("second".to_owned(), Arc::clone(&second)),
-        ])));
+        let runtime = ClientRuntime::new(Vec::<u8>::new(), Arc::new(provider()));
+        let shell_stream: Arc<dyn ShellStream> = shell.clone();
+        runtime.track_shell("shell".to_owned(), shell_stream);
+        runtime.track_sync("first".to_owned(), Arc::clone(&first));
+        runtime.track_sync("second".to_owned(), Arc::clone(&second));
 
-        cancel_sync_jobs(&jobs);
+        runtime.shutdown();
+        runtime.shutdown();
 
+        assert!(shell.closed.load(Ordering::Acquire));
         assert!(first.is_cancelled());
         assert!(second.is_cancelled());
-        assert!(jobs.lock().unwrap().is_empty());
+        assert!(runtime.is_idle());
+    }
+
+    #[test]
+    fn dropping_client_runtime_closes_shells_and_cancels_sync_jobs() {
+        let shell = Arc::new(FakeShell::new([]));
+        let observer = Arc::new(SyncObserver::default());
+        {
+            let runtime = ClientRuntime::new(Vec::<u8>::new(), Arc::new(provider()));
+            let shell_stream: Arc<dyn ShellStream> = shell.clone();
+            runtime.track_shell("shell".to_owned(), shell_stream);
+            runtime.track_sync("sync".to_owned(), Arc::clone(&observer));
+        }
+
+        assert!(shell.closed.load(Ordering::Acquire));
+        assert!(observer.is_cancelled());
     }
 
     #[test]

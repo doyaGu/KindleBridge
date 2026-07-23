@@ -24,6 +24,57 @@ use super::{
 
 const MAX_CLIENT_SYNC_JOBS: usize = 4;
 
+pub(super) struct ClientRuntime<W> {
+    writer: Arc<Mutex<W>>,
+    provider: Arc<dyn DeviceProvider>,
+    streams: Arc<Mutex<HashMap<String, Arc<dyn ShellStream>>>>,
+    sync_jobs: Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>,
+}
+
+impl<W> ClientRuntime<W> {
+    pub(super) fn new(writer: W, provider: Arc<dyn DeviceProvider>) -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(writer)),
+            provider,
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            sync_jobs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub(super) fn shutdown(&self) {
+        if let Ok(mut streams) = self.streams.lock() {
+            for (_, stream) in streams.drain() {
+                let _ = stream.close();
+            }
+        }
+        cancel_sync_jobs(&self.sync_jobs);
+    }
+
+    #[cfg(test)]
+    pub(super) fn track_shell(&self, stream_id: String, shell: Arc<dyn ShellStream>) {
+        self.streams.lock().unwrap().insert(stream_id, shell);
+    }
+
+    #[cfg(test)]
+    pub(super) fn track_sync(&self, operation_id: String, observer: Arc<SyncObserver>) {
+        self.sync_jobs
+            .lock()
+            .unwrap()
+            .insert(operation_id, observer);
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_idle(&self) -> bool {
+        self.streams.lock().unwrap().is_empty() && self.sync_jobs.lock().unwrap().is_empty()
+    }
+}
+
+impl<W> Drop for ClientRuntime<W> {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// Serves the full duplex JSON-RPC API, including asynchronous shell stream
 /// notifications. Each invocation owns one client's stream registry; dropping
 /// the client deterministically closes every shell it opened.
@@ -36,19 +87,7 @@ where
     R: BufRead,
     W: Write + Send + 'static,
 {
-    let writer = Arc::new(Mutex::new(writer));
-    let streams: Arc<Mutex<HashMap<String, Arc<dyn ShellStream>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let sync_jobs: Arc<Mutex<HashMap<String, Arc<SyncObserver>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let result = serve_streaming_loop(reader, &writer, &provider, &streams, &sync_jobs);
-    if let Ok(mut streams) = streams.lock() {
-        for (_, stream) in streams.drain() {
-            let _ = stream.close();
-        }
-    }
-    cancel_sync_jobs(&sync_jobs);
-    result
+    ClientRuntime::new(writer, provider).serve(reader)
 }
 
 pub(super) fn cancel_sync_jobs(jobs: &Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>) {
@@ -59,58 +98,53 @@ pub(super) fn cancel_sync_jobs(jobs: &Arc<Mutex<HashMap<String, Arc<SyncObserver
     }
 }
 
-fn serve_streaming_loop<R, W>(
-    reader: &mut R,
-    writer: &Arc<Mutex<W>>,
-    provider: &Arc<dyn DeviceProvider>,
-    streams: &Arc<Mutex<HashMap<String, Arc<dyn ShellStream>>>>,
-    sync_jobs: &Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>,
-) -> Result<(), ServeError>
+impl<W> ClientRuntime<W>
 where
-    R: BufRead,
     W: Write + Send + 'static,
 {
-    loop {
-        let Some(payload) = read_frame(reader, DEFAULT_MAX_CONTENT_LENGTH)? else {
-            return Ok(());
-        };
-        let value = match serde_json::from_slice::<Value>(&payload) {
-            Ok(value) => value,
-            Err(_) => {
-                write_shared(
-                    writer,
-                    &RpcResponse::failure(RequestId::Null, RpcError::parse_error()),
-                )?;
-                continue;
-            }
-        };
-        let request = match parse_request_value(value) {
-            Ok(request) => request,
-            Err(error) => {
-                write_shared(writer, &RpcResponse::failure(RequestId::Null, error))?;
-                continue;
-            }
-        };
+    fn serve<R: BufRead>(&self, reader: &mut R) -> Result<(), ServeError> {
+        loop {
+            let Some(payload) = read_frame(reader, DEFAULT_MAX_CONTENT_LENGTH)? else {
+                return Ok(());
+            };
+            let value = match serde_json::from_slice::<Value>(&payload) {
+                Ok(value) => value,
+                Err(_) => {
+                    write_shared(
+                        &self.writer,
+                        &RpcResponse::failure(RequestId::Null, RpcError::parse_error()),
+                    )?;
+                    continue;
+                }
+            };
+            let request = match parse_request_value(value) {
+                Ok(request) => request,
+                Err(error) => {
+                    write_shared(&self.writer, &RpcResponse::failure(RequestId::Null, error))?;
+                    continue;
+                }
+            };
 
-        if request.method == methods::SHELL_OPEN {
-            handle_shell_open(request, writer, provider, streams)?;
-        } else if matches!(
-            request.method.as_str(),
-            methods::SYNC_PUSH_STREAM | methods::SYNC_PULL_STREAM
-        ) {
-            handle_sync_open(request, writer, provider, sync_jobs)?;
-        } else if request.method == methods::SYNC_CANCEL {
-            handle_sync_cancel(request, sync_jobs);
-        } else if matches!(
-            request.method.as_str(),
-            methods::STREAM_WRITE
-                | methods::STREAM_RESIZE
-                | methods::STREAM_CLOSE_INPUT
-                | methods::STREAM_CLOSE
-        ) {
-            handle_stream_notification(request, writer, streams)?;
-        } else if let Some(response) = handle_request(request, provider.as_ref()) {
-            write_shared(writer, &response)?;
+            if request.method == methods::SHELL_OPEN {
+                handle_shell_open(request, &self.writer, &self.provider, &self.streams)?;
+            } else if matches!(
+                request.method.as_str(),
+                methods::SYNC_PUSH_STREAM | methods::SYNC_PULL_STREAM
+            ) {
+                handle_sync_open(request, &self.writer, &self.provider, &self.sync_jobs)?;
+            } else if request.method == methods::SYNC_CANCEL {
+                handle_sync_cancel(request, &self.sync_jobs);
+            } else if matches!(
+                request.method.as_str(),
+                methods::STREAM_WRITE
+                    | methods::STREAM_RESIZE
+                    | methods::STREAM_CLOSE_INPUT
+                    | methods::STREAM_CLOSE
+            ) {
+                handle_stream_notification(request, &self.writer, &self.streams)?;
+            } else if let Some(response) = handle_request(request, self.provider.as_ref()) {
+                write_shared(&self.writer, &response)?;
+            }
         }
     }
 }
