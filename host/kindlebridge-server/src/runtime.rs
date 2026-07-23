@@ -6,11 +6,11 @@ use std::path::Path;
 use kindlebridge_bundle::{verify, BundleKind, VerifyOptions};
 use kindlebridge_schema::{
     error_codes, AppInstallParams, AppList, AppLogChunk, AppLogParams, AppLogSnapshot, AppState,
-    AppSummary, AppTargetParams, LogEntry, LogSnapshot, LogTailParams, ProcessList, ProcessSignal,
-    ProcessSignalParams, ProcessState, ProcessSummary, RpcError, SerialParams, SyncEntry,
-    SyncEntryKind, SyncListParams, SyncListResult, SyncMkdirParams, SyncMkdirResult,
-    SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams,
-    TransferDirection, TransferState,
+    AppSummary, AppTargetParams, LogEntry, LogSnapshot, LogTailParams, LogicalSyncPath,
+    ProcessList, ProcessSignal, ProcessSignalParams, ProcessState, ProcessSummary, RpcError,
+    SerialParams, SyncEntry, SyncEntryKind, SyncListParams, SyncListResult, SyncMkdirParams,
+    SyncMkdirResult, SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus,
+    SyncStatusParams, TransferDirection, TransferState,
 };
 use serde_json::json;
 
@@ -642,18 +642,11 @@ fn validate_transfer(
 }
 
 fn validate_path(path: &str) -> Result<(), RpcError> {
-    if path.is_empty()
-        || path.starts_with('/')
-        || path.contains('\\')
-        || path
-            .split('/')
-            .any(|component| component.is_empty() || matches!(component, "." | ".."))
-    {
-        return Err(RpcError::invalid_params(
-            "remote_path must be a normalized relative logical path",
-        ));
-    }
-    Ok(())
+    LogicalSyncPath::parse(path.to_owned())
+        .map(drop)
+        .map_err(|_| {
+            RpcError::invalid_params("remote_path must be a normalized relative logical path")
+        })
 }
 
 fn validate_host_path(path: &str) -> Result<(), RpcError> {
@@ -738,4 +731,26 @@ fn process_not_found(pid: u32) -> RpcError {
         "Process not found",
         json!({ "pid": pid }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fake_adapter_uses_all_logical_path_rules_but_keeps_its_fixed_error() {
+        for path in [
+            "a".repeat(1_025),
+            "a".repeat(256),
+            "books/a\nb".to_owned(),
+            "books/e\u{301}.epub".to_owned(),
+        ] {
+            assert_eq!(
+                validate_path(&path),
+                Err(RpcError::invalid_params(
+                    "remote_path must be a normalized relative logical path"
+                ))
+            );
+        }
+    }
 }
