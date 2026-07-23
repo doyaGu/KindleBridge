@@ -266,9 +266,11 @@ Watch mode debounces changes to the explicitly listed paths and reconnects to
 the shared host service for every deployment. Build or bundle failures occur
 before any device mutation, so the previous application remains active.
 Generated development bundles live below `.kindlebridge/` and receive a
-monotonic development release without rewriting the source manifest. Build
-cancellation and merged live application logs are the next development-loop
-increments.
+monotonic development release without rewriting the source manifest. If source
+changes while a build is still running, watch mode terminates that obsolete
+build process tree, reloads the project configuration, and builds only the
+latest source. Merged live application logs are the next development-loop
+increment.
 
 ```powershell
 cargo run --package kindlebridge-bundle -- key init --output dev.key

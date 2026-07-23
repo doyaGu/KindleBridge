@@ -20,8 +20,8 @@ use interprocess::local_socket::{
     prelude::*, GenericFilePath, GenericNamespaced, SendHalf, Stream,
 };
 use kindlebridge::{
-    execute_with_status, run_project_once, Cli, CliError, CommandOutput, RunArgs, ServerCommand,
-    ShellArgs, TopLevelCommand,
+    deploy_project_after_build, execute_with_status, Cli, CliError, CommandOutput, RunArgs,
+    ServerCommand, ShellArgs, TopLevelCommand,
 };
 use kindlebridge_bundle::read_project_manifest;
 use kindlebridge_schema::device_protocol::{ShellMode, ShellOpen, TerminalSize, SHELL_V2_FEATURE};
@@ -172,19 +172,16 @@ fn run_project_watch(cli: &Cli, args: &RunArgs) -> Result<CommandOutput, RunErro
             "[development].watch must list source paths for run --watch".to_owned(),
         ));
     }
-    let watch_paths = development
-        .watch
-        .iter()
-        .map(|path| {
-            if path.is_absolute() {
-                path.clone()
-            } else {
-                project_root.join(path)
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut watch_paths = resolve_watch_paths(project_root, &development.watch);
     let mut previous = watch_snapshot(&watch_paths)?;
-    print_run_result(run_project_connected(cli, args))?;
+    previous = run_current_build(
+        &development.build,
+        Some(&manifest_path),
+        project_root,
+        &watch_paths,
+        previous,
+    )?;
+    print_run_result(deploy_project_connected(cli, args))?;
     eprintln!(
         "watching {} (press Ctrl-C to stop)",
         watch_paths
@@ -209,9 +206,41 @@ fn run_project_watch(cli: &Cli, args: &RunArgs) -> Result<CommandOutput, RunErro
             }
             stable = next;
         }
-        previous = stable;
         eprintln!("change detected; rebuilding...");
-        match run_project_connected(cli, args) {
+        let refreshed = read_project_manifest(&manifest_path)
+            .map_err(|error| RunError::Message(format!("could not reload project: {error}")))?;
+        let refreshed = refreshed.development.ok_or_else(|| {
+            RunError::Message(format!(
+                "{} is missing [development]",
+                manifest_path.display()
+            ))
+        })?;
+        let refreshed_paths = resolve_watch_paths(project_root, &refreshed.watch);
+        if refreshed_paths.is_empty() {
+            return Err(RunError::Arguments(
+                "[development].watch must list source paths for run --watch".to_owned(),
+            ));
+        }
+        if refreshed_paths != watch_paths {
+            watch_paths = refreshed_paths;
+            stable = watch_snapshot(&watch_paths)?;
+            eprintln!("watch path configuration changed; reloaded project");
+        }
+        previous = match run_current_build(
+            &refreshed.build,
+            Some(&manifest_path),
+            project_root,
+            &watch_paths,
+            stable,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                previous = watch_snapshot(&watch_paths)?;
+                eprintln!("build failed; waiting for another change: {error}");
+                continue;
+            }
+        };
+        match deploy_project_connected(cli, args) {
             Ok(output) => println!("{output}"),
             Err(error) => {
                 eprintln!(
@@ -222,13 +251,144 @@ fn run_project_watch(cli: &Cli, args: &RunArgs) -> Result<CommandOutput, RunErro
     }
 }
 
-fn run_project_connected(cli: &Cli, args: &RunArgs) -> Result<String, CliError> {
+fn resolve_watch_paths(project_root: &Path, configured: &[PathBuf]) -> Vec<PathBuf> {
+    configured
+        .iter()
+        .map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                project_root.join(path)
+            }
+        })
+        .collect()
+}
+
+fn deploy_project_connected(cli: &Cli, args: &RunArgs) -> Result<String, CliError> {
     let stream = connect_or_start(cli).map_err(|error| {
         CliError::Project(format!("could not connect to the host server: {error}"))
     })?;
     let (reader, writer) = stream.split();
     let mut client = RpcClient::new(BufReader::new(reader), BufWriter::new(writer));
-    run_project_once(&mut client, args, false)
+    deploy_project_after_build(&mut client, args, false)
+}
+
+fn run_current_build(
+    build: &[String],
+    manifest_path: Option<&Path>,
+    project_root: &Path,
+    watch_paths: &[PathBuf],
+    mut snapshot: BTreeMap<PathBuf, (u64, std::time::SystemTime)>,
+) -> Result<BTreeMap<PathBuf, (u64, std::time::SystemTime)>, RunError> {
+    let mut current_build = build.to_vec();
+    loop {
+        let Some((program, arguments)) = current_build.split_first() else {
+            return Ok(snapshot);
+        };
+        let mut command = Command::new(program);
+        command.args(arguments).current_dir(project_root);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().map_err(|error| {
+            RunError::Command(CliError::Project(format!(
+                "could not start build command {program}: {error}"
+            )))
+        })?;
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|error| RunError::Message(format!("could not wait for build: {error}")))?
+            {
+                if status.success() {
+                    return watch_snapshot(watch_paths);
+                }
+                return Err(RunError::Command(CliError::BuildFailed {
+                    exit_code: status.code().unwrap_or(1),
+                    detail: String::new(),
+                }));
+            }
+            thread::sleep(Duration::from_millis(100));
+            let current = watch_snapshot(watch_paths)?;
+            if current == snapshot {
+                continue;
+            }
+            let stable = debounce_watch_paths(watch_paths, current)?;
+            terminate_build_tree(&mut child)?;
+            eprintln!("source changed during build; cancelled obsolete build");
+            snapshot = stable;
+            if let Some(manifest_path) = manifest_path {
+                let refreshed = read_project_manifest(manifest_path).map_err(|error| {
+                    RunError::Message(format!("could not reload project: {error}"))
+                })?;
+                current_build = refreshed
+                    .development
+                    .ok_or_else(|| {
+                        RunError::Message(format!(
+                            "{} is missing [development]",
+                            manifest_path.display()
+                        ))
+                    })?
+                    .build;
+            }
+            break;
+        }
+    }
+}
+
+fn debounce_watch_paths(
+    watch_paths: &[PathBuf],
+    mut snapshot: BTreeMap<PathBuf, (u64, std::time::SystemTime)>,
+) -> Result<BTreeMap<PathBuf, (u64, std::time::SystemTime)>, RunError> {
+    loop {
+        thread::sleep(Duration::from_millis(250));
+        let next = watch_snapshot(watch_paths)?;
+        if next == snapshot {
+            return Ok(snapshot);
+        }
+        snapshot = next;
+    }
+}
+
+fn terminate_build_tree(child: &mut std::process::Child) -> Result<(), RunError> {
+    #[cfg(windows)]
+    {
+        let status = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| {
+                RunError::Message(format!("could not terminate obsolete build tree: {error}"))
+            })?;
+        if !status.success() {
+            child.kill().map_err(|error| {
+                RunError::Message(format!("could not terminate obsolete build: {error}"))
+            })?;
+        }
+    }
+    #[cfg(unix)]
+    {
+        let group = format!("-{}", child.id());
+        let _ = Command::new("kill").args(["-TERM", "--", &group]).status();
+        for _ in 0..10 {
+            if child
+                .try_wait()
+                .map_err(|error| RunError::Message(format!("could not wait for build: {error}")))?
+                .is_some()
+            {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+    }
+    child
+        .wait()
+        .map_err(|error| RunError::Message(format!("could not reap obsolete build: {error}")))?;
+    Ok(())
 }
 
 fn print_run_result(result: Result<String, CliError>) -> Result<(), RunError> {
@@ -1190,6 +1350,46 @@ mod tests {
         fs::remove_file(first).unwrap();
         let removed = watch_snapshot(std::slice::from_ref(&root)).unwrap();
         assert_ne!(removed, added);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn watch_cancels_an_obsolete_build_and_runs_the_latest_source() {
+        let root =
+            std::env::temp_dir().join(format!("kindlebridge-watch-cancel-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.txt");
+        fs::write(&source, b"old").unwrap();
+        let marker = root.join("marker.txt");
+        let build = if cfg!(windows) {
+            vec![
+                "powershell.exe".to_owned(),
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                "if ((Get-Content source.txt) -eq 'old') { Start-Sleep -Seconds 5 }; Set-Content marker.txt done".to_owned(),
+            ]
+        } else {
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "if [ \"$(cat source.txt)\" = old ]; then sleep 5; fi; printf done > marker.txt"
+                    .to_owned(),
+            ]
+        };
+        let paths = vec![source.clone()];
+        let initial = watch_snapshot(&paths).unwrap();
+        let source_for_thread = source.clone();
+        let editor = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            fs::write(source_for_thread, b"newer source").unwrap();
+        });
+        let started = Instant::now();
+        let final_snapshot = run_current_build(&build, None, &root, &paths, initial).unwrap();
+        editor.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(fs::read_to_string(marker).unwrap().trim(), "done");
+        assert_eq!(final_snapshot, watch_snapshot(&paths).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 

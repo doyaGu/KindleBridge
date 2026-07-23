@@ -512,6 +512,23 @@ pub fn run_project_once<C: RpcCaller>(
     args: &RunArgs,
     json_output: bool,
 ) -> Result<String, CliError> {
+    run_project(caller, args, json_output, true)
+}
+
+pub fn deploy_project_after_build<C: RpcCaller>(
+    caller: &mut C,
+    args: &RunArgs,
+    json_output: bool,
+) -> Result<String, CliError> {
+    run_project(caller, args, json_output, false)
+}
+
+fn run_project<C: RpcCaller>(
+    caller: &mut C,
+    args: &RunArgs,
+    json_output: bool,
+    execute_build: bool,
+) -> Result<String, CliError> {
     let manifest_path = absolute_path(&args.manifest)?;
     let project_root = manifest_path.parent().ok_or_else(|| {
         CliError::Project(format!(
@@ -527,8 +544,10 @@ pub fn run_project_once<C: RpcCaller>(
             manifest_path.display()
         ))
     })?;
-    if let Some((program, arguments)) = development.build.split_first() {
-        run_project_build(program, arguments, project_root, json_output)?;
+    if execute_build {
+        if let Some((program, arguments)) = development.build.split_first() {
+            run_project_build(program, arguments, project_root, json_output)?;
+        }
     }
 
     let input = resolve_project_path(project_root, &development.input);
