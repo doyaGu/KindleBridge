@@ -77,6 +77,15 @@ pull is explicit with `--recursive`. Empty directories are preserved. Trees
 reject symbolic links, special files, and an existing pull destination. Each
 regular file still uses the bounded, atomic single-file sync path.
 
+Interactive CLI sync reports hashing and committed transfer progress on stderr;
+`--json` keeps stderr quiet. Pressing Ctrl-C closes that CLI's local connection,
+which cancels its active transfer, wakes any blocked KBP receive, and resets only
+the affected sync stream. Long transfers print their resume token before
+completion, so the next command can continue with `--resume TOKEN`. Other
+shells and device operations remain online.
+Each client is limited to four active sync jobs, and progress reporting adds no
+unbounded payload queue.
+
 This explicit TCP option is an internal bring-up path. It is unencrypted and
 must not be exposed beyond a trusted development link. The production profile
 still requires authenticated pairing and session encryption.
