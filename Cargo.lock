@@ -602,6 +602,8 @@ name = "kindlebridge-local"
 version = "0.1.0-dev.42"
 dependencies = [
  "interprocess",
+ "kindlebridge-schema",
+ "serde_json",
 ]
 
 [[package]]

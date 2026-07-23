@@ -15,6 +15,10 @@ use interprocess::local_socket::{
     prelude::*, Listener, ListenerNonblockingMode, ListenerOptions, Stream,
 };
 
+mod lifecycle;
+
+pub use lifecycle::{acquire, wait_for_shutdown, LifecycleError, ServerContract};
+
 /// A nonblocking listener for the current user's KindleBridge server.
 pub struct LocalListener {
     inner: Listener,
