@@ -2,7 +2,7 @@
 
 use kindlebridge_broker::{AuthenticatedSession, Grant, SUPPORTED_BUNDLE_PROFILE};
 use kindlebridge_schema::device_protocol::{
-    APP_LIST_FEATURE, LOG_TAIL_FEATURE, PROCESS_LIST_FEATURE,
+    APP_LIST_FEATURE, LOG_TAIL_FEATURE, PROCESS_LIST_FEATURE, SYNC_TREE_FEATURE,
 };
 use kindlebridge_wire::{PROTOCOL_MAJOR as KBP_MAJOR, PROTOCOL_MINOR as KBP_MINOR};
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,11 @@ pub const SERVICES: &[ServiceDefinition] = &[
     },
     ServiceDefinition {
         name: "sync.v1",
+        required_grant: Grant::FsApp,
+        available_on_kindlehf: true,
+    },
+    ServiceDefinition {
+        name: SYNC_TREE_FEATURE,
         required_grant: Grant::FsApp,
         available_on_kindlehf: true,
     },

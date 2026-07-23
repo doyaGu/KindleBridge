@@ -32,6 +32,7 @@ pub const LOG_TAIL_FEATURE: &str = "log.tail.v1";
 pub const PROCESS_LIST_FEATURE: &str = "process.list.v1";
 pub const PROCESS_SIGNAL_FEATURE: &str = "process.signal.v1";
 pub const SYNC_FEATURE: &str = "sync.v1";
+pub const SYNC_TREE_FEATURE: &str = "sync.tree.v1";
 pub const SHELL_V2_FEATURE: &str = SHELL_V2_SERVICE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

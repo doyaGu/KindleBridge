@@ -27,6 +27,8 @@ pub mod methods {
     pub const SYNC_PUSH: &str = "v1.sync.push";
     pub const SYNC_PULL: &str = "v1.sync.pull";
     pub const SYNC_STATUS: &str = "v1.sync.status";
+    pub const SYNC_LIST: &str = "v1.sync.list";
+    pub const SYNC_MKDIR: &str = "v1.sync.mkdir";
     pub const APP_INSTALL: &str = "v1.app.install";
     pub const APP_START: &str = "v1.app.start";
     pub const APP_STOP: &str = "v1.app.stop";
@@ -520,6 +522,56 @@ pub struct SyncStatus {
     pub next_offset: u64,
     pub total_size: u64,
     pub state: TransferState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncEntry {
+    pub name: String,
+    pub kind: SyncEntryKind,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncListParams {
+    pub serial: String,
+    pub remote_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default = "default_sync_list_limit")]
+    pub limit: u32,
+}
+
+const fn default_sync_list_limit() -> u32 {
+    256
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncListResult {
+    pub remote_path: String,
+    pub entries: Vec<SyncEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncMkdirParams {
+    pub serial: String,
+    pub remote_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncMkdirResult {
+    pub remote_path: String,
+    pub created: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

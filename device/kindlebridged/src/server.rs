@@ -19,13 +19,14 @@ use kindlebridge_schema::device_protocol::{
     APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, EXEC_FEATURE,
     LOG_TAIL_FEATURE, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION, RPC_SERVICE,
     SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE, SYNC_SERVICE,
+    SYNC_TREE_FEATURE,
 };
 #[cfg(test)]
 use kindlebridge_schema::device_protocol::{ServiceAccept, ServiceOpen, SYNC_CREDIT_BATCH_SIZE};
 use kindlebridge_schema::shell_protocol::{PacketSource, ShellPacket, ShellStreamState};
 use kindlebridge_schema::{
     error_codes, methods, AppTargetParams, ExecParams, LogTailParams, ProcessSignalParams,
-    RpcError, SerialParams, SyncStatusParams, MAX_SYNC_BLOCK_SIZE,
+    RpcError, SerialParams, SyncListParams, SyncMkdirParams, SyncStatusParams, MAX_SYNC_BLOCK_SIZE,
 };
 use kindlebridge_transport::{
     actor::{
@@ -74,6 +75,7 @@ const DEVICE_RUNTIME_FEATURES: &[&str] = &[
     PROCESS_SIGNAL_FEATURE,
     SHELL_V2_FEATURE,
     SYNC_FEATURE,
+    SYNC_TREE_FEATURE,
 ];
 
 #[derive(Debug)]
@@ -1827,6 +1829,8 @@ fn serve_sync_pull(
 fn dispatch(call: DeviceCall, config: &ServerConfig, sync_store: &SyncStore) -> DeviceReply {
     match call.method.as_str() {
         methods::SYNC_STATUS => reply(dispatch_sync_status(call.params, config, sync_store)),
+        methods::SYNC_LIST => reply(dispatch_sync_list(call.params, config, sync_store)),
+        methods::SYNC_MKDIR => reply(dispatch_sync_mkdir(call.params, config, sync_store)),
         methods::EXEC_RUN => reply(dispatch_exec(call.params, config)),
         methods::APP_LIST => reply(dispatch_app_list(call.params, config)),
         methods::PROCESS_LIST => reply(dispatch_process_list(call.params, config)),
@@ -1861,6 +1865,31 @@ fn dispatch_sync_status(
     require_serial(&params.serial, config)?;
     sync_store
         .status(&params.transfer_id)
+        .map_err(StoreError::into_rpc)
+}
+
+fn dispatch_sync_list(
+    params: serde_json::Value,
+    config: &ServerConfig,
+    sync_store: &SyncStore,
+) -> Result<impl Serialize, RpcError> {
+    let params =
+        decode_params::<SyncListParams>(params, "expected serial, remote_path, cursor, and limit")?;
+    require_serial(&params.serial, config)?;
+    sync_store
+        .list_directory(&params.remote_path, params.cursor.as_deref(), params.limit)
+        .map_err(StoreError::into_rpc)
+}
+
+fn dispatch_sync_mkdir(
+    params: serde_json::Value,
+    config: &ServerConfig,
+    sync_store: &SyncStore,
+) -> Result<impl Serialize, RpcError> {
+    let params = decode_params::<SyncMkdirParams>(params, "expected serial and remote_path")?;
+    require_serial(&params.serial, config)?;
+    sync_store
+        .create_directory(&params.remote_path)
         .map_err(StoreError::into_rpc)
 }
 

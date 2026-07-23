@@ -11,7 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::cell::Cell;
 
 use kindlebridge_schema::device_protocol::is_valid_transfer_id;
-use kindlebridge_schema::{error_codes, RpcError, SyncStatus, TransferDirection, TransferState};
+use kindlebridge_schema::{
+    error_codes, RpcError, SyncEntry, SyncEntryKind, SyncListResult, SyncMkdirResult, SyncStatus,
+    TransferDirection, TransferState,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
@@ -26,6 +29,7 @@ pub const SYNC_BLOCK_SIZE: u64 = 65_536;
 // development payloads.
 const CHECKPOINT_INTERVAL: u64 = 256 * 1024 * 1024;
 const METADATA_VERSION: u32 = 1;
+const MAX_DIRECTORY_ENTRIES: usize = 65_536;
 static NEXT_TRANSFER: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
@@ -493,6 +497,86 @@ impl SyncStore {
         File::open(self.open_existing_target(&logical)?).map_err(StoreError::Io)
     }
 
+    pub fn create_directory(&self, remote_path: &str) -> Result<SyncMkdirResult, StoreError> {
+        let logical = LogicalPath::parse(remote_path.to_owned())?;
+        self.ensure_layout()?;
+        let mut current = self.root.clone();
+        let mut created = false;
+        for component in logical.as_str().split('/') {
+            current.push(component);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => return Err(StoreError::UnsafePath),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir(&current)?;
+                    created = true;
+                }
+                Err(error) => return Err(StoreError::Io(error)),
+            }
+        }
+        Ok(SyncMkdirResult {
+            remote_path: logical.as_str().to_owned(),
+            created,
+        })
+    }
+
+    pub fn list_directory(
+        &self,
+        remote_path: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<SyncListResult, StoreError> {
+        if limit == 0 || limit > 1024 {
+            return Err(StoreError::InvalidListLimit);
+        }
+        let logical = LogicalPath::parse(remote_path.to_owned())?;
+        let cursor = cursor
+            .map(|value| {
+                let parsed = LogicalPath::parse(value.to_owned())?;
+                if parsed.as_str().contains('/') {
+                    return Err(PathError::InvalidComponent);
+                }
+                Ok(parsed.0)
+            })
+            .transpose()?;
+        self.ensure_layout()?;
+        let directory = self.open_existing_directory(&logical)?;
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            if entries.len() >= MAX_DIRECTORY_ENTRIES {
+                return Err(StoreError::DirectoryTooLarge);
+            }
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| StoreError::UnsafePath)?;
+            let name = LogicalPath::parse(name)?.0;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            let (kind, size) = if metadata.file_type().is_symlink() {
+                return Err(StoreError::UnsafePath);
+            } else if metadata.is_file() {
+                (SyncEntryKind::File, metadata.len())
+            } else if metadata.is_dir() {
+                (SyncEntryKind::Directory, 0)
+            } else {
+                return Err(StoreError::UnsafePath);
+            };
+            if cursor.as_ref().map_or(true, |cursor| &name > cursor) {
+                entries.push(SyncEntry { name, kind, size });
+            }
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let limit = usize::try_from(limit).map_err(|_| StoreError::InvalidListLimit)?;
+        let next_cursor = (entries.len() > limit).then(|| entries[limit - 1].name.clone());
+        entries.truncate(limit);
+        Ok(SyncListResult {
+            remote_path: logical.as_str().to_owned(),
+            entries,
+            next_cursor,
+        })
+    }
+
     fn ensure_layout(&self) -> Result<(), StoreError> {
         fs::create_dir_all(&self.root)?;
         fs::create_dir_all(self.stage_root())?;
@@ -591,6 +675,24 @@ impl SyncStore {
         }
         if !fs::metadata(&current)?.is_file() {
             return Err(StoreError::FileNotFound(logical.as_str().to_owned()));
+        }
+        Ok(current)
+    }
+
+    fn open_existing_directory(&self, logical: &LogicalPath) -> Result<PathBuf, StoreError> {
+        let mut current = self.root.clone();
+        for component in logical.as_str().split('/') {
+            current.push(component);
+            let metadata = fs::symlink_metadata(&current).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    StoreError::FileNotFound(logical.as_str().to_owned())
+                } else {
+                    StoreError::Io(error)
+                }
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StoreError::UnsafePath);
+            }
         }
         Ok(current)
     }
@@ -804,15 +906,20 @@ pub enum StoreError {
     SizeOverflow,
     #[error("invalid state: {0}")]
     InvalidState(&'static str),
+    #[error("directory list limit must be between 1 and 1024")]
+    InvalidListLimit,
+    #[error("directory contains more than 65536 entries")]
+    DirectoryTooLarge,
 }
 
 impl StoreError {
     #[must_use]
     pub fn into_rpc(self) -> RpcError {
         match self {
-            Self::Path(_) | Self::InvalidHash | Self::InvalidTransferId => {
-                RpcError::invalid_params(self.to_string())
-            }
+            Self::Path(_)
+            | Self::InvalidHash
+            | Self::InvalidTransferId
+            | Self::InvalidListLimit => RpcError::invalid_params(self.to_string()),
             Self::TransferNotFound(transfer_id) => {
                 RpcError::new(error_codes::TRANSFER_NOT_FOUND, "Transfer not found")
                     .with_data(json!({ "transfer_id": transfer_id }))
@@ -828,6 +935,10 @@ impl StoreError {
                 RpcError::new(error_codes::INVALID_STATE, "Invalid sync state")
                     .with_data(json!({ "detail": self.to_string() }))
             }
+            Self::DirectoryTooLarge => RpcError::new(
+                error_codes::INVALID_STATE,
+                "Directory exceeds the supported entry limit",
+            ),
             Self::Io(_) | Self::Json(_) | Self::SizeOverflow => RpcError::internal_error(),
         }
     }
@@ -1109,6 +1220,36 @@ mod tests {
             store.begin_pull(None, "../outside", 0),
             Err(StoreError::Path(PathError::InvalidComponent))
         ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_listing_is_sorted_paginated_and_preserves_empty_directories() {
+        let root = test_root("tree");
+        let store = SyncStore::new(&root);
+        assert!(store.create_directory("project/empty").unwrap().created);
+        assert!(!store.create_directory("project/empty").unwrap().created);
+        fs::write(root.join("project/z.txt"), b"z").unwrap();
+        fs::write(root.join("project/a.txt"), b"abc").unwrap();
+
+        let first = store.list_directory("project", None, 2).unwrap();
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a.txt", "empty"]
+        );
+        assert_eq!(first.entries[0].size, 3);
+        assert_eq!(first.next_cursor.as_deref(), Some("empty"));
+
+        let second = store
+            .list_directory("project", first.next_cursor.as_deref(), 2)
+            .unwrap();
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.entries[0].name, "z.txt");
+        assert_eq!(second.next_cursor, None);
         fs::remove_dir_all(root).unwrap();
     }
 }
