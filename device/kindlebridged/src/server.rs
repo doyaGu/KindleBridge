@@ -44,7 +44,7 @@ use kindlebridge_wire::{
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::app::AppSupervisor;
+use crate::application::ApplicationManager;
 use crate::exec::{self, ExecError};
 use crate::services;
 use crate::shell::{ShellEvent, ShellWorker, ShellWorkerError};
@@ -233,10 +233,9 @@ pub struct ServerConfig {
     pub connection_window: u32,
     pub stream_window: u32,
     pub sync_root: PathBuf,
-    pub activation_root: PathBuf,
     pub proc_root: PathBuf,
     pub log_path: PathBuf,
-    app_supervisor: Arc<AppSupervisor>,
+    applications: ApplicationManager,
 }
 
 impl ServerConfig {
@@ -248,10 +247,9 @@ impl ServerConfig {
             connection_window: DEFAULT_CONNECTION_WINDOW,
             stream_window: DEFAULT_STREAM_WINDOW,
             sync_root: PathBuf::from(DEFAULT_SYNC_ROOT),
-            activation_root: PathBuf::from(DEFAULT_ACTIVATION_ROOT),
             proc_root: PathBuf::from(DEFAULT_PROC_ROOT),
             log_path: PathBuf::from(DEFAULT_LOG_PATH),
-            app_supervisor: Arc::new(AppSupervisor::new()),
+            applications: ApplicationManager::new(DEFAULT_ACTIVATION_ROOT),
         }
     }
 
@@ -269,7 +267,7 @@ impl ServerConfig {
 
     #[must_use]
     pub fn activation_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.activation_root = root.into();
+        self.applications = ApplicationManager::new(root);
         self
     }
 
@@ -1253,7 +1251,7 @@ fn dispatch_app_list(
 ) -> Result<impl Serialize, RpcError> {
     let params = decode_params::<SerialParams>(params, "expected serial")?;
     require_serial(&params.serial, config)?;
-    services::app_list(&config.activation_root, &config.app_supervisor)
+    config.applications.list()
 }
 
 fn dispatch_process_list(
@@ -1263,13 +1261,7 @@ fn dispatch_process_list(
     let params = decode_params::<SerialParams>(params, "expected serial")?;
     require_serial(&params.serial, config)?;
     let mut list = services::process_list(&config.proc_root)?;
-    let managed = config.app_supervisor.managed_processes().map_err(|error| {
-        RpcError::new(
-            error_codes::INVALID_STATE,
-            "Application supervisor unavailable",
-        )
-        .with_data(serde_json::json!({ "detail": error.to_string() }))
-    })?;
+    let managed = config.applications.managed_processes()?;
     for process in &mut list.processes {
         process.app_id = managed.get(&process.pid).cloned();
     }
@@ -1282,17 +1274,7 @@ fn dispatch_process_signal(
 ) -> Result<impl Serialize, RpcError> {
     let params = decode_params::<ProcessSignalParams>(params, "expected serial, pid, and signal")?;
     require_serial(&params.serial, config)?;
-    if let Some(app_id) = config
-        .app_supervisor
-        .app_id_for_pid(params.pid)
-        .map_err(|error| {
-            RpcError::new(
-                error_codes::INVALID_STATE,
-                "Application supervisor unavailable",
-            )
-            .with_data(serde_json::json!({ "detail": error.to_string() }))
-        })?
-    {
+    if let Some(app_id) = config.applications.app_id_for_pid(params.pid)? {
         return Err(RpcError::invalid_params(format!(
             "PID {} is managed by {app_id}; use app stop or app restart",
             params.pid
@@ -1323,14 +1305,12 @@ fn dispatch_app_install(
     let mut bundle = sync_store
         .open_committed(&params.remote_path)
         .map_err(StoreError::into_rpc)?;
-    services::app_install(
+    config.applications.install(
         &mut bundle,
         &params.file_hash,
-        &config.activation_root,
         &config.device.target,
         &config.device.firmware,
         DEVICE_RUNTIME_FEATURES,
-        &config.app_supervisor,
     )
 }
 
@@ -1340,11 +1320,7 @@ fn dispatch_app_start(
 ) -> Result<impl Serialize, RpcError> {
     let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
     require_serial(&params.serial, config)?;
-    services::app_start(
-        &config.activation_root,
-        &config.app_supervisor,
-        &params.app_id,
-    )
+    config.applications.start(&params.app_id)
 }
 
 fn dispatch_app_log(
@@ -1356,7 +1332,7 @@ fn dispatch_app_log(
         "expected serial, app_id, run_id, cursors, and max_bytes",
     )?;
     require_serial(&params.serial, config)?;
-    services::app_log(&config.activation_root, &config.app_supervisor, &params)
+    config.applications.log(&params)
 }
 
 fn dispatch_app_stop(
@@ -1365,11 +1341,7 @@ fn dispatch_app_stop(
 ) -> Result<impl Serialize, RpcError> {
     let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
     require_serial(&params.serial, config)?;
-    services::app_stop(
-        &config.activation_root,
-        &config.app_supervisor,
-        &params.app_id,
-    )
+    config.applications.stop(&params.app_id)
 }
 
 fn dispatch_app_restart(
@@ -1378,11 +1350,7 @@ fn dispatch_app_restart(
 ) -> Result<impl Serialize, RpcError> {
     let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
     require_serial(&params.serial, config)?;
-    services::app_restart(
-        &config.activation_root,
-        &config.app_supervisor,
-        &params.app_id,
-    )
+    config.applications.restart(&params.app_id)
 }
 
 fn dispatch_app_rollback(
@@ -1391,11 +1359,7 @@ fn dispatch_app_rollback(
 ) -> Result<impl Serialize, RpcError> {
     let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
     require_serial(&params.serial, config)?;
-    services::app_rollback(
-        &config.activation_root,
-        &config.app_supervisor,
-        &params.app_id,
-    )
+    config.applications.rollback(&params.app_id)
 }
 
 fn dispatch_app_uninstall(
@@ -1404,11 +1368,7 @@ fn dispatch_app_uninstall(
 ) -> Result<impl Serialize, RpcError> {
     let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
     require_serial(&params.serial, config)?;
-    services::app_uninstall(
-        &config.activation_root,
-        &config.app_supervisor,
-        &params.app_id,
-    )
+    config.applications.uninstall(&params.app_id)
 }
 
 fn decode_params<T: serde::de::DeserializeOwned>(

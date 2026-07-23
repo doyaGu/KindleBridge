@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -32,8 +31,6 @@ const APP_BLOCK_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_APP_STOP_TIMEOUT_MS: u64 = 3_000;
 const MAX_APP_LOG_READ: u32 = 64 * 1024;
 const MAX_APP_LOG_BYTES: u64 = 4 * 1024 * 1024;
-static APP_OPERATION_LOCK: Mutex<()> = Mutex::new(());
-
 pub fn app_install(
     bundle: &mut File,
     expected_file_hash: &str,
@@ -88,13 +85,6 @@ pub fn app_install(
         ));
     }
 
-    let _operation_guard = APP_OPERATION_LOCK.lock().map_err(|_| {
-        app_install_failure(
-            "lock",
-            "internal_state",
-            "application install lock is unavailable",
-        )
-    })?;
     let store = InstallStore::open(activation_root, APP_BLOCK_QUOTA_BYTES)
         .map_err(|error| app_install_bundle_error("open_store", &error))?;
     store
@@ -277,7 +267,6 @@ fn app_install_failure(stage: &str, reason: &str, detail: &str) -> RpcError {
 }
 
 pub fn app_list(activation_root: &Path, supervisor: &AppSupervisor) -> Result<AppList, RpcError> {
-    let _operation_guard = lock_app_operations()?;
     app_list_unlocked(activation_root, supervisor)
 }
 
@@ -326,7 +315,6 @@ pub fn app_start(
     supervisor: &AppSupervisor,
     app_id: &str,
 ) -> Result<AppSummary, RpcError> {
-    let _operation_guard = lock_app_operations()?;
     app_start_unlocked(activation_root, supervisor, app_id)
 }
 
@@ -440,7 +428,6 @@ pub fn app_stop(
     supervisor: &AppSupervisor,
     app_id: &str,
 ) -> Result<AppSummary, RpcError> {
-    let _operation_guard = lock_app_operations()?;
     let (active, _entry, materialized) = active_materialized_application(activation_root, app_id)?;
     supervisor
         .stop(
@@ -456,7 +443,6 @@ pub fn app_restart(
     supervisor: &AppSupervisor,
     app_id: &str,
 ) -> Result<AppSummary, RpcError> {
-    let _operation_guard = lock_app_operations()?;
     let (_, _, materialized) = active_materialized_application(activation_root, app_id)?;
     supervisor
         .stop(
@@ -472,7 +458,6 @@ pub fn app_rollback(
     supervisor: &AppSupervisor,
     app_id: &str,
 ) -> Result<AppSummary, RpcError> {
-    let _operation_guard = lock_app_operations()?;
     let store = open_recovered_store(activation_root, "rollback", app_id)?;
     let active_id = store
         .active_generation_id()
@@ -549,7 +534,6 @@ pub fn app_uninstall(
     supervisor: &AppSupervisor,
     app_id: &str,
 ) -> Result<AppSummary, RpcError> {
-    let _operation_guard = lock_app_operations()?;
     let store = open_recovered_store(activation_root, "uninstall", app_id)?;
     let active_id = store
         .active_generation_id()
@@ -692,12 +676,6 @@ fn history_predecessor(generation: &ActivationGeneration, app_id: &str) -> Optio
         }) if rolled_back == app_id => *next_generation,
         _ => generation.previous_generation,
     }
-}
-
-fn lock_app_operations() -> Result<std::sync::MutexGuard<'static, ()>, RpcError> {
-    APP_OPERATION_LOCK
-        .lock()
-        .map_err(|_| invalid_device_state("application operation lock is unavailable"))
 }
 
 fn active_materialized_application(

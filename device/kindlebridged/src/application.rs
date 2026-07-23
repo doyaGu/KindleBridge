@@ -1,0 +1,164 @@
+//! Application installation, activation, and runtime ownership.
+//!
+//! This is the daemon's single application-domain boundary. Clones share the
+//! same operation lock and process supervisor, so activation changes cannot
+//! race lifecycle operations across KBP connections.
+
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use kindlebridge_schema::{
+    error_codes, AppList, AppLogParams, AppLogSnapshot, AppSummary, RpcError,
+};
+
+use crate::app::AppSupervisor;
+use crate::services;
+
+#[derive(Clone, Debug)]
+pub struct ApplicationManager {
+    inner: Arc<ApplicationManagerInner>,
+}
+
+#[derive(Debug)]
+struct ApplicationManagerInner {
+    activation_root: PathBuf,
+    operations: Mutex<()>,
+    supervisor: AppSupervisor,
+}
+
+impl ApplicationManager {
+    #[must_use]
+    pub fn new(activation_root: impl Into<PathBuf>) -> Self {
+        Self {
+            inner: Arc::new(ApplicationManagerInner {
+                activation_root: activation_root.into(),
+                operations: Mutex::new(()),
+                supervisor: AppSupervisor::new(),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn activation_root(&self) -> &Path {
+        &self.inner.activation_root
+    }
+
+    pub fn install(
+        &self,
+        bundle: &mut File,
+        expected_file_hash: &str,
+        target: &str,
+        firmware: &str,
+        available_features: &[&str],
+    ) -> Result<AppSummary, RpcError> {
+        let _operation = self.lock_install_operation()?;
+        services::app_install(
+            bundle,
+            expected_file_hash,
+            self.activation_root(),
+            target,
+            firmware,
+            available_features,
+            &self.inner.supervisor,
+        )
+    }
+
+    pub fn list(&self) -> Result<AppList, RpcError> {
+        let _operation = self.lock_operation()?;
+        services::app_list(self.activation_root(), &self.inner.supervisor)
+    }
+
+    pub fn log(&self, params: &AppLogParams) -> Result<AppLogSnapshot, RpcError> {
+        services::app_log(self.activation_root(), &self.inner.supervisor, params)
+    }
+
+    pub fn start(&self, app_id: &str) -> Result<AppSummary, RpcError> {
+        let _operation = self.lock_operation()?;
+        services::app_start(self.activation_root(), &self.inner.supervisor, app_id)
+    }
+
+    pub fn stop(&self, app_id: &str) -> Result<AppSummary, RpcError> {
+        let _operation = self.lock_operation()?;
+        services::app_stop(self.activation_root(), &self.inner.supervisor, app_id)
+    }
+
+    pub fn restart(&self, app_id: &str) -> Result<AppSummary, RpcError> {
+        let _operation = self.lock_operation()?;
+        services::app_restart(self.activation_root(), &self.inner.supervisor, app_id)
+    }
+
+    pub fn rollback(&self, app_id: &str) -> Result<AppSummary, RpcError> {
+        let _operation = self.lock_operation()?;
+        services::app_rollback(self.activation_root(), &self.inner.supervisor, app_id)
+    }
+
+    pub fn uninstall(&self, app_id: &str) -> Result<AppSummary, RpcError> {
+        let _operation = self.lock_operation()?;
+        services::app_uninstall(self.activation_root(), &self.inner.supervisor, app_id)
+    }
+
+    pub fn managed_processes(&self) -> Result<BTreeMap<u32, String>, RpcError> {
+        self.inner
+            .supervisor
+            .managed_processes()
+            .map_err(supervisor_unavailable)
+    }
+
+    pub fn app_id_for_pid(&self, pid: u32) -> Result<Option<String>, RpcError> {
+        self.inner
+            .supervisor
+            .app_id_for_pid(pid)
+            .map_err(supervisor_unavailable)
+    }
+
+    fn lock_operation(&self) -> Result<MutexGuard<'_, ()>, RpcError> {
+        self.inner
+            .operations
+            .lock()
+            .map_err(|_| invalid_operation_lock())
+    }
+
+    fn lock_install_operation(&self) -> Result<MutexGuard<'_, ()>, RpcError> {
+        self.inner.operations.lock().map_err(|_| {
+            RpcError::new(
+                error_codes::APP_INSTALL_FAILED,
+                "Application install failed",
+            )
+            .with_data(serde_json::json!({
+                "stage": "lock",
+                "reason": "internal_state",
+                "detail": "application install lock is unavailable",
+            }))
+        })
+    }
+}
+
+fn invalid_operation_lock() -> RpcError {
+    RpcError::new(error_codes::INVALID_STATE, "Invalid device state").with_data(serde_json::json!({
+        "detail": "application operation lock is unavailable",
+    }))
+}
+
+fn supervisor_unavailable(error: crate::app::RuntimeError) -> RpcError {
+    RpcError::new(
+        error_codes::INVALID_STATE,
+        "Application supervisor unavailable",
+    )
+    .with_data(serde_json::json!({ "detail": error.to_string() }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clones_share_application_domain_state() {
+        let manager = ApplicationManager::new("/tmp/kindlebridge-apps");
+        let clone = manager.clone();
+
+        assert_eq!(clone.activation_root(), manager.activation_root());
+        assert!(Arc::ptr_eq(&clone.inner, &manager.inner));
+    }
+}
