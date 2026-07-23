@@ -12,6 +12,10 @@ _Avoid_: Sync connection, sync session
 The host-side owner of Sync Stream operations and their local-file hashing, staging, resume, cancellation, and durability rules for one connected Kindle.
 _Avoid_: Sync manager, sync session
 
+**Logical Sync Path**:
+A non-empty, Unicode NFC, forward-slash relative path naming one location below the KindleBridge sync root. Host absolute-root aliases and backslashes are developer input forms, not Logical Sync Paths.
+_Avoid_: Remote filesystem path, host input path
+
 **Shell Stream**:
 A single `shell.v2` KBP stream that owns exactly one shell process from its opening metadata through exit and close or reset. A disconnected Shell Stream is destroyed and cannot be resumed.
 _Avoid_: Shell connection, resumable shell session
@@ -21,6 +25,22 @@ _Avoid_: Shell connection, resumable shell session
 > Developer: Does reconnecting USB resume the same Sync Stream?
 >
 > Domain expert: No. The interrupted Sync Stream ends; the Host Sync Client opens a new Sync Stream that resumes the same transfer from its persisted offset.
+>
+> Developer: Is `/mnt/us/kindlebridge-data/books/a.epub` a Logical Sync Path?
+>
+> Domain expert: No. The host input Adapter converts that alias to the Logical Sync Path `books/a.epub` before opening a Sync Stream.
+>
+> Developer: May a directory push create valid earlier entries before discovering an invalid later Logical Sync Path?
+>
+> Domain expert: No. The Host Sync Client validates the complete local tree before the first device mutation, so a path failure leaves no partial remote tree.
+>
+> Developer: What if two source paths differ only by ASCII letter case?
+>
+> Domain expert: The complete-tree validation rejects the push before mutation and reports both colliding paths.
+>
+> Developer: May a recursive pull begin writing locally while it is still discovering the device tree?
+>
+> Domain expert: No. It first builds and validates a complete manifest. Each file is verified independently with BLAKE3, and the Host Sync Client compares names, kinds, and sizes with a final manifest before accepting the result. A mismatch removes the partial result and asks the developer to retry. This does not claim that every file came from one atomic device snapshot.
 >
 > Developer: Does the same apply to an interactive shell?
 >
