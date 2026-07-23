@@ -16,6 +16,7 @@ pub mod server;
 mod services;
 pub mod shell;
 pub mod sync;
+mod sync_stream;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeviceInfo {
