@@ -118,7 +118,7 @@ Cargo package is an internal build identifier, not a product release.
   menu, and treats repeated start/stop as success. Installation and upgrades
   never change USB ownership: an active or indeterminate manager state is rejected,
   while an inactive installation is replaced atomically and remains inactive.
-  Laboratory invocations may opt into a bounded watchdog. Twenty-six
+  Laboratory invocations may opt into a bounded watchdog. Thirty
   deterministic shell lifecycle tests
   cover connected fail-closed behavior, MTP and existing stock-network entry,
   rollback, stale and detached state reporting, PID ownership, precise
@@ -129,8 +129,9 @@ Cargo package is an internal build identifier, not a product release.
   KT6; discovery, repeated root exec, multi-window stability, and large sync then
   passed. Dev.26 additionally passed a stock suspend/resume with an active Shell,
   Windows Terminal live resize from 30x120 to 42x132, and ten rounds of concurrent
-  Shell/sync/log traffic. Larger repeated physical-cycle qualification remains a
-  publication gate.
+  Shell/sync/log traffic. Dev.34 then passed 100 unplugged
+  Development-to-MTP-to-Development cycles, a real Windows WPD write/readback,
+  and a matched Bridge reattach without a controller reset or device reboot.
 - The package integrates a root-confined A/B daemon launcher into the USB
   manager. Host `daemon stage` uploads through `sync.v1`, verifies BLAKE3 plus
   the ELF32 little-endian ARM header on-device, writes only the inactive slot,
@@ -165,7 +166,11 @@ Cargo package is an internal build identifier, not a product release.
   sync regression completed in 6.04 seconds with the remote shell exit code
   preserved. The shared Windows service also passed three consecutive
   stop/automatic-start cycles without a cable replug.
-  The shell USB-lifecycle suite defines 26 deterministic cases, including exact
+  A separate KBP PING/PONG hardware gate measured actual Control-frame latency
+  during 128 MiB transfers: push P95 was 33.26 ms at 21.86 MiB/s and pull P95
+  was 16.99 ms at 18.73 MiB/s, both below the 50 ms limit. The control request
+  is token-matched, bounded to five seconds, and failed cleanly across session
+  loss. The shell USB-lifecycle suite defines 30 deterministic cases, including exact
   managed-entrypoint ownership, idempotent actions, controlled supervisor
   shutdown, and manual crash-fuse recovery. Nine additional MRPI installer and
   installer/uninstaller scenarios cover fresh and inactive installs, active, unknown and
@@ -180,10 +185,9 @@ Cargo package is an internal build identifier, not a product release.
 
 ## Required before an internal feature-complete candidate
 
-- KT6 validation of stock-`volumd` Bridge-to-MTP handback and re-entry, followed
-  by unplug/replug, sleep/wake, crashes, concurrency, and stock-MTP recovery tests.
-  The Windows onboarding script still needs validation on a clean host and
-  across supported Windows versions.
+- The Windows onboarding script still needs validation on a clean host and
+  across supported Windows versions. Broader crash/fault injection, storage
+  exhaustion, low-memory, and long-duration soak remain hardware gates.
 - Wi-Fi/TCP discovery, authenticated pairing, session encryption, multi-transport
   reconnect, and hardware throughput/latency measurements under concurrent streams.
 - A narrowly scoped, locally authenticated root broker IPC implementation.
