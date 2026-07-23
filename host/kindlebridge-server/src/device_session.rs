@@ -25,8 +25,9 @@ use kindlebridge_schema::{
     error_codes, AppInstallParams, AppList, AppSummary, AppTargetParams, DeviceFeatures,
     DeviceState, DeviceSummary, ExecParams, ExecResult, LogSnapshot, LogTailParams, ProcessList,
     ProcessSignalParams, ProcessSummary, RpcError, SerialParams, SyncListParams, SyncListResult,
-    SyncMkdirParams, SyncMkdirResult, SyncPullParams, SyncPullResult, SyncPushParams,
-    SyncPushResult, SyncStatus, SyncStatusParams, TransferState, MAX_SYNC_BLOCK_SIZE,
+    SyncMkdirParams, SyncMkdirResult, SyncProgressPhase, SyncPullParams, SyncPullResult,
+    SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams, TransferState,
+    MAX_SYNC_BLOCK_SIZE,
 };
 use kindlebridge_transport::{
     actor::{
@@ -50,7 +51,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{DeviceProvider, ProviderError};
+use crate::{DeviceProvider, ProviderError, SyncObserver};
 
 const SESSION_IO_TIMEOUT: Duration = Duration::from_secs(10 * 60 + 30);
 // Match the device's order-2 FunctionFS request size. Larger host transfers
@@ -255,8 +256,24 @@ impl DeviceProvider for ReconnectingUsbProvider {
         self.rpc(|provider| provider.sync_push(params))
     }
 
+    fn sync_push_observed(
+        &self,
+        params: SyncPushParams,
+        observer: &SyncObserver,
+    ) -> Result<SyncPushResult, RpcError> {
+        self.rpc(|provider| provider.sync_push_observed(params, observer))
+    }
+
     fn sync_pull(&self, params: SyncPullParams) -> Result<SyncPullResult, RpcError> {
         self.rpc(|provider| provider.sync_pull(params))
+    }
+
+    fn sync_pull_observed(
+        &self,
+        params: SyncPullParams,
+        observer: &SyncObserver,
+    ) -> Result<SyncPullResult, RpcError> {
+        self.rpc(|provider| provider.sync_pull_observed(params, observer))
     }
 
     fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError> {
@@ -361,6 +378,14 @@ impl DeviceProvider for ConnectedDeviceProvider {
     }
 
     fn sync_push(&self, params: SyncPushParams) -> Result<SyncPushResult, RpcError> {
+        self.sync_push_observed(params, &SyncObserver::default())
+    }
+
+    fn sync_push_observed(
+        &self,
+        params: SyncPushParams,
+        observer: &SyncObserver,
+    ) -> Result<SyncPushResult, RpcError> {
         let device = self.require_feature(&params.serial, SYNC_FEATURE)?;
         validate_host_path(&params.local_path)?;
         validate_block_size(params.block_size)?;
@@ -378,19 +403,32 @@ impl DeviceProvider for ConnectedDeviceProvider {
             .metadata()
             .map_err(|error| host_file_error("stat", &params.local_path, &error))?
             .len();
-        let file_hash = hash_file(&mut file, total_size)?;
+        observer.phase(SyncProgressPhase::Hashing, 0, total_size);
+        let file_hash = hash_file_observed(&mut file, total_size, observer)?;
+        observer.phase(SyncProgressPhase::Transferring, 0, total_size);
         device
             .session
-            .sync_push(&params, &mut file, total_size, &file_hash)
+            .sync_push_observed(&params, &mut file, total_size, &file_hash, observer)
             .map_err(link_rpc_error)
     }
 
     fn sync_pull(&self, params: SyncPullParams) -> Result<SyncPullResult, RpcError> {
+        self.sync_pull_observed(params, &SyncObserver::default())
+    }
+
+    fn sync_pull_observed(
+        &self,
+        params: SyncPullParams,
+        observer: &SyncObserver,
+    ) -> Result<SyncPullResult, RpcError> {
         let device = self.require_feature(&params.serial, SYNC_FEATURE)?;
         validate_host_path(&params.local_path)?;
         validate_block_size(params.block_size)?;
         validate_requested_transfer_id(params.transfer_id.as_deref())?;
-        device.session.sync_pull(&params).map_err(link_rpc_error)
+        device
+            .session
+            .sync_pull_observed(&params, observer)
+            .map_err(link_rpc_error)
     }
 
     fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError> {
@@ -757,9 +795,30 @@ impl ActorDeviceSession {
         total_size: u64,
         file_hash: &str,
     ) -> Result<SyncPushResult, LinkError> {
+        self.sync_push_observed(
+            params,
+            file,
+            total_size,
+            file_hash,
+            &SyncObserver::default(),
+        )
+    }
+
+    fn sync_push_observed(
+        &self,
+        params: &SyncPushParams,
+        file: &mut File,
+        total_size: u64,
+        file_hash: &str,
+        observer: &SyncObserver,
+    ) -> Result<SyncPushResult, LinkError> {
         let mut stream =
             self.connection
                 .open(SYNC_SERVICE, DEFAULT_STREAM_WINDOW, TrafficClass::Bulk)?;
+        register_sync_cancel(observer, &stream);
+        if observer.is_cancelled() {
+            return Err(sync_cancelled_error());
+        }
         stream.send_data(
             encode(&SyncRequest::Push {
                 transfer_id: params.transfer_id.clone(),
@@ -790,13 +849,20 @@ impl ActorDeviceSession {
         {
             return Err(LinkError::UnexpectedFrame("sync push resume mismatch"));
         }
+        observer.transfer_id(transfer_id.clone());
+        observer.phase(SyncProgressPhase::Transferring, offset, total_size);
         file.seek(SeekFrom::Start(offset))?;
         let mut buffer = vec![0_u8; params.block_size as usize];
         let mut sent = offset;
         if sent == total_size {
             stream.send_data(Vec::new(), true)?;
+            observer.transferred(sent);
         } else {
             loop {
+                if observer.is_cancelled() {
+                    let _ = stream.reset("sync cancelled");
+                    return Err(sync_cancelled_error());
+                }
                 let count = file.read(&mut buffer)?;
                 if count == 0 {
                     return Err(LinkError::UnexpectedFrame(
@@ -811,6 +877,7 @@ impl ActorDeviceSession {
                 }
                 let last = sent == total_size;
                 stream.send_data(buffer[..count].to_vec(), last)?;
+                observer.transferred(sent);
                 if last {
                     break;
                 }
@@ -839,11 +906,19 @@ impl ActorDeviceSession {
         Ok(result)
     }
 
-    fn sync_pull(&self, params: &SyncPullParams) -> Result<SyncPullResult, LinkError> {
+    fn sync_pull_observed(
+        &self,
+        params: &SyncPullParams,
+        observer: &SyncObserver,
+    ) -> Result<SyncPullResult, LinkError> {
         let started = Instant::now();
         let mut stream =
             self.connection
                 .open(SYNC_SERVICE, DEFAULT_STREAM_WINDOW, TrafficClass::Bulk)?;
+        register_sync_cancel(observer, &stream);
+        if observer.is_cancelled() {
+            return Err(sync_cancelled_error());
+        }
         let staging = params
             .transfer_id
             .as_deref()
@@ -889,6 +964,8 @@ impl ActorDeviceSession {
         {
             return Err(LinkError::UnexpectedFrame("sync pull resume mismatch"));
         }
+        observer.transfer_id(transfer_id.clone());
+        observer.phase(SyncProgressPhase::Transferring, remote_offset, total_size);
         let staging = match staging {
             Some(path) => path,
             None => staging_path(Path::new(&params.local_path), &transfer_id)?,
@@ -898,12 +975,17 @@ impl ActorDeviceSession {
         output.seek(SeekFrom::Start(remote_offset))?;
         let mut received = remote_offset;
         loop {
+            if observer.is_cancelled() {
+                let _ = stream.reset("sync cancelled");
+                return Err(sync_cancelled_error());
+            }
             let data = actor_data(&mut stream)?;
             output.write_all(&data.payload)?;
             hasher.update(&data.payload);
             received = received
                 .checked_add(data.payload.len() as u64)
                 .ok_or(LinkError::SequenceExhausted)?;
+            observer.transferred(received);
             if received > total_size {
                 return Err(LinkError::UnexpectedFrame(
                     "sync pull exceeded declared size",
@@ -932,6 +1014,7 @@ impl ActorDeviceSession {
         output.sync_all()?;
         drop(output);
         commit_host_file(&staging, Path::new(&params.local_path))?;
+        observer.transferred(received);
         let committed_at = started.elapsed();
         trace_sync(format_args!(
             "pull {transfer_id}: host durability and commit took {:.3}s ({:.3}s total)",
@@ -1865,6 +1948,50 @@ fn hash_file(file: &mut File, length: u64) -> Result<String, RpcError> {
         .map_err(|_| RpcError::new(error_codes::INVALID_STATE, "Host file could not be hashed"))
 }
 
+fn hash_file_observed(
+    file: &mut File,
+    length: u64,
+    observer: &SyncObserver,
+) -> Result<String, RpcError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| RpcError::new(error_codes::INVALID_STATE, "Host file could not be hashed"))?;
+    let mut remaining = length;
+    let mut hashed = 0_u64;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        if observer.is_cancelled() {
+            return Err(cancelled_rpc_error());
+        }
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| RpcError::new(error_codes::INVALID_STATE, "Host file is too large"))?;
+        let read = file.read(&mut buffer[..limit]).map_err(|_| {
+            RpcError::new(error_codes::INVALID_STATE, "Host file could not be hashed")
+        })?;
+        if read == 0 {
+            return Err(RpcError::new(
+                error_codes::INVALID_STATE,
+                "Host file changed while it was being hashed",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        let read = u64::try_from(read)
+            .map_err(|_| RpcError::new(error_codes::INVALID_STATE, "Host file is too large"))?;
+        remaining -= read;
+        hashed += read;
+        observer.transferred(hashed);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn cancelled_rpc_error() -> RpcError {
+    RpcError::new(error_codes::TRANSFER_CANCELLED, "Transfer cancelled")
+}
+
+fn sync_cancelled_error() -> LinkError {
+    LinkError::Remote(cancelled_rpc_error())
+}
+
 fn host_bundle_error(stage: &str, error: &kindlebridge_bundle::Error) -> RpcError {
     RpcError::new(
         error_codes::APP_INSTALL_FAILED,
@@ -2168,6 +2295,18 @@ fn drain_usb_recovery_inbound(
             Err(error) => return Err(error),
         }
     }
+}
+
+fn register_sync_cancel(observer: &SyncObserver, stream: &ActorStream) {
+    let stream = stream.clone();
+    observer.on_cancel(move || {
+        let _ = std::thread::Builder::new()
+            .name("kindlebridge-sync-cancel".to_owned())
+            .spawn(move || {
+                let _ = stream.cancel_receive();
+                let _ = stream.reset("sync cancelled");
+            });
+    });
 }
 
 #[derive(Debug, Error)]

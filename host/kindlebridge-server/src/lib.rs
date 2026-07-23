@@ -5,7 +5,7 @@ mod runtime;
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
@@ -19,9 +19,10 @@ use kindlebridge_schema::{
     LogSnapshot, LogTailParams, ProcessList, ProcessSignalParams, ProcessSummary, RequestId,
     RpcError, RpcRequest, RpcResponse, SerialParams, ServerVersion, ShellOpenParams,
     ShellOpenResult, StreamChannel, StreamClosedParams, StreamCreditParams, StreamDataParams,
-    StreamExitParams, StreamIdParams, StreamResizeParams, StreamWriteParams, SyncListParams,
-    SyncListResult, SyncMkdirParams, SyncMkdirResult, SyncPullParams, SyncPullResult,
-    SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams, DEFAULT_MAX_CONTENT_LENGTH,
+    StreamExitParams, StreamIdParams, StreamResizeParams, StreamWriteParams, SyncCancelParams,
+    SyncListParams, SyncListResult, SyncMkdirParams, SyncMkdirResult, SyncProgress,
+    SyncProgressPhase, SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus,
+    SyncStatusParams, TransferDirection, DEFAULT_MAX_CONTENT_LENGTH,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,7 @@ use thiserror::Error;
 use runtime::RuntimeState;
 
 static SERVER_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+const MAX_CLIENT_SYNC_JOBS: usize = 4;
 
 pub use device_session::{
     ConnectedDeviceProvider, DeviceShell, DeviceShellEvent, ReconnectingUsbProvider,
@@ -89,6 +91,24 @@ pub trait DeviceProvider: Send + Sync {
     fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError>;
     fn sync_list(&self, params: &SyncListParams) -> Result<SyncListResult, RpcError>;
     fn sync_mkdir(&self, params: &SyncMkdirParams) -> Result<SyncMkdirResult, RpcError>;
+    fn sync_push_observed(
+        &self,
+        params: SyncPushParams,
+        observer: &SyncObserver,
+    ) -> Result<SyncPushResult, RpcError> {
+        let result = self.sync_push(params)?;
+        observer.transferred(result.accepted_offset);
+        Ok(result)
+    }
+    fn sync_pull_observed(
+        &self,
+        params: SyncPullParams,
+        observer: &SyncObserver,
+    ) -> Result<SyncPullResult, RpcError> {
+        let result = self.sync_pull(params)?;
+        observer.transferred(result.received_size);
+        Ok(result)
+    }
     fn app_install(&self, params: AppInstallParams) -> Result<AppSummary, RpcError>;
     fn app_start(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError>;
     fn app_stop(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError>;
@@ -102,6 +122,113 @@ pub trait DeviceProvider: Send + Sync {
     fn log_tail(&self, params: &LogTailParams) -> Result<LogSnapshot, RpcError>;
     fn shell_open(&self, params: &ShellOpenParams) -> Result<Arc<dyn ShellStream>, RpcError> {
         Err(RpcError::feature_unavailable(&params.serial, "shell.v2"))
+    }
+}
+
+pub struct SyncObserver {
+    cancelled: AtomicBool,
+    transferred: AtomicU64,
+    total: AtomicU64,
+    phase: Mutex<SyncProgressPhase>,
+    transfer_id: Mutex<Option<String>>,
+    cancel_hooks: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Default for SyncObserver {
+    fn default() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            transferred: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            phase: Mutex::new(SyncProgressPhase::Hashing),
+            transfer_id: Mutex::new(None),
+            cancel_hooks: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl std::fmt::Debug for SyncObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SyncObserver")
+            .field("cancelled", &self.is_cancelled())
+            .field("transferred", &self.transferred.load(Ordering::Acquire))
+            .field("total", &self.total.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl SyncObserver {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let hooks = self
+            .cancel_hooks
+            .lock()
+            .map(|mut hooks| std::mem::take(&mut *hooks))
+            .unwrap_or_default();
+        for hook in hooks {
+            hook();
+        }
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn phase(&self, phase: SyncProgressPhase, transferred: u64, total: u64) {
+        self.total.store(total, Ordering::Release);
+        self.transferred.store(transferred, Ordering::Release);
+        if let Ok(mut current) = self.phase.lock() {
+            *current = phase;
+        }
+    }
+
+    pub fn transferred(&self, transferred: u64) {
+        self.transferred.store(transferred, Ordering::Release);
+    }
+
+    pub fn transfer_id(&self, transfer_id: impl Into<String>) {
+        if let Ok(mut current) = self.transfer_id.lock() {
+            *current = Some(transfer_id.into());
+        }
+    }
+
+    pub fn on_cancel(&self, hook: impl FnOnce() + Send + 'static) {
+        if self.is_cancelled() {
+            hook();
+            return;
+        }
+        let Ok(mut hooks) = self.cancel_hooks.lock() else {
+            hook();
+            return;
+        };
+        if self.is_cancelled() {
+            drop(hooks);
+            hook();
+        } else {
+            hooks.push(Box::new(hook));
+        }
+    }
+
+    fn snapshot(
+        &self,
+        operation_id: String,
+        direction: TransferDirection,
+        remote_path: String,
+    ) -> SyncProgress {
+        SyncProgress {
+            operation_id,
+            transfer_id: self.transfer_id.lock().ok().and_then(|id| id.clone()),
+            direction,
+            remote_path,
+            phase: self
+                .phase
+                .lock()
+                .map_or(SyncProgressPhase::Transferring, |phase| phase.clone()),
+            transferred: self.transferred.load(Ordering::Acquire),
+            total: self.total.load(Ordering::Acquire),
+        }
     }
 }
 
@@ -211,9 +338,54 @@ impl DeviceProvider for MemoryDeviceProvider {
         self.runtime()?.sync_push(params)
     }
 
+    fn sync_push_observed(
+        &self,
+        params: SyncPushParams,
+        observer: &SyncObserver,
+    ) -> Result<SyncPushResult, RpcError> {
+        let total = std::fs::metadata(&params.local_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        observer.phase(SyncProgressPhase::Hashing, 0, total);
+        if observer.is_cancelled() {
+            return Err(RpcError::new(
+                error_codes::TRANSFER_CANCELLED,
+                "Transfer cancelled",
+            ));
+        }
+        observer.transferred(total);
+        observer.phase(SyncProgressPhase::Transferring, 0, total);
+        let result = self.sync_push(params)?;
+        observer.transferred(result.accepted_offset);
+        observer.transfer_id(result.transfer_id.clone());
+        Ok(result)
+    }
+
     fn sync_pull(&self, params: SyncPullParams) -> Result<SyncPullResult, RpcError> {
         self.ensure_device(&params.serial)?;
         self.runtime()?.sync_pull(params)
+    }
+
+    fn sync_pull_observed(
+        &self,
+        params: SyncPullParams,
+        observer: &SyncObserver,
+    ) -> Result<SyncPullResult, RpcError> {
+        observer.phase(SyncProgressPhase::Transferring, 0, 0);
+        if observer.is_cancelled() {
+            return Err(RpcError::new(
+                error_codes::TRANSFER_CANCELLED,
+                "Transfer cancelled",
+            ));
+        }
+        let result = self.sync_pull(params)?;
+        observer.transfer_id(result.transfer_id.clone());
+        observer.phase(
+            SyncProgressPhase::Transferring,
+            result.received_size,
+            result.total_size,
+        );
+        Ok(result)
     }
 
     fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError> {
@@ -569,13 +741,24 @@ where
     let writer = Arc::new(Mutex::new(writer));
     let streams: Arc<Mutex<HashMap<String, Arc<dyn ShellStream>>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let result = serve_streaming_loop(reader, &writer, &provider, &streams);
+    let sync_jobs: Arc<Mutex<HashMap<String, Arc<SyncObserver>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let result = serve_streaming_loop(reader, &writer, &provider, &streams, &sync_jobs);
     if let Ok(mut streams) = streams.lock() {
         for (_, stream) in streams.drain() {
             let _ = stream.close();
         }
     }
+    cancel_sync_jobs(&sync_jobs);
     result
+}
+
+fn cancel_sync_jobs(jobs: &Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>) {
+    if let Ok(mut jobs) = jobs.lock() {
+        for (_, observer) in jobs.drain() {
+            observer.cancel();
+        }
+    }
 }
 
 fn serve_streaming_loop<R, W>(
@@ -583,6 +766,7 @@ fn serve_streaming_loop<R, W>(
     writer: &Arc<Mutex<W>>,
     provider: &Arc<dyn DeviceProvider>,
     streams: &Arc<Mutex<HashMap<String, Arc<dyn ShellStream>>>>,
+    sync_jobs: &Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>,
 ) -> Result<(), ServeError>
 where
     R: BufRead,
@@ -614,6 +798,13 @@ where
             handle_shell_open(request, writer, provider, streams)?;
         } else if matches!(
             request.method.as_str(),
+            methods::SYNC_PUSH_STREAM | methods::SYNC_PULL_STREAM
+        ) {
+            handle_sync_open(request, writer, provider, sync_jobs)?;
+        } else if request.method == methods::SYNC_CANCEL {
+            handle_sync_cancel(request, sync_jobs);
+        } else if matches!(
+            request.method.as_str(),
             methods::STREAM_WRITE
                 | methods::STREAM_RESIZE
                 | methods::STREAM_CLOSE_INPUT
@@ -623,6 +814,178 @@ where
         } else if let Some(response) = handle_request(request, provider.as_ref()) {
             write_shared(writer, &response)?;
         }
+    }
+}
+
+fn handle_sync_open<W: Write + Send + 'static>(
+    request: RpcRequest,
+    writer: &Arc<Mutex<W>>,
+    provider: &Arc<dyn DeviceProvider>,
+    jobs: &Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>,
+) -> Result<(), ServeError> {
+    let Some(id) = request.id else {
+        return Ok(());
+    };
+    let active_jobs = jobs
+        .lock()
+        .map_err(|_| {
+            FramingError::Json(serde_json::Error::io(io::Error::other(
+                "sync operation registry is unavailable",
+            )))
+        })?
+        .len();
+    if active_jobs >= MAX_CLIENT_SYNC_JOBS {
+        return write_shared(
+            writer,
+            &RpcResponse::failure(
+                id,
+                RpcError::new(
+                    error_codes::INVALID_STATE,
+                    "Too many active sync operations for this client",
+                ),
+            ),
+        );
+    }
+    let operation_id = random_stream_id().map_err(|_| {
+        FramingError::Json(serde_json::Error::io(io::Error::other(
+            "could not allocate sync operation ID",
+        )))
+    })?;
+    let observer = Arc::new(SyncObserver::default());
+    jobs.lock()
+        .map_err(|_| {
+            FramingError::Json(serde_json::Error::io(io::Error::other(
+                "sync operation registry is unavailable",
+            )))
+        })?
+        .insert(operation_id.clone(), Arc::clone(&observer));
+
+    let method = request.method;
+    let params = request.params;
+    let writer = Arc::clone(writer);
+    let provider = Arc::clone(provider);
+    let jobs = Arc::clone(jobs);
+    thread::spawn(move || {
+        let result = if method == methods::SYNC_PUSH_STREAM {
+            match params
+                .ok_or_else(|| RpcError::invalid_params("missing sync push params"))
+                .and_then(|value| {
+                    serde_json::from_value::<SyncPushParams>(value)
+                        .map_err(|_| RpcError::invalid_params("invalid sync push params"))
+                }) {
+                Ok(params) => {
+                    let remote_path = params.remote_path.clone();
+                    let total = std::fs::metadata(&params.local_path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0);
+                    observer.phase(SyncProgressPhase::Hashing, 0, total);
+                    run_with_progress(
+                        &writer,
+                        &observer,
+                        &operation_id,
+                        TransferDirection::Push,
+                        &remote_path,
+                        || provider.sync_push_observed(params, &observer),
+                    )
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            match params
+                .ok_or_else(|| RpcError::invalid_params("missing sync pull params"))
+                .and_then(|value| {
+                    serde_json::from_value::<SyncPullParams>(value)
+                        .map_err(|_| RpcError::invalid_params("invalid sync pull params"))
+                }) {
+                Ok(params) => {
+                    let remote_path = params.remote_path.clone();
+                    observer.phase(SyncProgressPhase::Transferring, 0, 0);
+                    run_with_progress(
+                        &writer,
+                        &observer,
+                        &operation_id,
+                        TransferDirection::Pull,
+                        &remote_path,
+                        || provider.sync_pull_observed(params, &observer),
+                    )
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let response = match result {
+            Ok(value) => RpcResponse::success(id, value),
+            Err(error) => RpcResponse::failure(id, error),
+        };
+        let _ = write_shared(&writer, &response);
+        if let Ok(mut jobs) = jobs.lock() {
+            jobs.remove(&operation_id);
+        }
+    });
+    Ok(())
+}
+
+fn run_with_progress<W, T>(
+    writer: &Arc<Mutex<W>>,
+    observer: &Arc<SyncObserver>,
+    operation_id: &str,
+    direction: TransferDirection,
+    remote_path: &str,
+    operation: impl FnOnce() -> Result<T, RpcError>,
+) -> Result<Value, RpcError>
+where
+    W: Write + Send + 'static,
+    T: Serialize,
+{
+    let (done_sender, done_receiver) = std::sync::mpsc::channel();
+    let reporter_writer = Arc::clone(writer);
+    let reporter_observer = Arc::clone(observer);
+    let reporter_id = operation_id.to_owned();
+    let reporter_path = remote_path.to_owned();
+    let reporter_direction = direction.clone();
+    let reporter = thread::spawn(move || loop {
+        if emit_notification(
+            &reporter_writer,
+            methods::SYNC_PROGRESS,
+            &reporter_observer.snapshot(
+                reporter_id.clone(),
+                reporter_direction.clone(),
+                reporter_path.clone(),
+            ),
+        )
+        .is_err()
+        {
+            reporter_observer.cancel();
+            return;
+        }
+        match done_receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    });
+    let result = operation().and_then(to_value);
+    let _ = done_sender.send(());
+    let _ = reporter.join();
+    let _ = emit_notification(
+        writer,
+        methods::SYNC_PROGRESS,
+        &observer.snapshot(operation_id.to_owned(), direction, remote_path.to_owned()),
+    );
+    result
+}
+
+fn handle_sync_cancel(request: RpcRequest, jobs: &Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>) {
+    let Some(params) = request
+        .params
+        .and_then(|value| serde_json::from_value::<SyncCancelParams>(value).ok())
+    else {
+        return;
+    };
+    if let Some(observer) = jobs
+        .lock()
+        .ok()
+        .and_then(|jobs| jobs.get(&params.operation_id).cloned())
+    {
+        observer.cancel();
     }
 }
 
@@ -1145,6 +1508,89 @@ mod tests {
         assert_eq!(values[2]["params"]["channel"], "stderr");
         assert_eq!(values[3]["params"]["exit_code"], 37);
         assert!(values[4]["params"]["reason"].is_null());
+    }
+
+    #[test]
+    fn sync_stream_emits_progress_before_its_final_response() {
+        let source =
+            std::env::temp_dir().join(format!("kindlebridge-progress-{}.bin", std::process::id()));
+        fs::write(&source, b"progress payload").unwrap();
+        let provider: Arc<dyn DeviceProvider> = Arc::new(provider());
+        let output = SharedOutput::default();
+        let writer = Arc::new(Mutex::new(output.clone()));
+        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        let request = RpcRequest::call(
+            RequestId::Number(12),
+            methods::SYNC_PUSH_STREAM,
+            Some(
+                serde_json::to_value(SyncPushParams {
+                    serial: "KT6-TEST".to_owned(),
+                    local_path: source.to_string_lossy().into_owned(),
+                    remote_path: "progress.bin".to_owned(),
+                    transfer_id: None,
+                    block_size: kindlebridge_schema::DEFAULT_SYNC_BLOCK_SIZE,
+                })
+                .unwrap(),
+            ),
+        );
+
+        handle_sync_open(request, &writer, &provider, &jobs).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while (!jobs.lock().unwrap().is_empty() || output.frames.load(Ordering::Acquire) < 2)
+            && Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+
+        let values = framed_values(&output);
+        assert!(values.len() >= 2);
+        assert!(values[..values.len() - 1]
+            .iter()
+            .all(|value| value["method"] == methods::SYNC_PROGRESS));
+        assert_eq!(
+            values[values.len() - 2]["params"]["transferred"],
+            b"progress payload".len()
+        );
+        let response: RpcResponse = serde_json::from_value(values.last().unwrap().clone()).unwrap();
+        let result: SyncPushResult =
+            serde_json::from_value(response.into_result().unwrap()).unwrap();
+        assert_eq!(result.accepted_offset, b"progress payload".len() as u64);
+        let _ = fs::remove_file(source);
+    }
+
+    #[test]
+    fn client_teardown_cancels_and_removes_all_sync_jobs() {
+        let first = Arc::new(SyncObserver::default());
+        let second = Arc::new(SyncObserver::default());
+        let jobs = Arc::new(Mutex::new(HashMap::from([
+            ("first".to_owned(), Arc::clone(&first)),
+            ("second".to_owned(), Arc::clone(&second)),
+        ])));
+
+        cancel_sync_jobs(&jobs);
+
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
+        assert!(jobs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancellation_hooks_run_once_and_late_hooks_run_immediately() {
+        let observer = SyncObserver::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first = Arc::clone(&calls);
+        observer.on_cancel(move || {
+            first.fetch_add(1, Ordering::AcqRel);
+        });
+
+        observer.cancel();
+        observer.cancel();
+        let late = Arc::clone(&calls);
+        observer.on_cancel(move || {
+            late.fetch_add(1, Ordering::AcqRel);
+        });
+
+        assert_eq!(calls.load(Ordering::Acquire), 2);
     }
 
     #[test]
