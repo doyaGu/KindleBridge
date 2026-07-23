@@ -90,46 +90,218 @@ impl ShellStream for DeviceShell {
 }
 
 pub trait DeviceProvider: Send + Sync {
-    fn list(&self) -> Result<Vec<DeviceSummary>, ProviderError>;
-    fn features(&self, serial: &str) -> Result<Option<DeviceFeatures>, ProviderError>;
-    fn ping(&self, serial: &str) -> Result<bool, RpcError>;
-    fn exec(&self, params: &ExecParams) -> Result<Option<ExecResult>, RpcError>;
-    fn sync_push(&self, params: SyncPushParams) -> Result<SyncPushResult, RpcError>;
-    fn sync_pull(&self, params: SyncPullParams) -> Result<SyncPullResult, RpcError>;
-    fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError>;
-    fn sync_list(&self, params: &SyncListParams) -> Result<SyncListResult, RpcError>;
-    fn sync_mkdir(&self, params: &SyncMkdirParams) -> Result<SyncMkdirResult, RpcError>;
+    fn perform(&self, operation: DeviceOperation) -> Result<DeviceOperationResult, RpcError>;
+
     fn sync_push_observed(
         &self,
         params: SyncPushParams,
         observer: &SyncObserver,
     ) -> Result<SyncPushResult, RpcError> {
-        let result = self.sync_push(params)?;
+        let result = self
+            .perform(DeviceOperation::SyncPush(params))?
+            .into_sync_push()?;
         observer.transferred(result.accepted_offset);
         Ok(result)
     }
+
     fn sync_pull_observed(
         &self,
         params: SyncPullParams,
         observer: &SyncObserver,
     ) -> Result<SyncPullResult, RpcError> {
-        let result = self.sync_pull(params)?;
+        let result = self
+            .perform(DeviceOperation::SyncPull(params))?
+            .into_sync_pull()?;
         observer.transferred(result.received_size);
         Ok(result)
     }
-    fn app_install(&self, params: AppInstallParams) -> Result<AppSummary, RpcError>;
-    fn app_start(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError>;
-    fn app_stop(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError>;
-    fn app_restart(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError>;
-    fn app_rollback(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError>;
-    fn app_uninstall(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError>;
-    fn app_list(&self, params: &SerialParams) -> Result<AppList, RpcError>;
-    fn app_log(&self, params: &AppLogParams) -> Result<AppLogSnapshot, RpcError>;
-    fn process_list(&self, params: &SerialParams) -> Result<ProcessList, RpcError>;
-    fn process_signal(&self, params: &ProcessSignalParams) -> Result<ProcessSummary, RpcError>;
-    fn log_tail(&self, params: &LogTailParams) -> Result<LogSnapshot, RpcError>;
+
     fn shell_open(&self, params: &ShellOpenParams) -> Result<Arc<dyn ShellStream>, RpcError> {
         Err(RpcError::feature_unavailable(&params.serial, "shell.v2"))
+    }
+}
+
+pub enum DeviceOperation {
+    List,
+    Features(String),
+    Ping(String),
+    Exec(ExecParams),
+    SyncPush(SyncPushParams),
+    SyncPull(SyncPullParams),
+    SyncStatus(SyncStatusParams),
+    SyncList(SyncListParams),
+    SyncMkdir(SyncMkdirParams),
+    AppInstall(AppInstallParams),
+    AppStart(AppTargetParams),
+    AppStop(AppTargetParams),
+    AppRestart(AppTargetParams),
+    AppRollback(AppTargetParams),
+    AppUninstall(AppTargetParams),
+    AppList(SerialParams),
+    AppLog(AppLogParams),
+    ProcessList(SerialParams),
+    ProcessSignal(ProcessSignalParams),
+    LogTail(LogTailParams),
+}
+
+pub enum DeviceOperationResult {
+    Devices(Vec<DeviceSummary>),
+    Features(Option<DeviceFeatures>),
+    Ping(bool),
+    Exec(Option<ExecResult>),
+    SyncPush(SyncPushResult),
+    SyncPull(SyncPullResult),
+    SyncStatus(SyncStatus),
+    SyncList(SyncListResult),
+    SyncMkdir(SyncMkdirResult),
+    App(AppSummary),
+    Apps(AppList),
+    AppLog(AppLogSnapshot),
+    Processes(ProcessList),
+    Process(ProcessSummary),
+    Log(LogSnapshot),
+}
+
+impl DeviceOperationResult {
+    fn into_sync_push(self) -> Result<SyncPushResult, RpcError> {
+        match self {
+            Self::SyncPush(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+
+    fn into_sync_pull(self) -> Result<SyncPullResult, RpcError> {
+        match self {
+            Self::SyncPull(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+}
+
+impl dyn DeviceProvider + '_ {
+    fn list(&self) -> Result<Vec<DeviceSummary>, RpcError> {
+        match self.perform(DeviceOperation::List)? {
+            DeviceOperationResult::Devices(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+
+    fn features(&self, serial: &str) -> Result<Option<DeviceFeatures>, RpcError> {
+        match self.perform(DeviceOperation::Features(serial.to_owned()))? {
+            DeviceOperationResult::Features(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+
+    fn ping(&self, serial: &str) -> Result<bool, RpcError> {
+        match self.perform(DeviceOperation::Ping(serial.to_owned()))? {
+            DeviceOperationResult::Ping(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+
+    fn exec(&self, params: &ExecParams) -> Result<Option<ExecResult>, RpcError> {
+        match self.perform(DeviceOperation::Exec(params.clone()))? {
+            DeviceOperationResult::Exec(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+
+    fn sync_push(&self, params: SyncPushParams) -> Result<SyncPushResult, RpcError> {
+        self.perform(DeviceOperation::SyncPush(params))?
+            .into_sync_push()
+    }
+
+    fn sync_pull(&self, params: SyncPullParams) -> Result<SyncPullResult, RpcError> {
+        self.perform(DeviceOperation::SyncPull(params))?
+            .into_sync_pull()
+    }
+
+    fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError> {
+        match self.perform(DeviceOperation::SyncStatus(params.clone()))? {
+            DeviceOperationResult::SyncStatus(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+
+    fn sync_list(&self, params: &SyncListParams) -> Result<SyncListResult, RpcError> {
+        match self.perform(DeviceOperation::SyncList(params.clone()))? {
+            DeviceOperationResult::SyncList(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+
+    fn sync_mkdir(&self, params: &SyncMkdirParams) -> Result<SyncMkdirResult, RpcError> {
+        match self.perform(DeviceOperation::SyncMkdir(params.clone()))? {
+            DeviceOperationResult::SyncMkdir(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+
+    fn app_start(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
+        self.app_result(DeviceOperation::AppStart(params.clone()))
+    }
+
+    fn app_install(&self, params: AppInstallParams) -> Result<AppSummary, RpcError> {
+        self.app_result(DeviceOperation::AppInstall(params))
+    }
+
+    fn app_stop(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
+        self.app_result(DeviceOperation::AppStop(params.clone()))
+    }
+
+    fn app_restart(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
+        self.app_result(DeviceOperation::AppRestart(params.clone()))
+    }
+
+    fn app_rollback(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
+        self.app_result(DeviceOperation::AppRollback(params.clone()))
+    }
+
+    fn app_uninstall(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
+        self.app_result(DeviceOperation::AppUninstall(params.clone()))
+    }
+
+    fn app_result(&self, operation: DeviceOperation) -> Result<AppSummary, RpcError> {
+        match self.perform(operation)? {
+            DeviceOperationResult::App(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+
+    fn app_list(&self, params: &SerialParams) -> Result<AppList, RpcError> {
+        match self.perform(DeviceOperation::AppList(params.clone()))? {
+            DeviceOperationResult::Apps(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+
+    fn app_log(&self, params: &AppLogParams) -> Result<AppLogSnapshot, RpcError> {
+        match self.perform(DeviceOperation::AppLog(params.clone()))? {
+            DeviceOperationResult::AppLog(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+
+    fn process_list(&self, params: &SerialParams) -> Result<ProcessList, RpcError> {
+        match self.perform(DeviceOperation::ProcessList(params.clone()))? {
+            DeviceOperationResult::Processes(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+
+    fn process_signal(&self, params: &ProcessSignalParams) -> Result<ProcessSummary, RpcError> {
+        match self.perform(DeviceOperation::ProcessSignal(params.clone()))? {
+            DeviceOperationResult::Process(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
+    }
+
+    fn log_tail(&self, params: &LogTailParams) -> Result<LogSnapshot, RpcError> {
+        match self.perform(DeviceOperation::LogTail(params.clone()))? {
+            DeviceOperationResult::Log(result) => Ok(result),
+            _ => Err(RpcError::internal_error()),
+        }
     }
 }
 
@@ -281,7 +453,7 @@ impl MemoryDeviceProvider {
     }
 }
 
-impl DeviceProvider for MemoryDeviceProvider {
+impl MemoryDeviceProvider {
     fn list(&self) -> Result<Vec<DeviceSummary>, ProviderError> {
         let mut devices: Vec<_> = self
             .devices
@@ -467,6 +639,81 @@ impl DeviceProvider for MemoryDeviceProvider {
     }
 }
 
+impl DeviceProvider for MemoryDeviceProvider {
+    fn perform(&self, operation: DeviceOperation) -> Result<DeviceOperationResult, RpcError> {
+        Ok(match operation {
+            DeviceOperation::List => {
+                DeviceOperationResult::Devices(self.list().map_err(provider_rpc_error)?)
+            }
+            DeviceOperation::Features(serial) => {
+                DeviceOperationResult::Features(self.features(&serial).map_err(provider_rpc_error)?)
+            }
+            DeviceOperation::Ping(serial) => DeviceOperationResult::Ping(self.ping(&serial)?),
+            DeviceOperation::Exec(params) => DeviceOperationResult::Exec(self.exec(&params)?),
+            DeviceOperation::SyncPush(params) => {
+                DeviceOperationResult::SyncPush(self.sync_push(params)?)
+            }
+            DeviceOperation::SyncPull(params) => {
+                DeviceOperationResult::SyncPull(self.sync_pull(params)?)
+            }
+            DeviceOperation::SyncStatus(params) => {
+                DeviceOperationResult::SyncStatus(self.sync_status(&params)?)
+            }
+            DeviceOperation::SyncList(params) => {
+                DeviceOperationResult::SyncList(self.sync_list(&params)?)
+            }
+            DeviceOperation::SyncMkdir(params) => {
+                DeviceOperationResult::SyncMkdir(self.sync_mkdir(&params)?)
+            }
+            DeviceOperation::AppInstall(params) => {
+                DeviceOperationResult::App(self.app_install(params)?)
+            }
+            DeviceOperation::AppStart(params) => {
+                DeviceOperationResult::App(self.app_start(&params)?)
+            }
+            DeviceOperation::AppStop(params) => DeviceOperationResult::App(self.app_stop(&params)?),
+            DeviceOperation::AppRestart(params) => {
+                DeviceOperationResult::App(self.app_restart(&params)?)
+            }
+            DeviceOperation::AppRollback(params) => {
+                DeviceOperationResult::App(self.app_rollback(&params)?)
+            }
+            DeviceOperation::AppUninstall(params) => {
+                DeviceOperationResult::App(self.app_uninstall(&params)?)
+            }
+            DeviceOperation::AppList(params) => {
+                DeviceOperationResult::Apps(self.app_list(&params)?)
+            }
+            DeviceOperation::AppLog(params) => {
+                DeviceOperationResult::AppLog(self.app_log(&params)?)
+            }
+            DeviceOperation::ProcessList(params) => {
+                DeviceOperationResult::Processes(self.process_list(&params)?)
+            }
+            DeviceOperation::ProcessSignal(params) => {
+                DeviceOperationResult::Process(self.process_signal(&params)?)
+            }
+            DeviceOperation::LogTail(params) => DeviceOperationResult::Log(self.log_tail(&params)?),
+        })
+    }
+
+    fn sync_push_observed(
+        &self,
+        params: SyncPushParams,
+        observer: &SyncObserver,
+    ) -> Result<SyncPushResult, RpcError> {
+        MemoryDeviceProvider::sync_push_observed(self, params, observer)
+    }
+
+    fn sync_pull_observed(
+        &self,
+        params: SyncPullParams,
+        observer: &SyncObserver,
+    ) -> Result<SyncPullResult, RpcError> {
+        MemoryDeviceProvider::sync_pull_observed(self, params, observer)
+    }
+}
+
 #[derive(Debug, Error)]
 #[error("device provider failed: {message}")]
 pub struct ProviderError {
@@ -501,10 +748,7 @@ pub enum ServeError {
 
 /// Dispatches a validated request. Notifications are executed but have no response.
 #[must_use]
-pub fn handle_request<P: DeviceProvider + ?Sized>(
-    request: RpcRequest,
-    provider: &P,
-) -> Option<RpcResponse> {
+pub fn handle_request(request: RpcRequest, provider: &dyn DeviceProvider) -> Option<RpcResponse> {
     let result = dispatch(&request, provider);
     request.id.map(|id| match result {
         Ok(value) => RpcResponse::success(id, value),
@@ -512,10 +756,7 @@ pub fn handle_request<P: DeviceProvider + ?Sized>(
     })
 }
 
-fn dispatch<P: DeviceProvider + ?Sized>(
-    request: &RpcRequest,
-    provider: &P,
-) -> Result<Value, RpcError> {
+fn dispatch(request: &RpcRequest, provider: &dyn DeviceProvider) -> Result<Value, RpcError> {
     match request.method.as_str() {
         methods::SERVER_PING => {
             require_empty_params(request.params.as_ref())?;
@@ -541,7 +782,7 @@ fn dispatch<P: DeviceProvider + ?Sized>(
         }
         methods::DEVICE_LIST => {
             require_empty_params(request.params.as_ref())?;
-            let devices = provider.list().map_err(provider_rpc_error)?;
+            let devices = provider.list()?;
             serde_json::to_value(DeviceList { devices }).map_err(|_| RpcError::internal_error())
         }
         methods::DEVICE_FEATURES => {
@@ -555,8 +796,7 @@ fn dispatch<P: DeviceProvider + ?Sized>(
                 return Err(RpcError::invalid_params("serial must not be empty"));
             }
             let features = provider
-                .features(&params.serial)
-                .map_err(provider_rpc_error)?
+                .features(&params.serial)?
                 .ok_or_else(|| RpcError::device_not_found(&params.serial))?;
             serde_json::to_value(features).map_err(|_| RpcError::internal_error())
         }
@@ -586,8 +826,7 @@ fn dispatch<P: DeviceProvider + ?Sized>(
                 ));
             }
             let features = provider
-                .features(&params.serial)
-                .map_err(provider_rpc_error)?
+                .features(&params.serial)?
                 .ok_or_else(|| RpcError::device_not_found(&params.serial))?;
             if !features.features.iter().any(|feature| feature == "exec.v1") {
                 return Err(RpcError::feature_unavailable(&params.serial, "exec.v1"));
@@ -711,10 +950,10 @@ pub(crate) fn provider_rpc_error(error: ProviderError) -> RpcError {
 }
 
 /// Serves framed JSON-RPC messages until clean EOF or a framing error.
-pub fn serve<R: BufRead, W: Write, P: DeviceProvider + ?Sized>(
+pub fn serve<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    provider: &P,
+    provider: &dyn DeviceProvider,
 ) -> Result<(), ServeError> {
     loop {
         let Some(payload) = read_frame(reader, DEFAULT_MAX_CONTENT_LENGTH)? else {
@@ -830,36 +1069,10 @@ mod tests {
         shell: Arc<FakeShell>,
     }
 
-    macro_rules! unused_provider_method {
-        ($name:ident($($argument:ident: $type:ty),*) -> $result:ty) => {
-            fn $name(&self, $($argument: $type),*) -> $result {
-                $(let _ = $argument;)*
-                unreachable!(concat!(stringify!($name), " is not used by shell tests"))
-            }
-        };
-    }
-
     impl DeviceProvider for ShellProvider {
-        unused_provider_method!(list() -> Result<Vec<DeviceSummary>, ProviderError>);
-        unused_provider_method!(features(serial: &str) -> Result<Option<DeviceFeatures>, ProviderError>);
-        unused_provider_method!(ping(serial: &str) -> Result<bool, RpcError>);
-        unused_provider_method!(exec(params: &ExecParams) -> Result<Option<ExecResult>, RpcError>);
-        unused_provider_method!(sync_push(params: SyncPushParams) -> Result<SyncPushResult, RpcError>);
-        unused_provider_method!(sync_pull(params: SyncPullParams) -> Result<SyncPullResult, RpcError>);
-        unused_provider_method!(sync_status(params: &SyncStatusParams) -> Result<SyncStatus, RpcError>);
-        unused_provider_method!(sync_list(params: &SyncListParams) -> Result<SyncListResult, RpcError>);
-        unused_provider_method!(sync_mkdir(params: &SyncMkdirParams) -> Result<SyncMkdirResult, RpcError>);
-        unused_provider_method!(app_install(params: AppInstallParams) -> Result<AppSummary, RpcError>);
-        unused_provider_method!(app_start(params: &AppTargetParams) -> Result<AppSummary, RpcError>);
-        unused_provider_method!(app_stop(params: &AppTargetParams) -> Result<AppSummary, RpcError>);
-        unused_provider_method!(app_restart(params: &AppTargetParams) -> Result<AppSummary, RpcError>);
-        unused_provider_method!(app_rollback(params: &AppTargetParams) -> Result<AppSummary, RpcError>);
-        unused_provider_method!(app_uninstall(params: &AppTargetParams) -> Result<AppSummary, RpcError>);
-        unused_provider_method!(app_list(params: &SerialParams) -> Result<AppList, RpcError>);
-        unused_provider_method!(app_log(params: &AppLogParams) -> Result<AppLogSnapshot, RpcError>);
-        unused_provider_method!(process_list(params: &SerialParams) -> Result<ProcessList, RpcError>);
-        unused_provider_method!(process_signal(params: &ProcessSignalParams) -> Result<ProcessSummary, RpcError>);
-        unused_provider_method!(log_tail(params: &LogTailParams) -> Result<LogSnapshot, RpcError>);
+        fn perform(&self, _operation: DeviceOperation) -> Result<DeviceOperationResult, RpcError> {
+            Err(RpcError::internal_error())
+        }
 
         fn shell_open(&self, _params: &ShellOpenParams) -> Result<Arc<dyn ShellStream>, RpcError> {
             Ok(self.shell.clone())

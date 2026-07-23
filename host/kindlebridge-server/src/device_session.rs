@@ -155,7 +155,7 @@ impl ConnectedDeviceProvider {
     }
 
     /// Open a persistent `shell.v2` stream on one connected device.
-    pub fn shell_open(&self, serial: &str, open: ShellOpen) -> Result<DeviceShell, RpcError> {
+    pub fn open_shell(&self, serial: &str, open: ShellOpen) -> Result<DeviceShell, RpcError> {
         let device = self.require_feature(serial, SHELL_V2_FEATURE)?;
         device.session.open_shell(open).map_err(link_rpc_error)
     }
@@ -175,7 +175,7 @@ impl ConnectedDeviceProvider {
     }
 }
 
-impl DeviceProvider for ConnectedDeviceProvider {
+impl ConnectedDeviceProvider {
     fn list(&self) -> Result<Vec<DeviceSummary>, ProviderError> {
         Ok(self
             .devices
@@ -453,8 +453,95 @@ impl DeviceProvider for ConnectedDeviceProvider {
         &self,
         params: &kindlebridge_schema::ShellOpenParams,
     ) -> Result<std::sync::Arc<dyn crate::ShellStream>, RpcError> {
-        ConnectedDeviceProvider::shell_open(self, &params.serial, params.open.clone())
+        ConnectedDeviceProvider::open_shell(self, &params.serial, params.open.clone())
             .map(|shell| std::sync::Arc::new(shell) as std::sync::Arc<dyn crate::ShellStream>)
+    }
+}
+
+impl DeviceProvider for ConnectedDeviceProvider {
+    fn perform(
+        &self,
+        operation: crate::DeviceOperation,
+    ) -> Result<crate::DeviceOperationResult, RpcError> {
+        use crate::{DeviceOperation, DeviceOperationResult};
+
+        Ok(match operation {
+            DeviceOperation::List => {
+                DeviceOperationResult::Devices(self.list().map_err(crate::provider_rpc_error)?)
+            }
+            DeviceOperation::Features(serial) => DeviceOperationResult::Features(
+                self.features(&serial).map_err(crate::provider_rpc_error)?,
+            ),
+            DeviceOperation::Ping(serial) => DeviceOperationResult::Ping(self.ping(&serial)?),
+            DeviceOperation::Exec(params) => DeviceOperationResult::Exec(self.exec(&params)?),
+            DeviceOperation::SyncPush(params) => {
+                DeviceOperationResult::SyncPush(self.sync_push(params)?)
+            }
+            DeviceOperation::SyncPull(params) => {
+                DeviceOperationResult::SyncPull(self.sync_pull(params)?)
+            }
+            DeviceOperation::SyncStatus(params) => {
+                DeviceOperationResult::SyncStatus(self.sync_status(&params)?)
+            }
+            DeviceOperation::SyncList(params) => {
+                DeviceOperationResult::SyncList(self.sync_list(&params)?)
+            }
+            DeviceOperation::SyncMkdir(params) => {
+                DeviceOperationResult::SyncMkdir(self.sync_mkdir(&params)?)
+            }
+            DeviceOperation::AppInstall(params) => {
+                DeviceOperationResult::App(self.app_install(params)?)
+            }
+            DeviceOperation::AppStart(params) => {
+                DeviceOperationResult::App(self.app_start(&params)?)
+            }
+            DeviceOperation::AppStop(params) => DeviceOperationResult::App(self.app_stop(&params)?),
+            DeviceOperation::AppRestart(params) => {
+                DeviceOperationResult::App(self.app_restart(&params)?)
+            }
+            DeviceOperation::AppRollback(params) => {
+                DeviceOperationResult::App(self.app_rollback(&params)?)
+            }
+            DeviceOperation::AppUninstall(params) => {
+                DeviceOperationResult::App(self.app_uninstall(&params)?)
+            }
+            DeviceOperation::AppList(params) => {
+                DeviceOperationResult::Apps(self.app_list(&params)?)
+            }
+            DeviceOperation::AppLog(params) => {
+                DeviceOperationResult::AppLog(self.app_log(&params)?)
+            }
+            DeviceOperation::ProcessList(params) => {
+                DeviceOperationResult::Processes(self.process_list(&params)?)
+            }
+            DeviceOperation::ProcessSignal(params) => {
+                DeviceOperationResult::Process(self.process_signal(&params)?)
+            }
+            DeviceOperation::LogTail(params) => DeviceOperationResult::Log(self.log_tail(&params)?),
+        })
+    }
+
+    fn sync_push_observed(
+        &self,
+        params: SyncPushParams,
+        observer: &SyncObserver,
+    ) -> Result<SyncPushResult, RpcError> {
+        ConnectedDeviceProvider::sync_push_observed(self, params, observer)
+    }
+
+    fn sync_pull_observed(
+        &self,
+        params: SyncPullParams,
+        observer: &SyncObserver,
+    ) -> Result<SyncPullResult, RpcError> {
+        ConnectedDeviceProvider::sync_pull_observed(self, params, observer)
+    }
+
+    fn shell_open(
+        &self,
+        params: &kindlebridge_schema::ShellOpenParams,
+    ) -> Result<std::sync::Arc<dyn crate::ShellStream>, RpcError> {
+        ConnectedDeviceProvider::shell_open(self, params)
     }
 }
 
@@ -1941,7 +2028,7 @@ mod tests {
         let provider = ConnectedDeviceProvider::connect(&[address]).unwrap();
         let executable = std::env::current_exe().unwrap();
         let shell = provider
-            .shell_open(
+            .open_shell(
                 "KT6-SHELL",
                 ShellOpen {
                     mode: kindlebridge_schema::device_protocol::ShellMode::Raw,
@@ -2087,7 +2174,7 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
         let shell_open = || {
             provider
-                .shell_open(
+                .open_shell(
                     "KT6-FAIR",
                     ShellOpen {
                         mode: kindlebridge_schema::device_protocol::ShellMode::Raw,
