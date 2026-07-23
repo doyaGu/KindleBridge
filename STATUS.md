@@ -35,6 +35,12 @@ Cargo package is an internal build identifier, not a product release.
   back to `/mnt/us/kindlebridge-data`. Tests cover a 9 MiB+ push/pull (larger
   than the stream window) and a real TCP disconnect/reconnect resume. KT6
   power-loss validation remains a release gate.
+  The additive `sync.tree.v1` capability provides paginated, path-confined
+  directory listing and idempotent directory creation. CLI directory push is
+  automatic; `sync pull --recursive` preserves regular files and empty
+  directories while rejecting symbolic links, special files, and partial
+  destination merges. Each file continues through the existing atomic,
+  checksummed `sync.v1` stream.
 - Deterministic `kindlebridge.bundle.v1` KBB build, inspect, verify, Ed25519 signatures,
   BLAKE3 block hashes, zstd/none blocks, safe paths, and activation records.
   `app install SERIAL LOCAL_BUNDLE.kbb` now performs host fail-fast verification,
@@ -139,7 +145,7 @@ Cargo package is an internal build identifier, not a product release.
   menu, and treats repeated start/stop as success. Installation and upgrades
   never change USB ownership: an active or indeterminate manager state is rejected,
   while an inactive installation is replaced atomically and remains inactive.
-  Laboratory invocations may opt into a bounded watchdog. Thirty
+  Laboratory invocations may opt into a bounded watchdog. Thirty-three
   deterministic shell lifecycle tests
   cover connected fail-closed behavior, MTP and existing stock-network entry,
   rollback, stale and detached state reporting, PID ownership, precise
@@ -212,8 +218,8 @@ Cargo package is an internal build identifier, not a product release.
 - Wi-Fi/TCP discovery, authenticated pairing, session encryption, multi-transport
   reconnect, and hardware throughput/latency measurements under concurrent streams.
 - A narrowly scoped, locally authenticated root broker IPC implementation.
-- Root exec grants, sync progress/cancellation and directory semantics,
-  structured application lifecycle events, process control, forward/reverse, GDB,
+- Root exec grants, sync progress/cancellation, structured application
+  lifecycle events, forward/reverse, GDB,
   core dumps, basic perf, screenshot, and bugreport services.
 - KT6 fault-injection validation of offline daemon A/B activation and automatic
   pre-bind rollback. Safe-mode, complete uninstall, and stock USB recovery

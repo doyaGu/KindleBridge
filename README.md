@@ -63,6 +63,8 @@ cargo run --package kindlebridge -- --server target/debug/kindlebridge-server.ex
 
 cargo run --package kindlebridge -- --server target/debug/kindlebridge-server.exe --tcp-device 192.168.15.244:4765 sync push YOUR_KINDLE_SERIAL C:\work\app.bin apps/demo/app.bin
 cargo run --package kindlebridge -- --server target/debug/kindlebridge-server.exe --tcp-device 192.168.15.244:4765 sync pull YOUR_KINDLE_SERIAL apps/demo/app.bin C:\work\app-from-kindle.bin
+cargo run --package kindlebridge -- --server target/debug/kindlebridge-server.exe --tcp-device 192.168.15.244:4765 sync push YOUR_KINDLE_SERIAL C:\work\assets apps/demo/assets
+cargo run --package kindlebridge -- --server target/debug/kindlebridge-server.exe --tcp-device 192.168.15.244:4765 sync pull --recursive YOUR_KINDLE_SERIAL apps/demo/assets C:\work\assets-from-kindle
 ```
 
 Sync local paths are absolute host paths. Device paths are relative logical
@@ -70,6 +72,10 @@ paths below the configured sync root; absolute paths and traversal are rejected.
 The local JSON-RPC connection carries only paths and transfer metadata. File
 content travels as raw KBP `DATA` frames with 8 MiB stream / 16 MiB connection
 windows, persistent resume metadata, and an end-to-end BLAKE3 check.
+Directory push is automatic when the local source is a directory; directory
+pull is explicit with `--recursive`. Empty directories are preserved. Trees
+reject symbolic links, special files, and an existing pull destination. Each
+regular file still uses the bounded, atomic single-file sync path.
 
 This explicit TCP option is an internal bring-up path. It is unencrypted and
 must not be exposed beyond a trusted development link. The production profile
