@@ -18,7 +18,7 @@ use kindlebridge_wire::{Command, Frame, FLAG_END_STREAM};
 use serde::Serialize;
 
 use super::{expect, link_rpc_error, LinkError};
-use crate::SyncObserver;
+use crate::HostSyncOperation;
 
 #[derive(Clone, Debug)]
 pub(super) struct SyncClient {
@@ -30,10 +30,10 @@ impl SyncClient {
         Self { connection }
     }
 
-    pub(super) fn push_observed(
+    pub(super) fn push_with_operation(
         &self,
         params: SyncPushParams,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPushResult, RpcError> {
         validate_host_path(&params.local_path)?;
         validate_block_size(params.block_size)?;
@@ -51,22 +51,22 @@ impl SyncClient {
             .metadata()
             .map_err(|error| host_file_error("stat", &params.local_path, &error))?
             .len();
-        observer.phase(SyncProgressPhase::Hashing, 0, total_size);
-        let file_hash = hash_file_observed(&mut file, total_size, observer)?;
-        observer.phase(SyncProgressPhase::Transferring, 0, total_size);
-        self.push_open_file(&params, &mut file, total_size, &file_hash, observer)
+        operation.phase(SyncProgressPhase::Hashing, 0, total_size);
+        let file_hash = hash_file_with_operation(&mut file, total_size, operation)?;
+        operation.phase(SyncProgressPhase::Transferring, 0, total_size);
+        self.push_open_file(&params, &mut file, total_size, &file_hash, operation)
             .map_err(link_rpc_error)
     }
 
-    pub(super) fn pull_observed(
+    pub(super) fn pull_with_operation(
         &self,
         params: SyncPullParams,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPullResult, RpcError> {
         validate_host_path(&params.local_path)?;
         validate_block_size(params.block_size)?;
         validate_requested_transfer_id(params.transfer_id.as_deref())?;
-        self.pull_stream(&params, observer).map_err(link_rpc_error)
+        self.pull_stream(&params, operation).map_err(link_rpc_error)
     }
 
     pub(super) fn push_open_file(
@@ -75,13 +75,13 @@ impl SyncClient {
         file: &mut File,
         total_size: u64,
         file_hash: &str,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPushResult, LinkError> {
         let mut stream =
             self.connection
                 .open(SYNC_SERVICE, DEFAULT_STREAM_WINDOW, TrafficClass::Bulk)?;
-        register_cancel(observer, &stream);
-        if observer.is_cancelled() {
+        register_cancel(operation, &stream);
+        if operation.is_cancelled() {
             return Err(sync_cancelled_error());
         }
         stream.send_data(
@@ -114,17 +114,17 @@ impl SyncClient {
         {
             return Err(LinkError::UnexpectedFrame("sync push resume mismatch"));
         }
-        observer.transfer_id(transfer_id.clone());
-        observer.phase(SyncProgressPhase::Transferring, offset, total_size);
+        operation.transfer_id(transfer_id.clone());
+        operation.phase(SyncProgressPhase::Transferring, offset, total_size);
         file.seek(SeekFrom::Start(offset))?;
         let mut buffer = vec![0_u8; params.block_size as usize];
         let mut sent = offset;
         if sent == total_size {
             stream.send_data(Vec::new(), true)?;
-            observer.transferred(sent);
+            operation.transferred(sent);
         } else {
             loop {
-                if observer.is_cancelled() {
+                if operation.is_cancelled() {
                     let _ = stream.reset("sync cancelled");
                     return Err(sync_cancelled_error());
                 }
@@ -142,7 +142,7 @@ impl SyncClient {
                 }
                 let last = sent == total_size;
                 stream.send_data(buffer[..count].to_vec(), last)?;
-                observer.transferred(sent);
+                operation.transferred(sent);
                 if last {
                     break;
                 }
@@ -174,14 +174,14 @@ impl SyncClient {
     fn pull_stream(
         &self,
         params: &SyncPullParams,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPullResult, LinkError> {
         let started = Instant::now();
         let mut stream =
             self.connection
                 .open(SYNC_SERVICE, DEFAULT_STREAM_WINDOW, TrafficClass::Bulk)?;
-        register_cancel(observer, &stream);
-        if observer.is_cancelled() {
+        register_cancel(operation, &stream);
+        if operation.is_cancelled() {
             return Err(sync_cancelled_error());
         }
         let staging = params
@@ -229,8 +229,8 @@ impl SyncClient {
         {
             return Err(LinkError::UnexpectedFrame("sync pull resume mismatch"));
         }
-        observer.transfer_id(transfer_id.clone());
-        observer.phase(SyncProgressPhase::Transferring, remote_offset, total_size);
+        operation.transfer_id(transfer_id.clone());
+        operation.phase(SyncProgressPhase::Transferring, remote_offset, total_size);
         let staging = match staging {
             Some(path) => path,
             None => staging_path(Path::new(&params.local_path), &transfer_id)?,
@@ -240,7 +240,7 @@ impl SyncClient {
         output.seek(SeekFrom::Start(remote_offset))?;
         let mut received = remote_offset;
         loop {
-            if observer.is_cancelled() {
+            if operation.is_cancelled() {
                 let _ = stream.reset("sync cancelled");
                 return Err(sync_cancelled_error());
             }
@@ -250,7 +250,7 @@ impl SyncClient {
             received = received
                 .checked_add(data.payload.len() as u64)
                 .ok_or(LinkError::SequenceExhausted)?;
-            observer.transferred(received);
+            operation.transferred(received);
             if received > total_size {
                 return Err(LinkError::UnexpectedFrame(
                     "sync pull exceeded declared size",
@@ -279,7 +279,7 @@ impl SyncClient {
         output.sync_all()?;
         drop(output);
         commit_host_file(&staging, Path::new(&params.local_path))?;
-        observer.transferred(received);
+        operation.transferred(received);
         let committed_at = started.elapsed();
         trace(format_args!(
             "pull {transfer_id}: host durability and commit took {:.3}s ({:.3}s total)",
@@ -320,10 +320,10 @@ pub(super) fn hash_file(file: &mut File, length: u64) -> Result<String, RpcError
         .map_err(link_rpc_error)
 }
 
-fn hash_file_observed(
+fn hash_file_with_operation(
     file: &mut File,
     length: u64,
-    observer: &SyncObserver,
+    operation: &HostSyncOperation,
 ) -> Result<String, RpcError> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| host_file_error("seek", "source", &error))?;
@@ -331,7 +331,7 @@ fn hash_file_observed(
     let mut buffer = vec![0_u8; kindlebridge_schema::DEFAULT_SYNC_BLOCK_SIZE as usize];
     let mut hashed = 0_u64;
     while hashed < length {
-        if observer.is_cancelled() {
+        if operation.is_cancelled() {
             return Err(cancelled_rpc_error());
         }
         let remaining = length - hashed;
@@ -346,7 +346,7 @@ fn hash_file_observed(
         }
         hasher.update(&buffer[..count]);
         hashed += count as u64;
-        observer.transferred(hashed);
+        operation.transferred(hashed);
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -443,9 +443,9 @@ pub(super) fn host_file_error(operation: &str, path: &str, error: &std::io::Erro
     }))
 }
 
-fn register_cancel(observer: &SyncObserver, stream: &ActorStream) {
+fn register_cancel(operation: &HostSyncOperation, stream: &ActorStream) {
     let stream = stream.clone();
-    observer.on_cancel(move || {
+    operation.on_cancel(move || {
         let _ = std::thread::Builder::new()
             .name("kindlebridge-sync-cancel".to_owned())
             .spawn(move || {

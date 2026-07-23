@@ -18,9 +18,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::host_rpc::handle_registry;
-use super::{DeviceRegistry, DeviceShellEvent, ServeError, ShellStream, SyncObserver};
+use super::{DeviceRegistry, DeviceShellEvent, HostSyncOperation, ServeError, ShellStream};
 
-const MAX_CLIENT_SYNC_JOBS: usize = 4;
+const MAX_CLIENT_SYNC_OPERATIONS: usize = 4;
 
 fn to_value<T: Serialize>(value: T) -> Result<Value, RpcError> {
     serde_json::to_value(value).map_err(|_| RpcError::internal_error())
@@ -30,7 +30,7 @@ pub(super) struct ClientRuntime<W> {
     writer: Arc<Mutex<W>>,
     registry: Arc<DeviceRegistry>,
     streams: Arc<Mutex<HashMap<String, Arc<dyn ShellStream>>>>,
-    sync_jobs: Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>,
+    sync_operations: Arc<Mutex<HashMap<String, Arc<HostSyncOperation>>>>,
 }
 
 impl<W> ClientRuntime<W> {
@@ -39,7 +39,7 @@ impl<W> ClientRuntime<W> {
             writer: Arc::new(Mutex::new(writer)),
             registry,
             streams: Arc::new(Mutex::new(HashMap::new())),
-            sync_jobs: Arc::new(Mutex::new(HashMap::new())),
+            sync_operations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -49,7 +49,7 @@ impl<W> ClientRuntime<W> {
                 let _ = stream.close();
             }
         }
-        cancel_sync_jobs(&self.sync_jobs);
+        cancel_sync_operations(&self.sync_operations);
     }
 
     #[cfg(test)]
@@ -58,16 +58,20 @@ impl<W> ClientRuntime<W> {
     }
 
     #[cfg(test)]
-    pub(super) fn track_sync(&self, operation_id: String, observer: Arc<SyncObserver>) {
-        self.sync_jobs
+    pub(super) fn track_sync_operation(
+        &self,
+        operation_id: String,
+        operation: Arc<HostSyncOperation>,
+    ) {
+        self.sync_operations
             .lock()
             .unwrap()
-            .insert(operation_id, observer);
+            .insert(operation_id, operation);
     }
 
     #[cfg(test)]
     pub(super) fn is_idle(&self) -> bool {
-        self.streams.lock().unwrap().is_empty() && self.sync_jobs.lock().unwrap().is_empty()
+        self.streams.lock().unwrap().is_empty() && self.sync_operations.lock().unwrap().is_empty()
     }
 }
 
@@ -92,10 +96,12 @@ where
     ClientRuntime::new(writer, registry).serve(reader)
 }
 
-pub(super) fn cancel_sync_jobs(jobs: &Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>) {
-    if let Ok(mut jobs) = jobs.lock() {
-        for (_, observer) in jobs.drain() {
-            observer.cancel();
+pub(super) fn cancel_sync_operations(
+    operations: &Arc<Mutex<HashMap<String, Arc<HostSyncOperation>>>>,
+) {
+    if let Ok(mut operations) = operations.lock() {
+        for (_, operation) in operations.drain() {
+            operation.cancel();
         }
     }
 }
@@ -133,9 +139,9 @@ where
                 request.method.as_str(),
                 methods::SYNC_PUSH_STREAM | methods::SYNC_PULL_STREAM
             ) {
-                handle_sync_open(request, &self.writer, &self.registry, &self.sync_jobs)?;
+                handle_sync_open(request, &self.writer, &self.registry, &self.sync_operations)?;
             } else if request.method == methods::SYNC_CANCEL {
-                handle_sync_cancel(request, &self.sync_jobs);
+                handle_sync_cancel(request, &self.sync_operations);
             } else if matches!(
                 request.method.as_str(),
                 methods::STREAM_WRITE
@@ -155,12 +161,12 @@ pub(super) fn handle_sync_open<W: Write + Send + 'static>(
     request: RpcRequest,
     writer: &Arc<Mutex<W>>,
     registry: &Arc<DeviceRegistry>,
-    jobs: &Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>,
+    operations: &Arc<Mutex<HashMap<String, Arc<HostSyncOperation>>>>,
 ) -> Result<(), ServeError> {
     let Some(id) = request.id else {
         return Ok(());
     };
-    let active_jobs = jobs
+    let active_jobs = operations
         .lock()
         .map_err(|_| {
             FramingError::Json(serde_json::Error::io(io::Error::other(
@@ -168,7 +174,7 @@ pub(super) fn handle_sync_open<W: Write + Send + 'static>(
             )))
         })?
         .len();
-    if active_jobs >= MAX_CLIENT_SYNC_JOBS {
+    if active_jobs >= MAX_CLIENT_SYNC_OPERATIONS {
         return write_shared(
             writer,
             &RpcResponse::failure(
@@ -185,20 +191,21 @@ pub(super) fn handle_sync_open<W: Write + Send + 'static>(
             "could not allocate sync operation ID",
         )))
     })?;
-    let observer = Arc::new(SyncObserver::default());
-    jobs.lock()
+    let operation = Arc::new(HostSyncOperation::default());
+    operations
+        .lock()
         .map_err(|_| {
             FramingError::Json(serde_json::Error::io(io::Error::other(
                 "sync operation registry is unavailable",
             )))
         })?
-        .insert(operation_id.clone(), Arc::clone(&observer));
+        .insert(operation_id.clone(), Arc::clone(&operation));
 
     let method = request.method;
     let params = request.params;
     let writer = Arc::clone(writer);
     let registry = Arc::clone(registry);
-    let jobs = Arc::clone(jobs);
+    let operations = Arc::clone(operations);
     thread::spawn(move || {
         let result = if method == methods::SYNC_PUSH_STREAM {
             match params
@@ -212,14 +219,18 @@ pub(super) fn handle_sync_open<W: Write + Send + 'static>(
                     let total = std::fs::metadata(&params.local_path)
                         .map(|metadata| metadata.len())
                         .unwrap_or(0);
-                    observer.phase(SyncProgressPhase::Hashing, 0, total);
+                    operation.phase(SyncProgressPhase::Hashing, 0, total);
                     run_with_progress(
                         &writer,
-                        &observer,
+                        &operation,
                         &operation_id,
                         TransferDirection::Push,
                         &remote_path,
-                        || registry.rpc(|provider| provider.sync_push_observed(params, &observer)),
+                        || {
+                            registry.rpc(|provider| {
+                                provider.sync_push_with_operation(params, &operation)
+                            })
+                        },
                     )
                 }
                 Err(error) => Err(error),
@@ -233,14 +244,18 @@ pub(super) fn handle_sync_open<W: Write + Send + 'static>(
                 }) {
                 Ok(params) => {
                     let remote_path = params.remote_path.clone();
-                    observer.phase(SyncProgressPhase::Transferring, 0, 0);
+                    operation.phase(SyncProgressPhase::Transferring, 0, 0);
                     run_with_progress(
                         &writer,
-                        &observer,
+                        &operation,
                         &operation_id,
                         TransferDirection::Pull,
                         &remote_path,
-                        || registry.rpc(|provider| provider.sync_pull_observed(params, &observer)),
+                        || {
+                            registry.rpc(|provider| {
+                                provider.sync_pull_with_operation(params, &operation)
+                            })
+                        },
                     )
                 }
                 Err(error) => Err(error),
@@ -251,8 +266,8 @@ pub(super) fn handle_sync_open<W: Write + Send + 'static>(
             Err(error) => RpcResponse::failure(id, error),
         };
         let _ = write_shared(&writer, &response);
-        if let Ok(mut jobs) = jobs.lock() {
-            jobs.remove(&operation_id);
+        if let Ok(mut operations) = operations.lock() {
+            operations.remove(&operation_id);
         }
     });
     Ok(())
@@ -260,11 +275,11 @@ pub(super) fn handle_sync_open<W: Write + Send + 'static>(
 
 fn run_with_progress<W, T>(
     writer: &Arc<Mutex<W>>,
-    observer: &Arc<SyncObserver>,
+    operation: &Arc<HostSyncOperation>,
     operation_id: &str,
     direction: TransferDirection,
     remote_path: &str,
-    operation: impl FnOnce() -> Result<T, RpcError>,
+    run: impl FnOnce() -> Result<T, RpcError>,
 ) -> Result<Value, RpcError>
 where
     W: Write + Send + 'static,
@@ -272,7 +287,7 @@ where
 {
     let (done_sender, done_receiver) = std::sync::mpsc::channel();
     let reporter_writer = Arc::clone(writer);
-    let reporter_observer = Arc::clone(observer);
+    let reporter_operation = Arc::clone(operation);
     let reporter_id = operation_id.to_owned();
     let reporter_path = remote_path.to_owned();
     let reporter_direction = direction.clone();
@@ -280,7 +295,7 @@ where
         if emit_notification(
             &reporter_writer,
             methods::SYNC_PROGRESS,
-            &reporter_observer.snapshot(
+            &reporter_operation.snapshot(
                 reporter_id.clone(),
                 reporter_direction.clone(),
                 reporter_path.clone(),
@@ -288,7 +303,7 @@ where
         )
         .is_err()
         {
-            reporter_observer.cancel();
+            reporter_operation.cancel();
             return;
         }
         match done_receiver.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -296,30 +311,33 @@ where
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
     });
-    let result = operation().and_then(to_value);
+    let result = run().and_then(to_value);
     let _ = done_sender.send(());
     let _ = reporter.join();
     let _ = emit_notification(
         writer,
         methods::SYNC_PROGRESS,
-        &observer.snapshot(operation_id.to_owned(), direction, remote_path.to_owned()),
+        &operation.snapshot(operation_id.to_owned(), direction, remote_path.to_owned()),
     );
     result
 }
 
-fn handle_sync_cancel(request: RpcRequest, jobs: &Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>) {
+fn handle_sync_cancel(
+    request: RpcRequest,
+    operations: &Arc<Mutex<HashMap<String, Arc<HostSyncOperation>>>>,
+) {
     let Some(params) = request
         .params
         .and_then(|value| serde_json::from_value::<SyncCancelParams>(value).ok())
     else {
         return;
     };
-    if let Some(observer) = jobs
+    if let Some(operation) = operations
         .lock()
         .ok()
-        .and_then(|jobs| jobs.get(&params.operation_id).cloned())
+        .and_then(|operations| operations.get(&params.operation_id).cloned())
     {
-        observer.cancel();
+        operation.cancel();
     }
 }
 

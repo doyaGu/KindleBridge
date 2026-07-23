@@ -5,11 +5,11 @@ mod device_registry;
 mod device_session;
 mod host_rpc;
 mod runtime;
+mod sync_operation;
 
 #[cfg(test)]
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(test)]
 use std::thread;
@@ -25,8 +25,8 @@ use kindlebridge_schema::{
     ExecParams, ExecResult, FramingError, LogSnapshot, LogTailParams, ProcessList,
     ProcessSignalParams, ProcessSummary, RequestId, RpcError, RpcResponse, SerialParams,
     ShellOpenParams, SyncListParams, SyncListResult, SyncMkdirParams, SyncMkdirResult,
-    SyncProgress, SyncProgressPhase, SyncPullParams, SyncPullResult, SyncPushParams,
-    SyncPushResult, SyncStatus, SyncStatusParams, TransferDirection, DEFAULT_MAX_CONTENT_LENGTH,
+    SyncProgressPhase, SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus,
+    SyncStatusParams, DEFAULT_MAX_CONTENT_LENGTH,
 };
 #[cfg(test)]
 use kindlebridge_schema::{methods, ShellOpenResult};
@@ -45,6 +45,7 @@ use runtime::RuntimeState;
 pub use device_registry::DeviceRegistry;
 pub use device_session::{ConnectedDeviceProvider, DeviceShell, DeviceShellEvent};
 pub use host_rpc::{reset_server_stop_requested, server_stop_requested};
+pub use sync_operation::HostSyncOperation;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRecord {
@@ -92,27 +93,27 @@ impl ShellStream for DeviceShell {
 pub trait DeviceProvider: Send + Sync {
     fn perform(&self, operation: DeviceOperation) -> Result<DeviceOperationResult, RpcError>;
 
-    fn sync_push_observed(
+    fn sync_push_with_operation(
         &self,
         params: SyncPushParams,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPushResult, RpcError> {
         let result = self
             .perform(DeviceOperation::SyncPush(params))?
             .into_sync_push()?;
-        observer.transferred(result.accepted_offset);
+        operation.transferred(result.accepted_offset);
         Ok(result)
     }
 
-    fn sync_pull_observed(
+    fn sync_pull_with_operation(
         &self,
         params: SyncPullParams,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPullResult, RpcError> {
         let result = self
             .perform(DeviceOperation::SyncPull(params))?
             .into_sync_pull()?;
-        observer.transferred(result.received_size);
+        operation.transferred(result.received_size);
         Ok(result)
     }
 
@@ -305,113 +306,6 @@ impl dyn DeviceProvider + '_ {
     }
 }
 
-pub struct SyncObserver {
-    cancelled: AtomicBool,
-    transferred: AtomicU64,
-    total: AtomicU64,
-    phase: Mutex<SyncProgressPhase>,
-    transfer_id: Mutex<Option<String>>,
-    cancel_hooks: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
-}
-
-impl Default for SyncObserver {
-    fn default() -> Self {
-        Self {
-            cancelled: AtomicBool::new(false),
-            transferred: AtomicU64::new(0),
-            total: AtomicU64::new(0),
-            phase: Mutex::new(SyncProgressPhase::Hashing),
-            transfer_id: Mutex::new(None),
-            cancel_hooks: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-impl std::fmt::Debug for SyncObserver {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SyncObserver")
-            .field("cancelled", &self.is_cancelled())
-            .field("transferred", &self.transferred.load(Ordering::Acquire))
-            .field("total", &self.total.load(Ordering::Acquire))
-            .finish_non_exhaustive()
-    }
-}
-
-impl SyncObserver {
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-        let hooks = self
-            .cancel_hooks
-            .lock()
-            .map(|mut hooks| std::mem::take(&mut *hooks))
-            .unwrap_or_default();
-        for hook in hooks {
-            hook();
-        }
-    }
-
-    #[must_use]
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-
-    pub fn phase(&self, phase: SyncProgressPhase, transferred: u64, total: u64) {
-        self.total.store(total, Ordering::Release);
-        self.transferred.store(transferred, Ordering::Release);
-        if let Ok(mut current) = self.phase.lock() {
-            *current = phase;
-        }
-    }
-
-    pub fn transferred(&self, transferred: u64) {
-        self.transferred.store(transferred, Ordering::Release);
-    }
-
-    pub fn transfer_id(&self, transfer_id: impl Into<String>) {
-        if let Ok(mut current) = self.transfer_id.lock() {
-            *current = Some(transfer_id.into());
-        }
-    }
-
-    pub fn on_cancel(&self, hook: impl FnOnce() + Send + 'static) {
-        if self.is_cancelled() {
-            hook();
-            return;
-        }
-        let Ok(mut hooks) = self.cancel_hooks.lock() else {
-            hook();
-            return;
-        };
-        if self.is_cancelled() {
-            drop(hooks);
-            hook();
-        } else {
-            hooks.push(Box::new(hook));
-        }
-    }
-
-    fn snapshot(
-        &self,
-        operation_id: String,
-        direction: TransferDirection,
-        remote_path: String,
-    ) -> SyncProgress {
-        SyncProgress {
-            operation_id,
-            transfer_id: self.transfer_id.lock().ok().and_then(|id| id.clone()),
-            direction,
-            remote_path,
-            phase: self
-                .phase
-                .lock()
-                .map_or(SyncProgressPhase::Transferring, |phase| phase.clone()),
-            transferred: self.transferred.load(Ordering::Acquire),
-            total: self.total.load(Ordering::Acquire),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct MemoryDeviceProvider {
     devices: Vec<DeviceRecord>,
@@ -518,26 +412,26 @@ impl MemoryDeviceProvider {
         self.runtime()?.sync_push(params)
     }
 
-    fn sync_push_observed(
+    fn sync_push_with_operation(
         &self,
         params: SyncPushParams,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPushResult, RpcError> {
         let total = std::fs::metadata(&params.local_path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
-        observer.phase(SyncProgressPhase::Hashing, 0, total);
-        if observer.is_cancelled() {
+        operation.phase(SyncProgressPhase::Hashing, 0, total);
+        if operation.is_cancelled() {
             return Err(RpcError::new(
                 error_codes::TRANSFER_CANCELLED,
                 "Transfer cancelled",
             ));
         }
-        observer.transferred(total);
-        observer.phase(SyncProgressPhase::Transferring, 0, total);
+        operation.transferred(total);
+        operation.phase(SyncProgressPhase::Transferring, 0, total);
         let result = self.sync_push(params)?;
-        observer.transferred(result.accepted_offset);
-        observer.transfer_id(result.transfer_id.clone());
+        operation.transferred(result.accepted_offset);
+        operation.transfer_id(result.transfer_id.clone());
         Ok(result)
     }
 
@@ -546,21 +440,21 @@ impl MemoryDeviceProvider {
         self.runtime()?.sync_pull(params)
     }
 
-    fn sync_pull_observed(
+    fn sync_pull_with_operation(
         &self,
         params: SyncPullParams,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPullResult, RpcError> {
-        observer.phase(SyncProgressPhase::Transferring, 0, 0);
-        if observer.is_cancelled() {
+        operation.phase(SyncProgressPhase::Transferring, 0, 0);
+        if operation.is_cancelled() {
             return Err(RpcError::new(
                 error_codes::TRANSFER_CANCELLED,
                 "Transfer cancelled",
             ));
         }
         let result = self.sync_pull(params)?;
-        observer.transfer_id(result.transfer_id.clone());
-        observer.phase(
+        operation.transfer_id(result.transfer_id.clone());
+        operation.phase(
             SyncProgressPhase::Transferring,
             result.received_size,
             result.total_size,
@@ -697,20 +591,20 @@ impl DeviceProvider for MemoryDeviceProvider {
         })
     }
 
-    fn sync_push_observed(
+    fn sync_push_with_operation(
         &self,
         params: SyncPushParams,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPushResult, RpcError> {
-        MemoryDeviceProvider::sync_push_observed(self, params, observer)
+        MemoryDeviceProvider::sync_push_with_operation(self, params, operation)
     }
 
-    fn sync_pull_observed(
+    fn sync_pull_with_operation(
         &self,
         params: SyncPullParams,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPullResult, RpcError> {
-        MemoryDeviceProvider::sync_pull_observed(self, params, observer)
+        MemoryDeviceProvider::sync_pull_with_operation(self, params, operation)
     }
 }
 
@@ -809,7 +703,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs;
     use std::io::{self, BufReader, Cursor};
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use kindlebridge_schema::{
@@ -1060,7 +954,7 @@ mod tests {
         let registry = Arc::new(DeviceRegistry::direct(Arc::new(provider())));
         let output = SharedOutput::default();
         let writer = Arc::new(Mutex::new(output.clone()));
-        let jobs = Arc::new(Mutex::new(HashMap::new()));
+        let operations = Arc::new(Mutex::new(HashMap::new()));
         let request = RpcRequest::call(
             RequestId::Number(12),
             methods::SYNC_PUSH_STREAM,
@@ -1076,9 +970,9 @@ mod tests {
             ),
         );
 
-        handle_sync_open(request, &writer, &registry, &jobs).unwrap();
+        handle_sync_open(request, &writer, &registry, &operations).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while (!jobs.lock().unwrap().is_empty() || output.frames.load(Ordering::Acquire) < 2)
+        while (!operations.lock().unwrap().is_empty() || output.frames.load(Ordering::Acquire) < 2)
             && Instant::now() < deadline
         {
             thread::yield_now();
@@ -1103,16 +997,16 @@ mod tests {
     #[test]
     fn client_runtime_shutdown_is_idempotent_and_clears_all_work() {
         let shell = Arc::new(FakeShell::new([]));
-        let first = Arc::new(SyncObserver::default());
-        let second = Arc::new(SyncObserver::default());
+        let first = Arc::new(HostSyncOperation::default());
+        let second = Arc::new(HostSyncOperation::default());
         let runtime = ClientRuntime::new(
             Vec::<u8>::new(),
             Arc::new(DeviceRegistry::direct(Arc::new(provider()))),
         );
         let shell_stream: Arc<dyn ShellStream> = shell.clone();
         runtime.track_shell("shell".to_owned(), shell_stream);
-        runtime.track_sync("first".to_owned(), Arc::clone(&first));
-        runtime.track_sync("second".to_owned(), Arc::clone(&second));
+        runtime.track_sync_operation("first".to_owned(), Arc::clone(&first));
+        runtime.track_sync_operation("second".to_owned(), Arc::clone(&second));
 
         runtime.shutdown();
         runtime.shutdown();
@@ -1124,9 +1018,9 @@ mod tests {
     }
 
     #[test]
-    fn dropping_client_runtime_closes_shells_and_cancels_sync_jobs() {
+    fn dropping_client_runtime_closes_shells_and_cancels_sync_operations() {
         let shell = Arc::new(FakeShell::new([]));
-        let observer = Arc::new(SyncObserver::default());
+        let operation = Arc::new(HostSyncOperation::default());
         {
             let runtime = ClientRuntime::new(
                 Vec::<u8>::new(),
@@ -1134,30 +1028,11 @@ mod tests {
             );
             let shell_stream: Arc<dyn ShellStream> = shell.clone();
             runtime.track_shell("shell".to_owned(), shell_stream);
-            runtime.track_sync("sync".to_owned(), Arc::clone(&observer));
+            runtime.track_sync_operation("sync".to_owned(), Arc::clone(&operation));
         }
 
         assert!(shell.closed.load(Ordering::Acquire));
-        assert!(observer.is_cancelled());
-    }
-
-    #[test]
-    fn cancellation_hooks_run_once_and_late_hooks_run_immediately() {
-        let observer = SyncObserver::default();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let first = Arc::clone(&calls);
-        observer.on_cancel(move || {
-            first.fetch_add(1, Ordering::AcqRel);
-        });
-
-        observer.cancel();
-        observer.cancel();
-        let late = Arc::clone(&calls);
-        observer.on_cancel(move || {
-            late.fetch_add(1, Ordering::AcqRel);
-        });
-
-        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert!(operation.is_cancelled());
     }
 
     #[test]

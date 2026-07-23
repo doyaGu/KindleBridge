@@ -53,7 +53,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{DeviceProvider, ProviderError, SyncObserver};
+use crate::{DeviceProvider, HostSyncOperation, ProviderError};
 use sync_client::SyncClient;
 
 const SESSION_IO_TIMEOUT: Duration = Duration::from_secs(10 * 60 + 30);
@@ -208,29 +208,35 @@ impl ConnectedDeviceProvider {
     }
 
     fn sync_push(&self, params: SyncPushParams) -> Result<SyncPushResult, RpcError> {
-        self.sync_push_observed(params, &SyncObserver::default())
+        self.sync_push_with_operation(params, &HostSyncOperation::default())
     }
 
-    fn sync_push_observed(
+    fn sync_push_with_operation(
         &self,
         params: SyncPushParams,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPushResult, RpcError> {
         let device = self.require_feature(&params.serial, SYNC_FEATURE)?;
-        device.session.sync_client().push_observed(params, observer)
+        device
+            .session
+            .sync_client()
+            .push_with_operation(params, operation)
     }
 
     fn sync_pull(&self, params: SyncPullParams) -> Result<SyncPullResult, RpcError> {
-        self.sync_pull_observed(params, &SyncObserver::default())
+        self.sync_pull_with_operation(params, &HostSyncOperation::default())
     }
 
-    fn sync_pull_observed(
+    fn sync_pull_with_operation(
         &self,
         params: SyncPullParams,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPullResult, RpcError> {
         let device = self.require_feature(&params.serial, SYNC_FEATURE)?;
-        device.session.sync_client().pull_observed(params, observer)
+        device
+            .session
+            .sync_client()
+            .pull_with_operation(params, operation)
     }
 
     fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError> {
@@ -292,7 +298,7 @@ impl ConnectedDeviceProvider {
                 &mut file,
                 total_size,
                 &file_hash,
-                &SyncObserver::default(),
+                &HostSyncOperation::default(),
             )
             .map_err(link_rpc_error)?;
         if pushed.state != TransferState::Complete || pushed.accepted_offset != total_size {
@@ -429,20 +435,20 @@ impl DeviceProvider for ConnectedDeviceProvider {
         })
     }
 
-    fn sync_push_observed(
+    fn sync_push_with_operation(
         &self,
         params: SyncPushParams,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPushResult, RpcError> {
-        ConnectedDeviceProvider::sync_push_observed(self, params, observer)
+        ConnectedDeviceProvider::sync_push_with_operation(self, params, operation)
     }
 
-    fn sync_pull_observed(
+    fn sync_pull_with_operation(
         &self,
         params: SyncPullParams,
-        observer: &SyncObserver,
+        operation: &HostSyncOperation,
     ) -> Result<SyncPullResult, RpcError> {
-        ConnectedDeviceProvider::sync_pull_observed(self, params, observer)
+        ConnectedDeviceProvider::sync_pull_with_operation(self, params, operation)
     }
 
     fn shell_open(
@@ -2132,7 +2138,7 @@ mod tests {
                 &mut file,
                 payload.len() as u64,
                 blake3::hash(&payload).to_hex().as_ref(),
-                &SyncObserver::default(),
+                &HostSyncOperation::default(),
             )
             .unwrap();
         let transfer_flushes = flushes.load(Ordering::Relaxed) - before;
