@@ -94,8 +94,13 @@ Cargo package is an internal build identifier, not a product release.
   uninstall on the KT6 without a USB mode transition or daemon restart.
   Watch now terminates an obsolete Windows build process tree (or Linux
   process group), reloads changed project configuration, debounces again, and
-  deploys only the latest successful result. Merging live application logs
-  remains required before this workflow is feature-complete.
+  deploys only the latest successful result. Dev.38 adds separate bounded
+  stdout/stderr capture, byte cursors, run identities, one-shot `app log`, and
+  continuous `app log --follow`. Watch follows the same stream and marks
+  successful redeployments without replaying the preceding run. The KT6 gate
+  verified separate channels, two source-triggered reloads, changing PIDs/run
+  IDs, cleanup, and continued Bridge availability. Follow mode preserves its
+  cursors and waits quietly through transient device-link unavailability.
 - A formal USB device link, not only a raw probe. The host automatically
   discovers and claims the exact `VID_1949:PID_9981` `ff/4b/01` interface,
   leaves MTP alone, performs the normal KBP HELLO, and exposes the same exec and
@@ -208,7 +213,7 @@ Cargo package is an internal build identifier, not a product release.
   reconnect, and hardware throughput/latency measurements under concurrent streams.
 - A narrowly scoped, locally authenticated root broker IPC implementation.
 - Root exec grants, sync progress/cancellation and directory semantics,
-  merged live logs/events, process control, forward/reverse, GDB,
+  structured application lifecycle events, process control, forward/reverse, GDB,
   core dumps, basic perf, screenshot, and bugreport services.
 - KT6 fault-injection validation of offline daemon A/B activation and automatic
   pre-bind rollback. Safe-mode, complete uninstall, and stock USB recovery

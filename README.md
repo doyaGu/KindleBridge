@@ -269,8 +269,10 @@ Generated development bundles live below `.kindlebridge/` and receive a
 monotonic development release without rewriting the source manifest. If source
 changes while a build is still running, watch mode terminates that obsolete
 build process tree, reloads the project configuration, and builds only the
-latest source. Merged live application logs are the next development-loop
-increment.
+latest source. `run --watch` follows the application's bounded stdout and
+stderr capture across each successful redeployment. `app log SERIAL APP_ID`
+prints the current run; `--follow` preserves byte cursors, marks application
+restarts, and waits quietly through transient device-link loss.
 
 ```powershell
 cargo run --package kindlebridge-bundle -- key init --output dev.key
@@ -300,8 +302,11 @@ and process policy. `app start`, `app stop`, and `app restart` operate on a real
 process group; list reports the observed PID and reaps exited applications.
 Stop sends TERM, waits the bundle's `stop_timeout_ms`, then kills the process
 group. A parent-death-aware internal runner also cleans the group if the daemon
-is terminated. App stdout/stderr inherit the daemon log, so they are visible to
-the current log snapshot command. Installing the identical bundle again is
+is terminated. Each start truncates separate stdout and stderr captures below
+the application's private data directory. Each channel is capped at 4 MiB
+while its pipe continues to be drained, preventing both unbounded growth and
+application deadlock. `app log` exposes byte cursors and a stable run ID.
+Installing the identical bundle again is
 idempotent and verifies that its runtime image is present. Missing or corrupt
 runtime images are hard errors, not compatibility states. `app rollback`
 returns to the previous distinct signed application

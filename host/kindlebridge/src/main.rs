@@ -26,8 +26,8 @@ use kindlebridge::{
 use kindlebridge_bundle::read_project_manifest;
 use kindlebridge_schema::device_protocol::{ShellMode, ShellOpen, TerminalSize, SHELL_V2_FEATURE};
 use kindlebridge_schema::{
-    methods, read_json_frame, write_json_frame, AppLogParams, AppLogSnapshot, ClientError,
-    DeviceFeatures, RequestId, RpcClient, RpcRequest, RpcResponse, ShellOpenParams,
+    error_codes, methods, read_json_frame, write_json_frame, AppLogParams, AppLogSnapshot,
+    ClientError, DeviceFeatures, RequestId, RpcClient, RpcRequest, RpcResponse, ShellOpenParams,
     ShellOpenResult, StreamChannel, StreamClosedParams, StreamCreditParams, StreamDataParams,
     StreamExitParams, StreamIdParams, StreamResizeParams, StreamWriteParams,
     DEFAULT_MAX_CONTENT_LENGTH,
@@ -300,26 +300,40 @@ fn run_app_log(
     let mut stderr_cursor = 0;
     let mut warned_stdout_cap = false;
     let mut warned_stderr_cap = false;
+    let mut waiting_for_device = false;
 
     loop {
-        let value = client
-            .call(
-                methods::APP_LOG,
-                Some(
-                    serde_json::to_value(AppLogParams {
-                        serial: serial.clone(),
-                        app_id: app_id.clone(),
-                        run_id: run_id.clone(),
-                        stdout_cursor,
-                        stderr_cursor,
-                        max_bytes: Some(max_bytes),
-                    })
-                    .map_err(|_| {
-                        RunError::Message("could not encode app log request".to_owned())
-                    })?,
-                ),
-            )
-            .map_err(|error| RunError::Message(format!("app log request failed: {error}")))?;
+        let params = serde_json::to_value(AppLogParams {
+            serial: serial.clone(),
+            app_id: app_id.clone(),
+            run_id: run_id.clone(),
+            stdout_cursor,
+            stderr_cursor,
+            max_bytes: Some(max_bytes),
+        })
+        .map_err(|_| RunError::Message("could not encode app log request".to_owned()))?;
+        let value = match client.call(methods::APP_LOG, Some(params)) {
+            Ok(value) => {
+                if waiting_for_device {
+                    eprintln!("--- {app_id} log connection restored ---");
+                    waiting_for_device = false;
+                }
+                value
+            }
+            Err(error) if follow && is_retryable_app_log_error(&error) => {
+                if !waiting_for_device {
+                    eprintln!("--- {app_id} is offline; waiting for KindleBridge ---");
+                    waiting_for_device = true;
+                }
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            Err(error) => {
+                return Err(RunError::Message(format!(
+                    "app log request failed: {error}"
+                )))
+            }
+        };
         let snapshot: AppLogSnapshot = serde_json::from_value(value)
             .map_err(|_| RunError::Message("server returned invalid app log data".to_owned()))?;
         let restarted = run_id.is_some() && snapshot.reset;
@@ -370,6 +384,17 @@ fn run_app_log(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn is_retryable_app_log_error(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Rpc(error)
+            if matches!(
+                error.code,
+                error_codes::SERVER_NOT_READY | error_codes::DEVICE_NOT_FOUND
+            )
+    )
 }
 
 fn resolve_watch_paths(project_root: &Path, configured: &[PathBuf]) -> Vec<PathBuf> {
@@ -1571,5 +1596,18 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         credit.stop();
         assert!(!worker.join().unwrap());
+    }
+
+    #[test]
+    fn app_log_follow_retries_only_transient_device_link_errors() {
+        for code in [error_codes::SERVER_NOT_READY, error_codes::DEVICE_NOT_FOUND] {
+            assert!(is_retryable_app_log_error(&ClientError::Rpc(
+                kindlebridge_schema::RpcError::new(code, "offline")
+            )));
+        }
+        assert!(!is_retryable_app_log_error(&ClientError::Rpc(
+            kindlebridge_schema::RpcError::feature_unavailable("KT6-TEST", "app.log.v1")
+        )));
+        assert!(!is_retryable_app_log_error(&ClientError::InvalidResponse));
     }
 }
