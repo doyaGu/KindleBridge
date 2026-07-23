@@ -9,9 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use interprocess::local_socket::{
-    prelude::*, GenericFilePath, GenericNamespaced, ListenerNonblockingMode, ListenerOptions,
-};
+use interprocess::local_socket::prelude::*;
 use kindlebridge_server::{
     reset_server_stop_requested, serve_streaming, server_stop_requested, ConnectedDeviceProvider,
     DeviceProvider, DeviceRecord, MemoryDeviceProvider, ReconnectingUsbProvider,
@@ -128,31 +126,7 @@ fn run_local_service(
     idle_timeout: Duration,
 ) -> Result<(), String> {
     reset_server_stop_requested();
-    let endpoint = local_endpoint();
-    let listener = if GenericNamespaced::is_supported() {
-        ListenerOptions::new()
-            .name(
-                endpoint
-                    .as_str()
-                    .to_ns_name::<GenericNamespaced>()
-                    .map_err(|error| format!("invalid local pipe name: {error}"))?,
-            )
-            .nonblocking(ListenerNonblockingMode::Accept)
-            .create_sync()
-    } else {
-        ListenerOptions::new()
-            .name(
-                endpoint
-                    .as_str()
-                    .to_fs_name::<GenericFilePath>()
-                    .map_err(|error| format!("invalid local socket path: {error}"))?,
-            )
-            .try_overwrite(true)
-            .nonblocking(ListenerNonblockingMode::Accept)
-            .create_sync()
-    }
-    .map_err(|error| format!("could not listen on {endpoint}: {error}"))?;
-    secure_unix_socket(&endpoint)?;
+    let listener = kindlebridge_local::bind().map_err(|error| error.to_string())?;
 
     let active_clients = Arc::new(AtomicUsize::new(0));
     let mut idle_since = Instant::now();
@@ -199,50 +173,6 @@ impl Drop for ClientGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
-}
-
-fn local_endpoint() -> String {
-    if GenericNamespaced::is_supported() {
-        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_owned());
-        format!("kindlebridge-{}", sanitize_endpoint_component(&user))
-    } else {
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let user = std::env::var("USER").unwrap_or_else(|_| "user".to_owned());
-        base.join(format!(
-            "kindlebridge-{}.sock",
-            sanitize_endpoint_component(&user)
-        ))
-        .to_string_lossy()
-        .into_owned()
-    }
-}
-
-fn sanitize_endpoint_component(value: &str) -> String {
-    let value: String = value
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-        .take(64)
-        .collect();
-    if value.is_empty() {
-        "user".to_owned()
-    } else {
-        value
-    }
-}
-
-#[cfg(unix)]
-fn secure_unix_socket(endpoint: &str) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(endpoint, fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("could not secure local socket {endpoint}: {error}"))
-}
-
-#[cfg(not(unix))]
-fn secure_unix_socket(_endpoint: &str) -> Result<(), String> {
-    Ok(())
 }
 
 struct ParentWatchdog {

@@ -16,9 +16,7 @@ use crossterm::event::{
     KeyModifiers,
 };
 use crossterm::{execute, terminal};
-use interprocess::local_socket::{
-    prelude::*, GenericFilePath, GenericNamespaced, SendHalf, Stream,
-};
+use interprocess::local_socket::{prelude::*, SendHalf, Stream};
 use kindlebridge::{
     deploy_project_after_build, execute_with_status, AppCommand, Cli, CliError, CommandOutput,
     RpcCaller, RunArgs, ServerCommand, ShellArgs, TopLevelCommand,
@@ -118,7 +116,7 @@ fn run(cli: &Cli) -> Result<CommandOutput, RunError> {
     }
     if let TopLevelCommand::Server(args) = &cli.command {
         if matches!(args.command, ServerCommand::Status | ServerCommand::Stop) {
-            let Ok(stream) = connect_local() else {
+            let Ok(stream) = kindlebridge_local::connect() else {
                 return Ok(CommandOutput {
                     output: "not running".to_owned(),
                     exit_code: 0,
@@ -214,7 +212,7 @@ fn run_project_watch(cli: &Cli, args: &RunArgs) -> Result<CommandOutput, RunErro
     )?;
     print_run_result(deploy_project_connected(cli, args))?;
     let log_serial = args.serial.clone();
-    let log_stream = connect_local().map_err(|error| {
+    let log_stream = kindlebridge_local::connect().map_err(|error| {
         RunError::Message(format!("could not follow application logs: {error}"))
     })?;
     thread::spawn(move || {
@@ -1440,11 +1438,11 @@ fn parse_escape(value: &str) -> Result<Option<u8>, RunError> {
 }
 
 fn connect_or_start(cli: &Cli) -> Result<Stream, RunError> {
-    if let Ok(stream) = connect_local() {
+    if let Ok(stream) = kindlebridge_local::connect() {
         match probe_server_version(stream) {
             Ok(version) => match classify_server(&version) {
                 ServerCompatibility::Compatible => {
-                    if let Ok(stream) = connect_local() {
+                    if let Ok(stream) = kindlebridge_local::connect() {
                         return Ok(stream);
                     }
                 }
@@ -1459,7 +1457,7 @@ fn connect_or_start(cli: &Cli) -> Result<Stream, RunError> {
                     }
                     match stop_if_incompatible()? {
                         StopOutcome::MatchingServer => {
-                            if let Ok(stream) = connect_local() {
+                            if let Ok(stream) = kindlebridge_local::connect() {
                                 return Ok(stream);
                             }
                         }
@@ -1494,11 +1492,11 @@ fn spawn_server_and_connect(cli: &Cli) -> Result<Stream, RunError> {
     let mut child_exit = None;
     let mut incompatible = None;
     loop {
-        if let Ok(stream) = connect_local() {
+        if let Ok(stream) = kindlebridge_local::connect() {
             if let Ok(version) = probe_server_version(stream) {
                 match classify_server(&version) {
                     ServerCompatibility::Compatible => {
-                        if let Ok(stream) = connect_local() {
+                        if let Ok(stream) = kindlebridge_local::connect() {
                             return Ok(stream);
                         }
                     }
@@ -1574,7 +1572,7 @@ enum StopOutcome {
 }
 
 fn stop_if_incompatible() -> Result<StopOutcome, RunError> {
-    let Ok(stream) = connect_local() else {
+    let Ok(stream) = kindlebridge_local::connect() else {
         return Ok(StopOutcome::EndpointGone);
     };
     let (reader, writer) = stream.split();
@@ -1601,7 +1599,7 @@ fn stop_if_incompatible() -> Result<StopOutcome, RunError> {
 }
 
 fn stop_race_outcome(_error: ClientError) -> Result<StopOutcome, RunError> {
-    let Ok(stream) = connect_local() else {
+    let Ok(stream) = kindlebridge_local::connect() else {
         return Ok(StopOutcome::EndpointGone);
     };
     match probe_server_version(stream) {
@@ -1626,13 +1624,13 @@ fn wait_for_replacement_window() -> Result<ReplacementWindow, RunError> {
     let started = Instant::now();
     let mut unavailable_since = None;
     loop {
-        match connect_local() {
+        match kindlebridge_local::connect() {
             Ok(stream) => {
                 unavailable_since = None;
                 if let Ok(version) = probe_server_version(stream) {
                     match classify_server(&version) {
                         ServerCompatibility::Compatible => {
-                            if let Ok(stream) = connect_local() {
+                            if let Ok(stream) = kindlebridge_local::connect() {
                                 return Ok(ReplacementWindow::MatchingServer(stream));
                             }
                         }
@@ -1678,7 +1676,7 @@ fn wait_for_local_server_shutdown() -> Result<(), RunError> {
     // listener still exists. Require a short, continuous unavailable period so
     // the next CLI cannot land in the server's final accept/exit window.
     if wait_until_stable(SERVER_STOP_TIMEOUT, SERVER_ENDPOINT_QUIET_PERIOD, || {
-        connect_local().is_err()
+        kindlebridge_local::connect().is_err()
     }) {
         Ok(())
     } else {
@@ -1753,46 +1751,6 @@ fn hide_server_window(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn hide_server_window(_command: &mut Command) {}
-
-fn connect_local() -> io::Result<Stream> {
-    let endpoint = local_endpoint();
-    if GenericNamespaced::is_supported() {
-        Stream::connect(endpoint.as_str().to_ns_name::<GenericNamespaced>()?)
-    } else {
-        Stream::connect(endpoint.as_str().to_fs_name::<GenericFilePath>()?)
-    }
-}
-
-fn local_endpoint() -> String {
-    if GenericNamespaced::is_supported() {
-        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_owned());
-        format!("kindlebridge-{}", sanitize_endpoint_component(&user))
-    } else {
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let user = std::env::var("USER").unwrap_or_else(|_| "user".to_owned());
-        base.join(format!(
-            "kindlebridge-{}.sock",
-            sanitize_endpoint_component(&user)
-        ))
-        .to_string_lossy()
-        .into_owned()
-    }
-}
-
-fn sanitize_endpoint_component(value: &str) -> String {
-    let value: String = value
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-        .take(64)
-        .collect();
-    if value.is_empty() {
-        "user".to_owned()
-    } else {
-        value
-    }
-}
 
 fn print_error(json_output: bool, error: &RunError) {
     if json_output {
