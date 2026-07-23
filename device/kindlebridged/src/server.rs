@@ -147,6 +147,7 @@ pub struct TcpServer {
     listener: TcpFrameListener,
     config: ServerConfig,
     sync_store: SyncStore,
+    shells: ShellStreams,
 }
 
 impl TcpServer {
@@ -158,6 +159,7 @@ impl TcpServer {
             listener,
             config,
             sync_store,
+            shells: ShellStreams::default(),
         })
     }
 
@@ -176,6 +178,7 @@ impl TcpServer {
             TcpActorSink(stream),
             &self.config,
             &self.sync_store,
+            &self.shells,
             false,
         )
     }
@@ -197,6 +200,7 @@ impl TcpServer {
                         TcpActorSink(stream),
                         &self.config,
                         &self.sync_store,
+                        &self.shells,
                         false,
                     )
                 });
@@ -224,6 +228,7 @@ pub struct UsbServer {
     functionfs: FunctionFsDevice,
     config: ServerConfig,
     sync_store: SyncStore,
+    shells: ShellStreams,
 }
 
 impl UsbServer {
@@ -240,6 +245,7 @@ impl UsbServer {
             functionfs,
             config,
             sync_store,
+            shells: ShellStreams::default(),
         })
     }
 
@@ -258,6 +264,7 @@ impl UsbServer {
             FunctionFsActorSink(writer),
             &self.config,
             &self.sync_store,
+            &self.shells,
             true,
         )?;
         Ok(true)
@@ -278,6 +285,7 @@ impl UsbServer {
                     FunctionFsActorSink(writer),
                     &self.config,
                     &self.sync_store,
+                    &self.shells,
                     true,
                 )
             });
@@ -448,6 +456,7 @@ fn serve_actor_connection<R, W>(
     sink: W,
     config: &ServerConfig,
     sync_store: &SyncStore,
+    shells: &ShellStreams,
     restart_in_place: bool,
 ) -> Result<(), ServerError>
 where
@@ -463,7 +472,6 @@ where
     } else {
         Connection::start(state, source, sink)
     };
-    let shells = ShellStreams::default();
     loop {
         let incoming = match incoming.recv() {
             Ok(incoming) => incoming,
