@@ -37,9 +37,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 #[cfg(test)]
-use client_runtime::{
-    handle_shell_open, handle_stream_notification, handle_sync_open, ClientRuntime,
-};
+use client_runtime::{handle_shell_open, handle_stream_notification, ClientRuntime};
 use runtime::RuntimeState;
 
 pub use device_registry::DeviceRegistry;
@@ -953,8 +951,7 @@ mod tests {
         fs::write(&source, b"progress payload").unwrap();
         let registry = Arc::new(DeviceRegistry::direct(Arc::new(provider())));
         let output = SharedOutput::default();
-        let writer = Arc::new(Mutex::new(output.clone()));
-        let operations = Arc::new(Mutex::new(HashMap::new()));
+        let runtime = ClientRuntime::new(output.clone(), registry);
         let request = RpcRequest::call(
             RequestId::Number(12),
             methods::SYNC_PUSH_STREAM,
@@ -970,9 +967,9 @@ mod tests {
             ),
         );
 
-        handle_sync_open(request, &writer, &registry, &operations).unwrap();
+        runtime.open_sync(request).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while (!operations.lock().unwrap().is_empty() || output.frames.load(Ordering::Acquire) < 2)
+        while (!runtime.is_idle() || output.frames.load(Ordering::Acquire) < 2)
             && Instant::now() < deadline
         {
             thread::yield_now();
