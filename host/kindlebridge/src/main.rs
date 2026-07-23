@@ -28,9 +28,9 @@ use kindlebridge_schema::device_protocol::{ShellMode, ShellOpen, TerminalSize, S
 use kindlebridge_schema::{
     error_codes, methods, read_json_frame, write_json_frame, AppLogParams, AppLogSnapshot,
     AppState, ClientError, DeviceFeatures, RequestId, RpcClient, RpcRequest, RpcResponse,
-    ShellOpenParams, ShellOpenResult, StreamChannel, StreamClosedParams, StreamCreditParams,
-    StreamDataParams, StreamExitParams, StreamIdParams, StreamResizeParams, StreamWriteParams,
-    SyncProgress, SyncProgressPhase, DEFAULT_MAX_CONTENT_LENGTH,
+    ServerVersion, ShellOpenParams, ShellOpenResult, StreamChannel, StreamClosedParams,
+    StreamCreditParams, StreamDataParams, StreamExitParams, StreamIdParams, StreamResizeParams,
+    StreamWriteParams, SyncProgress, SyncProgressPhase, API_VERSION, DEFAULT_MAX_CONTENT_LENGTH,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -40,9 +40,11 @@ const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SERVER_ENDPOINT_QUIET_PERIOD: Duration = Duration::from_millis(100);
+const SERVER_COMPETITOR_GRACE: Duration = Duration::from_millis(500);
 const INPUT_POLL: Duration = Duration::from_millis(50);
 const MAX_INPUT_PACKET: usize =
     kindlebridge_schema::shell_protocol::USB_ALIGNED_SHELL_PACKET_PAYLOAD;
+const EXPECTED_SERVER_NAME: &str = "kindlebridge-server";
 
 fn main() -> ExitCode {
     let json_requested = std::env::args_os().any(|argument| argument == "--json");
@@ -1437,21 +1439,87 @@ fn parse_escape(value: &str) -> Result<Option<u8>, RunError> {
 
 fn connect_or_start(cli: &Cli) -> Result<Stream, RunError> {
     if let Ok(stream) = connect_local() {
-        return Ok(stream);
+        match probe_server_version(stream) {
+            Ok(version) => match classify_server(&version) {
+                ServerCompatibility::Compatible => {
+                    if let Ok(stream) = connect_local() {
+                        return Ok(stream);
+                    }
+                }
+                ServerCompatibility::Replace => {
+                    if !cli.json {
+                        eprintln!(
+                            "updating local {EXPECTED_SERVER_NAME} {} (API {}) to {} (API {API_VERSION})",
+                            version.version,
+                            version.api_version,
+                            env!("CARGO_PKG_VERSION")
+                        );
+                    }
+                    match stop_if_incompatible()? {
+                        StopOutcome::MatchingServer => {
+                            if let Ok(stream) = connect_local() {
+                                return Ok(stream);
+                            }
+                        }
+                        StopOutcome::StopRequested | StopOutcome::EndpointGone => {}
+                    }
+                    match wait_for_replacement_window()? {
+                        ReplacementWindow::MatchingServer(stream) => return Ok(stream),
+                        ReplacementWindow::EndpointGone => {}
+                    }
+                }
+                ServerCompatibility::Foreign => {
+                    return Err(foreign_server_error(&version));
+                }
+            },
+            Err(_) => {
+                // A server can close between connect and the version call. Only
+                // proceed when its endpoint actually disappears; never stop an
+                // unverified process that happens to own the same local name.
+                wait_for_local_server_shutdown()?;
+            }
+        }
     }
+    spawn_server_and_connect(cli)
+}
+
+fn spawn_server_and_connect(cli: &Cli) -> Result<Stream, RunError> {
     let mut command = server_command(cli)?;
     let mut child = command
         .spawn()
         .map_err(|error| RunError::Startup(format!("could not start {}: {error}", cli.server)))?;
     let started = Instant::now();
+    let mut child_exit = None;
+    let mut incompatible = None;
     loop {
         if let Ok(stream) = connect_local() {
-            return Ok(stream);
+            if let Ok(version) = probe_server_version(stream) {
+                match classify_server(&version) {
+                    ServerCompatibility::Compatible => {
+                        if let Ok(stream) = connect_local() {
+                            return Ok(stream);
+                        }
+                    }
+                    ServerCompatibility::Replace => incompatible = Some(version),
+                    ServerCompatibility::Foreign => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(foreign_server_error(&version));
+                    }
+                }
+            }
         }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| RunError::Startup(format!("could not inspect server: {error}")))?
-        {
+        if child_exit.is_none() {
+            child_exit = child
+                .try_wait()
+                .map_err(|error| RunError::Startup(format!("could not inspect server: {error}")))?
+                .map(|status| (Instant::now(), status));
+        }
+        if let Some((exited_at, status)) = &child_exit {
+            if exited_at.elapsed() < SERVER_COMPETITOR_GRACE {
+                thread::sleep(SERVER_POLL_INTERVAL);
+                continue;
+            }
             return Err(RunError::Startup(format!(
                 "server exited during startup with {status}"
             )));
@@ -1459,12 +1527,148 @@ fn connect_or_start(cli: &Cli) -> Result<Stream, RunError> {
         if started.elapsed() >= SERVER_START_TIMEOUT {
             let _ = child.kill();
             let _ = child.wait();
+            return Err(RunError::Startup(match incompatible {
+                Some(version) => format!(
+                    "{} launched {}, but this CLI requires {} (API {API_VERSION})",
+                    cli.server,
+                    format_server_identity(&version),
+                    env!("CARGO_PKG_VERSION")
+                ),
+                None => "shared local server startup timed out".to_owned(),
+            }));
+        }
+        thread::sleep(SERVER_POLL_INTERVAL);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServerCompatibility {
+    Compatible,
+    Replace,
+    Foreign,
+}
+
+fn classify_server(version: &ServerVersion) -> ServerCompatibility {
+    if version.name != EXPECTED_SERVER_NAME {
+        ServerCompatibility::Foreign
+    } else if version.version == env!("CARGO_PKG_VERSION") && version.api_version == API_VERSION {
+        ServerCompatibility::Compatible
+    } else {
+        ServerCompatibility::Replace
+    }
+}
+
+fn probe_server_version(stream: Stream) -> Result<ServerVersion, ClientError> {
+    let (reader, writer) = stream.split();
+    let mut client = RpcClient::new(BufReader::new(reader), BufWriter::new(writer));
+    let value = client.call(methods::SERVER_VERSION, None)?;
+    serde_json::from_value(value).map_err(|_| ClientError::InvalidResponse)
+}
+
+enum StopOutcome {
+    StopRequested,
+    MatchingServer,
+    EndpointGone,
+}
+
+fn stop_if_incompatible() -> Result<StopOutcome, RunError> {
+    let Ok(stream) = connect_local() else {
+        return Ok(StopOutcome::EndpointGone);
+    };
+    let (reader, writer) = stream.split();
+    let mut client = RpcClient::new(BufReader::new(reader), BufWriter::new(writer));
+    let value = match client.call(methods::SERVER_VERSION, None) {
+        Ok(value) => value,
+        Err(error) => return stop_race_outcome(error),
+    };
+    let version: ServerVersion = serde_json::from_value(value).map_err(|_| {
+        RunError::Startup(
+            "the existing local server returned invalid version information".to_owned(),
+        )
+    })?;
+    match classify_server(&version) {
+        ServerCompatibility::Compatible => Ok(StopOutcome::MatchingServer),
+        ServerCompatibility::Foreign => Err(foreign_server_error(&version)),
+        ServerCompatibility::Replace => {
+            if let Err(error) = client.call(methods::SERVER_STOP, None) {
+                return stop_race_outcome(error);
+            }
+            Ok(StopOutcome::StopRequested)
+        }
+    }
+}
+
+fn stop_race_outcome(_error: ClientError) -> Result<StopOutcome, RunError> {
+    let Ok(stream) = connect_local() else {
+        return Ok(StopOutcome::EndpointGone);
+    };
+    match probe_server_version(stream) {
+        Ok(version) => match classify_server(&version) {
+            ServerCompatibility::Compatible => Ok(StopOutcome::MatchingServer),
+            ServerCompatibility::Foreign => Err(foreign_server_error(&version)),
+            // Another CLI may already have delivered STOP while the old
+            // listener is still accepting its final connections. Enter the
+            // bounded replacement wait instead of racing a second STOP.
+            ServerCompatibility::Replace => Ok(StopOutcome::StopRequested),
+        },
+        Err(_) => Ok(StopOutcome::EndpointGone),
+    }
+}
+
+enum ReplacementWindow {
+    MatchingServer(Stream),
+    EndpointGone,
+}
+
+fn wait_for_replacement_window() -> Result<ReplacementWindow, RunError> {
+    let started = Instant::now();
+    let mut unavailable_since = None;
+    loop {
+        match connect_local() {
+            Ok(stream) => {
+                unavailable_since = None;
+                if let Ok(version) = probe_server_version(stream) {
+                    match classify_server(&version) {
+                        ServerCompatibility::Compatible => {
+                            if let Ok(stream) = connect_local() {
+                                return Ok(ReplacementWindow::MatchingServer(stream));
+                            }
+                        }
+                        ServerCompatibility::Foreign => {
+                            return Err(foreign_server_error(&version));
+                        }
+                        ServerCompatibility::Replace => {}
+                    }
+                }
+            }
+            Err(_) => {
+                let unavailable_since = unavailable_since.get_or_insert_with(Instant::now);
+                if unavailable_since.elapsed() >= SERVER_ENDPOINT_QUIET_PERIOD {
+                    return Ok(ReplacementWindow::EndpointGone);
+                }
+            }
+        }
+        if started.elapsed() >= SERVER_STOP_TIMEOUT {
             return Err(RunError::Startup(
-                "shared local server startup timed out".to_owned(),
+                "old local server did not stop within 5 seconds".to_owned(),
             ));
         }
         thread::sleep(SERVER_POLL_INTERVAL);
     }
+}
+
+fn foreign_server_error(version: &ServerVersion) -> RunError {
+    RunError::Startup(format!(
+        "local endpoint belongs to {}, not {EXPECTED_SERVER_NAME}; stop it manually",
+        format_server_identity(version)
+    ))
+}
+
+fn format_server_identity(version: &ServerVersion) -> String {
+    format!(
+        "{} {} (API {})",
+        version.name, version.version, version.api_version
+    )
 }
 
 fn wait_for_local_server_shutdown() -> Result<(), RunError> {
@@ -1666,6 +1870,50 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    fn server_version(name: &str, version: &str, api_version: &str) -> ServerVersion {
+        ServerVersion {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            api_version: api_version.to_owned(),
+        }
+    }
+
+    #[test]
+    fn server_compatibility_requires_exact_name_build_and_api() {
+        assert_eq!(
+            classify_server(&server_version(
+                EXPECTED_SERVER_NAME,
+                env!("CARGO_PKG_VERSION"),
+                API_VERSION
+            )),
+            ServerCompatibility::Compatible
+        );
+        assert_eq!(
+            classify_server(&server_version(
+                EXPECTED_SERVER_NAME,
+                "0.1.0-dev.40",
+                API_VERSION
+            )),
+            ServerCompatibility::Replace
+        );
+        assert_eq!(
+            classify_server(&server_version(
+                EXPECTED_SERVER_NAME,
+                env!("CARGO_PKG_VERSION"),
+                "v0"
+            )),
+            ServerCompatibility::Replace
+        );
+        assert_eq!(
+            classify_server(&server_version(
+                "unrelated-server",
+                env!("CARGO_PKG_VERSION"),
+                API_VERSION
+            )),
+            ServerCompatibility::Foreign
+        );
+    }
 
     #[test]
     fn sync_cli_upgrades_file_transfers_to_the_progress_rpc() {
