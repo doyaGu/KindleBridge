@@ -17,6 +17,8 @@ mod header;
 mod install;
 mod model;
 mod path;
+#[cfg(feature = "full")]
+mod project;
 #[cfg(feature = "verify")]
 mod verify;
 
@@ -43,6 +45,10 @@ pub use model::{
     RotationProofSignedData, SignatureEntry, SignaturePolicy, Tree, Variant,
 };
 pub use path::{validate_bundle_path, validate_symlink_target};
+#[cfg(feature = "full")]
+pub use project::{
+    build_project_bundle, read_project_manifest, BuiltBundle, DevelopmentConfig, ProjectManifest,
+};
 #[cfg(feature = "verify")]
 pub use verify::{
     inspect, inspect_bytes, verify, verify_bytes, Inspection, VerifiedBundle, VerifyOptions,

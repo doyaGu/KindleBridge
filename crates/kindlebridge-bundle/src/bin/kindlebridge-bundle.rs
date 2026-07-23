@@ -1,18 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use kindlebridge_bundle::{
-    inspect, verify, BuildConfig, BundleBuilder, BundleKind, CompressionPolicy, DataPolicy,
-    Permissions, ProcessPolicy, VerifyOptions,
-};
+use kindlebridge_bundle::{build_project_bundle, inspect, verify, VerifyOptions};
 use rand_core::OsRng;
-use serde::Deserialize;
 use serde_json::json;
-use walkdir::WalkDir;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -68,72 +62,6 @@ enum KeyCommand {
 enum KeyPurpose {
     Development,
     Release,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Manifest {
-    kind: BundleKind,
-    id: String,
-    version: String,
-    release: u64,
-    #[serde(default = "default_channel")]
-    channel: String,
-    #[serde(default = "default_target")]
-    target: String,
-    #[serde(default = "default_os")]
-    os: String,
-    #[serde(default = "default_arch")]
-    arch: String,
-    #[serde(default = "default_abi")]
-    abi: String,
-    firmware_min: Option<Vec<u64>>,
-    firmware_max_exclusive: Option<Vec<u64>>,
-    #[serde(default)]
-    required_features: Vec<String>,
-    #[serde(default)]
-    optional_features: Vec<String>,
-    #[serde(default)]
-    entrypoints: BTreeMap<String, String>,
-    #[serde(default)]
-    executable: Vec<String>,
-    #[serde(default)]
-    permissions: Permissions,
-    process: Option<ProcessPolicy>,
-    #[serde(default)]
-    data: DataPolicy,
-    annotations: Option<BTreeMap<String, String>>,
-    publisher_name: Option<String>,
-    #[serde(default)]
-    compression: ManifestCompression,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum ManifestCompression {
-    Never,
-    #[default]
-    ZstdWhenSmaller,
-}
-
-fn default_channel() -> String {
-    "dev".to_owned()
-}
-
-fn default_target() -> String {
-    "kindlehf".to_owned()
-}
-
-fn default_os() -> String {
-    "kindle-linux".to_owned()
-}
-
-fn default_arch() -> String {
-    "arm".to_owned()
-}
-
-fn default_abi() -> String {
-    "gnueabihf".to_owned()
 }
 
 fn main() {
@@ -206,72 +134,26 @@ fn build_bundle(
     json_output: bool,
 ) -> Result<(), Box<dyn Error>> {
     refuse_overwrite(output)?;
-    let manifest: Manifest = toml::from_str(&fs::read_to_string(manifest_path)?)?;
-    let signing_key = read_signing_key(signing_key_path)?;
-    let executable: BTreeSet<String> = manifest
-        .executable
-        .iter()
-        .chain(manifest.entrypoints.values())
-        .cloned()
-        .collect();
-
-    let mut config = BuildConfig::new(
-        manifest.kind,
-        manifest.id,
-        manifest.version,
-        manifest.release,
-        manifest.target,
-    );
-    config.channel = manifest.channel;
-    config.os = manifest.os;
-    config.arch = manifest.arch;
-    config.abi = manifest.abi;
-    config.firmware_min = manifest.firmware_min;
-    config.firmware_max_exclusive = manifest.firmware_max_exclusive;
-    config.required_features = manifest.required_features;
-    config.optional_features = manifest.optional_features;
-    config.entrypoints = manifest.entrypoints;
-    config.permissions = manifest.permissions;
-    config.process = manifest.process;
-    config.data = manifest.data;
-    config.annotations = manifest.annotations;
-    config.publisher_name = manifest.publisher_name;
-    config.compression = match manifest.compression {
-        ManifestCompression::Never => CompressionPolicy::Never,
-        ManifestCompression::ZstdWhenSmaller => CompressionPolicy::ZstdWhenSmaller,
-    };
-
-    let mut builder = BundleBuilder::new(config);
-    add_input_tree(&mut builder, input, &executable)?;
-    let bytes = builder.build(&signing_key)?;
-    fs::write(output, &bytes)?;
-    let verified = kindlebridge_bundle::verify_bytes(
-        &bytes,
-        &VerifyOptions {
-            expected_publisher: Some(&signing_key.verifying_key()),
-            target: None,
-            firmware: None,
-        },
-    )?;
+    let built = build_project_bundle(manifest_path, input, signing_key_path, output, None)?;
 
     if json_output {
         println!(
             "{}",
             json!({
                 "output": output,
-                "bytes": bytes.len(),
-                "id": verified.inspection.envelope.id,
-                "version": verified.inspection.envelope.version,
-                "release": verified.inspection.envelope.release,
-                "bundle_root": format!("{:?}", verified.inspection.header.bundle_root),
+                "bytes": built.bytes,
+                "id": built.id,
+                "version": built.version,
+                "release": built.release,
+                "bundle_root": format!("{:?}", built.bundle_root),
             })
         );
     } else {
         println!(
             "built {} ({} bytes, root {:?})",
             output.display(),
-            bytes.len(),
-            verified.inspection.header.bundle_root
+            built.bytes,
+            built.bundle_root
         );
     }
     Ok(())
@@ -349,59 +231,6 @@ fn verify_bundle(
         );
     }
     Ok(())
-}
-
-fn add_input_tree(
-    builder: &mut BundleBuilder,
-    root: &Path,
-    executable: &BTreeSet<String>,
-) -> Result<(), Box<dyn Error>> {
-    if !root.is_dir() {
-        return Err(format!("input is not a directory: {}", root.display()).into());
-    }
-    for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
-        let entry = entry?;
-        if entry.path() == root {
-            continue;
-        }
-        let relative = entry.path().strip_prefix(root)?;
-        let logical = path_to_logical(relative)?;
-        if entry.file_type().is_dir() {
-            builder.add_directory(logical)?;
-        } else if entry.file_type().is_symlink() {
-            let target = fs::read_link(entry.path())?;
-            builder.add_symlink(logical, path_to_logical(&target)?)?;
-        } else if entry.file_type().is_file() {
-            let is_executable = executable.contains(&logical);
-            builder.add_file(logical, fs::read(entry.path())?, is_executable)?;
-        } else {
-            return Err(format!("unsupported input entry: {}", entry.path().display()).into());
-        }
-    }
-    Ok(())
-}
-
-fn path_to_logical(path: &Path) -> Result<String, Box<dyn Error>> {
-    let mut logical = String::new();
-    for component in path.components() {
-        let component = component
-            .as_os_str()
-            .to_str()
-            .ok_or("input path is not valid UTF-8")?;
-        if !logical.is_empty() {
-            logical.push('/');
-        }
-        logical.push_str(component);
-    }
-    Ok(logical)
-}
-
-fn read_signing_key(path: &Path) -> Result<SigningKey, Box<dyn Error>> {
-    let bytes = fs::read(path)?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| "signing key must contain exactly 32 raw bytes")?;
-    Ok(SigningKey::from_bytes(&bytes))
 }
 
 fn read_verifying_key(path: &Path) -> Result<VerifyingKey, Box<dyn Error>> {
