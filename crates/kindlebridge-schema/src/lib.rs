@@ -10,6 +10,7 @@ use thiserror::Error;
 
 pub mod device_protocol;
 pub mod device_rpc;
+pub mod host_rpc;
 pub mod shell_protocol;
 
 pub const JSONRPC_VERSION: &str = "2.0";
@@ -303,6 +304,26 @@ pub struct ServerVersion {
     pub name: String,
     pub version: String,
     pub api_version: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmptyParams {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PingResult {
+    pub ok: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerStatus {
+    pub running: bool,
+    pub pid: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerStopResult {
+    pub stopping: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
