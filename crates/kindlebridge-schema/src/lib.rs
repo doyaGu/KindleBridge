@@ -12,6 +12,9 @@ pub mod device_protocol;
 pub mod device_rpc;
 pub mod host_rpc;
 pub mod shell_protocol;
+pub mod sync_path;
+
+pub use sync_path::{LogicalSyncPath, LogicalSyncPathError};
 
 pub const JSONRPC_VERSION: &str = "2.0";
 pub const API_VERSION: &str = "v1";
