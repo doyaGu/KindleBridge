@@ -4,6 +4,10 @@ KindleBridge provides a persistent development link between a host and a Kindle.
 
 ## Language
 
+**Device RPC**:
+A bounded typed request and reply carried over one `rpc.v1` KBP stream. It performs one device operation and owns no work after its reply stream closes.
+_Avoid_: Generic device command, streaming operation
+
 **Sync Stream**:
 A single `sync.v1` KBP stream that owns exactly one push or pull from its opening metadata through its terminal reply and close or reset.
 _Avoid_: Sync connection, sync session
@@ -26,6 +30,10 @@ _Avoid_: Shell connection, resumable shell session
 
 ## Example dialogue
 
+> Developer: Is a file push a Device RPC?
+>
+> Domain expert: No. Opening and transferring the file is a Sync Stream. Bounded operations such as sync status, directory list, and directory creation are Device RPCs.
+>
 > Developer: Does reconnecting USB resume the same Sync Stream?
 >
 > Domain expert: No. The interrupted Sync Stream ends; the Host Sync Client opens a new Sync Stream that resumes the same transfer from its persisted offset.
