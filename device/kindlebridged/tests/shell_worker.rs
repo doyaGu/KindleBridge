@@ -255,6 +255,38 @@ fn raw_shell_reports_signal_exit() {
 }
 
 #[cfg(unix)]
+#[test]
+fn hangup_force_kills_and_joins_a_process_that_ignores_sighup() {
+    let mut worker = ShellWorker::spawn(ShellOpen {
+        mode: ShellMode::Raw,
+        argv: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "trap '' HUP; printf READY; while :; do sleep 1; done".to_owned(),
+        ],
+        terminal_size: None,
+        cwd: std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        term: "linux".to_owned(),
+    })
+    .unwrap();
+    let ready = recv_stdout_until(&mut worker, b"READY", Duration::from_secs(5));
+    assert!(ready.ends_with(b"READY"));
+
+    worker.hangup().unwrap();
+    loop {
+        if let ShellEvent::Exit(status) = worker.recv_timeout(Duration::from_secs(5)).unwrap() {
+            assert_eq!(status.exit_code, -1);
+            assert_eq!(status.signal, 9);
+            break;
+        }
+    }
+    worker.join().unwrap();
+}
+
+#[cfg(unix)]
 fn recv_stdout_until(worker: &mut ShellWorker, marker: &[u8], timeout: Duration) -> Vec<u8> {
     let deadline = std::time::Instant::now() + timeout;
     let mut output = Vec::new();

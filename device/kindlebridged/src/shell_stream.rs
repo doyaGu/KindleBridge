@@ -9,7 +9,9 @@ use kindlebridge_schema::device_protocol::{ShellOpen, SHELL_STREAM_WINDOW};
 use kindlebridge_schema::shell_protocol::{
     PacketSource, ShellPacket, ShellPacketError, ShellStreamState,
 };
-use kindlebridge_transport::actor::{ConnectionError, IncomingStream as ActorIncomingStream};
+use kindlebridge_transport::actor::{
+    ConnectionError, IncomingStream as ActorIncomingStream, Stream as ActorStream,
+};
 use kindlebridge_transport::TrafficClass;
 use kindlebridge_wire::{Command, FLAG_END_STREAM};
 use thiserror::Error;
@@ -94,8 +96,7 @@ fn serve_stream(incoming: ActorIncomingStream) -> Result<(), ShellStreamError> {
             let frame = match input_stream.recv() {
                 Ok(frame) => frame,
                 Err(_) => {
-                    input_stopped.store(true, Ordering::Release);
-                    let _ = input.hangup();
+                    stop_input(&input_stopped, &input);
                     break;
                 }
             };
@@ -125,12 +126,12 @@ fn serve_stream(incoming: ActorIncomingStream) -> Result<(), ShellStreamError> {
                     if result.is_err() {
                         input_stopped.store(true, Ordering::Release);
                         let _ = input_stream.reset("shell process input stopped");
+                        let _ = input.hangup();
                         break;
                     }
                 }
                 Command::Reset | Command::Close => {
-                    input_stopped.store(true, Ordering::Release);
-                    let _ = input.hangup();
+                    stop_input(&input_stopped, &input);
                     break;
                 }
                 _ => {
@@ -143,43 +144,81 @@ fn serve_stream(incoming: ActorIncomingStream) -> Result<(), ShellStreamError> {
         }
     });
 
+    let mut terminal_error = None;
     loop {
         match worker.recv_timeout(Duration::from_secs(1)) {
             Ok(ShellEvent::Stdout(bytes)) => {
                 if stream_stopped.load(Ordering::Acquire) {
-                    break;
+                    continue;
                 }
-                stream.send_data(ShellPacket::Stdout(bytes).encode()?, false)?;
+                if let Err(error) = send_packet(&stream, ShellPacket::Stdout(bytes), false) {
+                    terminal_error = Some(error);
+                    stop_output(&stream_stopped, &worker, &stream);
+                }
             }
             Ok(ShellEvent::Stderr(bytes)) => {
                 if stream_stopped.load(Ordering::Acquire) {
-                    break;
+                    continue;
                 }
-                stream.send_data(ShellPacket::Stderr(bytes).encode()?, false)?;
+                if let Err(error) = send_packet(&stream, ShellPacket::Stderr(bytes), false) {
+                    terminal_error = Some(error);
+                    stop_output(&stream_stopped, &worker, &stream);
+                }
             }
             Ok(ShellEvent::Exit(status)) => {
-                if stream_stopped.load(Ordering::Acquire) {
-                    break;
+                if !stream_stopped.load(Ordering::Acquire) {
+                    let result = send_packet(&stream, ShellPacket::Exit(status), true);
+                    let _ = stream.cancel_receive();
+                    let result =
+                        result.and_then(|()| stream.close().map_err(ShellStreamError::from));
+                    if let Err(error) = result {
+                        terminal_error = Some(error);
+                        stop_output(&stream_stopped, &worker, &stream);
+                    }
                 }
-                let result = stream.send_data(ShellPacket::Exit(status).encode()?, true);
-                let _ = stream.cancel_receive();
-                result?;
-                stream.close()?;
                 break;
             }
             Err(ShellWorkerError::ReceiveTimeout) => {}
             Err(error) => {
-                if stream_stopped.load(Ordering::Acquire) {
-                    break;
+                if !stream_stopped.load(Ordering::Acquire) {
+                    let _ = stream.cancel_receive();
+                    if let Err(reset_error) = stream.reset(error.to_string()) {
+                        terminal_error = Some(reset_error.into());
+                    }
                 }
-                let _ = stream.cancel_receive();
-                stream.reset(error.to_string())?;
                 break;
             }
         }
     }
-    let _ = input_thread.join();
+    let input_result = input_thread
+        .join()
+        .map_err(|_| ShellStreamError::InputPanicked);
+    let worker_result = worker.join().map_err(ShellStreamError::from);
+    input_result?;
+    worker_result?;
+    terminal_error.map_or(Ok(()), Err)
+}
+
+fn send_packet(
+    stream: &ActorStream,
+    packet: ShellPacket,
+    end_stream: bool,
+) -> Result<(), ShellStreamError> {
+    stream.send_data(packet.encode()?, end_stream)?;
     Ok(())
+}
+
+fn stop_input(stopped: &AtomicBool, input: &crate::shell::ShellInput) {
+    if !stopped.swap(true, Ordering::AcqRel) {
+        let _ = input.hangup();
+    }
+}
+
+fn stop_output(stopped: &AtomicBool, worker: &ShellWorker, stream: &ActorStream) {
+    if !stopped.swap(true, Ordering::AcqRel) {
+        let _ = worker.hangup();
+    }
+    let _ = stream.cancel_receive();
 }
 
 #[derive(Debug, Error)]
@@ -195,6 +234,8 @@ pub enum ShellStreamError {
         label: &'static str,
         source: serde_json::Error,
     },
+    #[error("shell input worker panicked")]
+    InputPanicked,
     #[error("{0}")]
     UnexpectedFrame(&'static str),
 }
