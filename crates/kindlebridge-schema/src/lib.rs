@@ -29,6 +29,10 @@ pub mod methods {
     pub const SYNC_STATUS: &str = "v1.sync.status";
     pub const SYNC_LIST: &str = "v1.sync.list";
     pub const SYNC_MKDIR: &str = "v1.sync.mkdir";
+    pub const SYNC_PUSH_STREAM: &str = "v1.sync.push_stream";
+    pub const SYNC_PULL_STREAM: &str = "v1.sync.pull_stream";
+    pub const SYNC_CANCEL: &str = "v1.sync.cancel";
+    pub const SYNC_PROGRESS: &str = "v1.sync.progress";
     pub const APP_INSTALL: &str = "v1.app.install";
     pub const APP_START: &str = "v1.app.start";
     pub const APP_STOP: &str = "v1.app.stop";
@@ -66,6 +70,7 @@ pub mod error_codes {
     pub const CHECKSUM_MISMATCH: i64 = -32_011;
     pub const TRANSFER_NOT_FOUND: i64 = -32_012;
     pub const FILE_NOT_FOUND: i64 = -32_013;
+    pub const TRANSFER_CANCELLED: i64 = -32_014;
     pub const APP_NOT_FOUND: i64 = -32_020;
     pub const NO_ROLLBACK_AVAILABLE: i64 = -32_021;
     pub const APP_INSTALL_FAILED: i64 = -32_022;
@@ -576,6 +581,31 @@ pub struct SyncMkdirResult {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum SyncProgressPhase {
+    Hashing,
+    Transferring,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncProgress {
+    pub operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_id: Option<String>,
+    pub direction: TransferDirection,
+    pub remote_path: String,
+    pub phase: SyncProgressPhase,
+    pub transferred: u64,
+    pub total: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncCancelParams {
+    pub operation_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AppState {
     Stopped,
     Running,
@@ -1009,22 +1039,41 @@ impl<R: BufRead, W: Write> RpcClient<R, W> {
     }
 
     pub fn call(&mut self, method: &str, params: Option<Value>) -> Result<Value, ClientError> {
+        self.call_with_notifications(method, params, |_| Err(ClientError::InvalidResponse))
+    }
+
+    pub fn call_with_notifications(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        mut notification: impl FnMut(&RpcRequest) -> Result<(), ClientError>,
+    ) -> Result<Value, ClientError> {
         let id = RequestId::Number(self.next_id);
         self.next_id = self.next_id.checked_add(1).unwrap_or(1);
         let request = RpcRequest::call(id.clone(), method, params);
         write_json_frame(&mut self.writer, &request)?;
 
-        let value = read_json_frame(&mut self.reader, self.max_content_length)?
-            .ok_or(ClientError::ServerClosed)?;
-        let response: RpcResponse =
-            serde_json::from_value(value).map_err(|_| ClientError::InvalidResponse)?;
-        if response.jsonrpc != JSONRPC_VERSION {
-            return Err(ClientError::InvalidResponse);
+        loop {
+            let value = read_json_frame(&mut self.reader, self.max_content_length)?
+                .ok_or(ClientError::ServerClosed)?;
+            if value.get("method").is_some() {
+                let request = parse_request_value(value).map_err(ClientError::Rpc)?;
+                if request.id.is_some() {
+                    return Err(ClientError::InvalidResponse);
+                }
+                notification(&request)?;
+                continue;
+            }
+            let response: RpcResponse =
+                serde_json::from_value(value).map_err(|_| ClientError::InvalidResponse)?;
+            if response.jsonrpc != JSONRPC_VERSION {
+                return Err(ClientError::InvalidResponse);
+            }
+            if response.id != id {
+                return Err(ClientError::MismatchedId);
+            }
+            return response.into_result().map_err(ClientError::Rpc);
         }
-        if response.id != id {
-            return Err(ClientError::MismatchedId);
-        }
-        response.into_result().map_err(ClientError::Rpc)
     }
 
     pub fn into_parts(self) -> (R, W) {
@@ -1089,6 +1138,43 @@ mod tests {
     fn sync_default_preserves_interactive_scheduling_opportunities() {
         assert_eq!(DEFAULT_SYNC_BLOCK_SIZE, 256 * 1024);
         assert_eq!(MAX_SYNC_BLOCK_SIZE, 1024 * 1024);
+    }
+
+    #[test]
+    fn rpc_client_delivers_notifications_before_the_final_result() {
+        let mut input = Vec::new();
+        write_json_frame(
+            &mut input,
+            &RpcRequest::notification(
+                methods::SYNC_PROGRESS,
+                Some(json!({
+                    "operation_id": "operation",
+                    "direction": "push",
+                    "remote_path": "file.bin",
+                    "phase": "transferring",
+                    "transferred": 5,
+                    "total": 10
+                })),
+            ),
+        )
+        .unwrap();
+        write_json_frame(
+            &mut input,
+            &RpcResponse::success(RequestId::Number(1), json!({ "done": true })),
+        )
+        .unwrap();
+        let mut client = RpcClient::new(BufReader::new(Cursor::new(input)), Vec::new());
+        let mut notifications = Vec::new();
+
+        let result = client
+            .call_with_notifications(methods::SYNC_PUSH_STREAM, None, |request| {
+                notifications.push(request.method.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(notifications, [methods::SYNC_PROGRESS]);
+        assert_eq!(result, json!({ "done": true }));
     }
 
     #[test]
