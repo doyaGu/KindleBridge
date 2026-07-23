@@ -4,6 +4,10 @@ KindleBridge provides a persistent development link between a host and a Kindle.
 
 ## Language
 
+**Host RPC**:
+A bounded typed request and reply carried over the current user's local JSON-RPC link. It performs one host control or device-provider operation and owns no Shell Stream or sync job after its reply.
+_Avoid_: Device RPC, host stream
+
 **Device RPC**:
 A bounded typed request and reply carried over one `rpc.v1` KBP stream. It performs one device operation and owns no work after its reply stream closes.
 _Avoid_: Generic device command, streaming operation
@@ -33,6 +37,14 @@ _Avoid_: Shell connection, resumable shell session
 > Developer: Is a file push a Device RPC?
 >
 > Domain expert: No. Opening and transferring the file is a Sync Stream. Bounded operations such as sync status, directory list, and directory creation are Device RPCs.
+>
+> Developer: Is `v1.shell.open` a Host RPC because it uses JSON-RPC?
+>
+> Domain expert: No. Its reply hands ownership to the local Shell Stream lifecycle, so it is a stream-opening request. A Host RPC owns no work after its reply.
+>
+> Developer: Does every Host RPC become a Device RPC?
+>
+> Domain expert: No. Server status and stop are local host controls, while a legacy bounded sync call can drive a Sync Stream. Host RPC describes the local call's ownership, not the device-side protocol it selects.
 >
 > Developer: Does reconnecting USB resume the same Sync Stream?
 >
