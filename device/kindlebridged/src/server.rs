@@ -57,7 +57,7 @@ const DEFAULT_SYNC_ROOT: &str = "/mnt/us/kindlebridge-data";
 const DEFAULT_ACTIVATION_ROOT: &str = "/var/local/kindlebridge/apps";
 const DEFAULT_PROC_ROOT: &str = "/proc";
 const DEFAULT_LOG_PATH: &str = "/var/local/kindlebridge/usb.log";
-const SYNC_PUSH_QUEUE_DEPTH: usize = 3;
+const SYNC_PIPELINE_QUEUE_DEPTH: usize = 3;
 const MAX_CONCURRENT_SHELLS: usize = 4;
 const DEVICE_RUNTIME_FEATURES: &[&str] = &[
     APP_INSTALL_FEATURE,
@@ -103,8 +103,8 @@ where
     A: Clone + Send,
     E: Send,
 {
-    let (work_tx, work_rx) = mpsc::sync_channel::<T>(SYNC_PUSH_QUEUE_DEPTH);
-    let (ack_tx, ack_rx) = mpsc::sync_channel::<Result<A, E>>(SYNC_PUSH_QUEUE_DEPTH);
+    let (work_tx, work_rx) = mpsc::sync_channel::<T>(SYNC_PIPELINE_QUEUE_DEPTH);
+    let (ack_tx, ack_rx) = mpsc::sync_channel::<Result<A, E>>(SYNC_PIPELINE_QUEUE_DEPTH);
 
     thread::scope(|scope| {
         let writer = scope.spawn(move || {
@@ -1008,28 +1008,79 @@ fn actor_sync_pull(
         file_hash: transfer.file_hash().to_owned(),
     };
     stream.send_data(encode(&ready)?, false)?;
-    let mut buffer = vec![0_u8; block_size as usize];
     if transfer.offset() == transfer.total_size() {
         transfer.finish()?;
         stream.send_data(Vec::new(), true)?;
     } else {
-        loop {
-            let count = transfer.read_chunk(&mut buffer)?;
-            if count == 0 {
-                stream.reset("sync source ended before declared size")?;
-                return Ok(());
-            }
-            let is_last = transfer.offset() == transfer.total_size();
-            if is_last {
-                transfer.finish()?;
-            } else {
-                transfer.checkpoint_if_due()?;
-            }
-            stream.send_data(buffer[..count].to_vec(), is_last)?;
-            if is_last {
-                break;
-            }
+        struct PullChunk {
+            payload: Vec<u8>,
+            is_last: bool,
         }
+
+        let (send_result, reader_result) = thread::scope(|scope| {
+            let (chunk_tx, chunk_rx) =
+                mpsc::sync_channel::<Result<PullChunk, ServerError>>(SYNC_PIPELINE_QUEUE_DEPTH);
+            let reader = scope.spawn(move || {
+                let result = (|| -> Result<(), ServerError> {
+                    let mut buffer = vec![0_u8; block_size as usize];
+                    loop {
+                        let count = transfer.read_chunk(&mut buffer)?;
+                        if count == 0 {
+                            return Err(ServerError::UnexpectedFrame(
+                                "sync source ended before declared size",
+                            ));
+                        }
+                        let is_last = transfer.offset() == transfer.total_size();
+                        if is_last {
+                            transfer.finish()?;
+                        } else {
+                            transfer.checkpoint_if_due()?;
+                        }
+                        let chunk = PullChunk {
+                            payload: buffer[..count].to_vec(),
+                            is_last,
+                        };
+                        if chunk_tx.send(Ok(chunk)).is_err() {
+                            return Ok(());
+                        }
+                        if is_last {
+                            return Ok(());
+                        }
+                    }
+                })();
+                if let Err(error) = result {
+                    let _ = chunk_tx.send(Err(error));
+                }
+            });
+
+            let send_result = loop {
+                match chunk_rx.recv() {
+                    Ok(Ok(chunk)) => {
+                        if let Err(error) = stream.send_data(chunk.payload, chunk.is_last) {
+                            break Err(ServerError::Connection(error));
+                        }
+                        if chunk.is_last {
+                            break Ok(());
+                        }
+                    }
+                    Ok(Err(error)) => break Err(error),
+                    Err(_) => {
+                        break Err(ServerError::UnexpectedFrame(
+                            "sync storage reader stopped before the transfer completed",
+                        ));
+                    }
+                }
+            };
+            // If USB sending failed, wake a reader blocked on the bounded queue
+            // before joining it. This keeps disconnect cleanup deterministic.
+            drop(chunk_rx);
+            let reader_result = reader
+                .join()
+                .map_err(|_| ServerError::UnexpectedFrame("sync storage reader panicked"));
+            (send_result, reader_result)
+        });
+        send_result?;
+        reader_result?;
     }
     stream.close()?;
     Ok(())
@@ -2526,7 +2577,7 @@ mod tests {
             "the next USB read did not run while storage was blocked"
         );
         assert!(
-            maximum.load(Ordering::SeqCst) <= SYNC_PUSH_QUEUE_DEPTH + 2,
+            maximum.load(Ordering::SeqCst) <= SYNC_PIPELINE_QUEUE_DEPTH + 2,
             "payload ownership exceeded the queue, active writer, and producer slots"
         );
         assert_eq!(live.load(Ordering::SeqCst), 0);
