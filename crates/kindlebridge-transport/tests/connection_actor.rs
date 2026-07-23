@@ -69,6 +69,66 @@ impl FrameSink for FailOnceSink {
 }
 
 #[test]
+fn ping_waits_for_the_matching_control_pong() {
+    let (device_tx, device_rx) = mpsc::channel();
+    let (host_tx, host_rx) = mpsc::channel();
+    let (connection, _incoming) = Connection::start(
+        online_host_state(),
+        ChannelSource(device_rx),
+        ChannelSink(host_tx),
+    );
+
+    let ping = {
+        let connection = connection.clone();
+        thread::spawn(move || connection.ping())
+    };
+    let request = host_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(request.header.command, Command::Ping);
+    assert_eq!(request.header.stream_id, 0);
+    assert_eq!(request.payload.len(), 16);
+
+    device_tx
+        .send(
+            Frame::new(
+                Header::new(Command::Pong, 0, 1),
+                b"not-the-request-token".to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(!ping.is_finished());
+    device_tx
+        .send(Frame::new(Header::new(Command::Pong, 0, 2), request.payload).unwrap())
+        .unwrap();
+    ping.join().unwrap().unwrap();
+}
+
+#[test]
+fn missing_pong_times_out_without_disconnecting_other_work() {
+    let (_device_tx, device_rx) = mpsc::channel();
+    let (host_tx, host_rx) = mpsc::channel();
+    let (connection, _incoming) = Connection::start(
+        online_host_state(),
+        ChannelSource(device_rx),
+        ChannelSink(host_tx),
+    );
+
+    assert_eq!(
+        connection.ping_timeout(Duration::from_millis(20)),
+        Err(kindlebridge_transport::actor::ConnectionError::PingTimedOut)
+    );
+    assert_eq!(
+        host_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .header
+            .command,
+        Command::Ping
+    );
+    assert!(connection.is_online());
+}
+
+#[test]
 fn received_credit_is_returned_only_after_the_worker_consumes_data() {
     let (device_tx, device_rx) = mpsc::channel();
     let (host_tx, host_rx) = mpsc::channel();

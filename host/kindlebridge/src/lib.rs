@@ -281,6 +281,11 @@ pub struct DeviceArgs {
 pub enum DeviceCommand {
     /// List known devices.
     List,
+    /// Round-trip one KBP control frame through a device.
+    Ping {
+        /// Stable device serial from `device list`.
+        serial: String,
+    },
     /// Print negotiated features for one device.
     Features {
         /// Stable device serial from `device list`.
@@ -431,6 +436,16 @@ pub fn execute<C: RpcCaller>(
                             .collect::<Vec<_>>()
                             .join("\n"),
                     )
+                }
+            }
+            DeviceCommand::Ping { serial } => {
+                let result =
+                    caller.call(methods::DEVICE_PING, Some(json!({ "serial": serial })))?;
+                require_ping(&result)?;
+                if json_output {
+                    pretty_json(&result)
+                } else {
+                    Ok("pong".to_owned())
                 }
             }
             DeviceCommand::Features { serial } => {
@@ -1095,6 +1110,28 @@ mod tests {
             )]
         );
         assert!(output.contains("exec.v1"));
+    }
+
+    #[test]
+    fn device_ping_uses_the_device_control_method() {
+        let mut caller = RecordingCaller {
+            calls: Vec::new(),
+            replies: VecDeque::from([json!({ "ok": true })]),
+        };
+        let command = TopLevelCommand::Device(DeviceArgs {
+            command: DeviceCommand::Ping {
+                serial: "KT6-TEST".to_owned(),
+            },
+        });
+
+        assert_eq!(execute(&mut caller, &command, false).unwrap(), "pong");
+        assert_eq!(
+            caller.calls,
+            vec![(
+                methods::DEVICE_PING.to_owned(),
+                Some(json!({ "serial": "KT6-TEST" }))
+            )]
+        );
     }
 
     #[test]

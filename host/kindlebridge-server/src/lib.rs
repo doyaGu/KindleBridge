@@ -81,6 +81,7 @@ impl ShellStream for DeviceShell {
 pub trait DeviceProvider: Send + Sync {
     fn list(&self) -> Result<Vec<DeviceSummary>, ProviderError>;
     fn features(&self, serial: &str) -> Result<Option<DeviceFeatures>, ProviderError>;
+    fn ping(&self, serial: &str) -> Result<bool, RpcError>;
     fn exec(&self, params: &ExecParams) -> Result<Option<ExecResult>, RpcError>;
     fn sync_push(&self, params: SyncPushParams) -> Result<SyncPushResult, RpcError>;
     fn sync_pull(&self, params: SyncPullParams) -> Result<SyncPullResult, RpcError>;
@@ -158,6 +159,13 @@ impl DeviceProvider for MemoryDeviceProvider {
             .iter()
             .find(|record| record.summary.serial == serial)
             .map(DeviceRecord::features))
+    }
+
+    fn ping(&self, serial: &str) -> Result<bool, RpcError> {
+        Ok(self
+            .devices
+            .iter()
+            .any(|device| device.summary.serial == serial))
     }
 
     fn exec(&self, params: &ExecParams) -> Result<Option<ExecResult>, RpcError> {
@@ -352,6 +360,16 @@ fn dispatch<P: DeviceProvider + ?Sized>(
                 .map_err(provider_rpc_error)?
                 .ok_or_else(|| RpcError::device_not_found(&params.serial))?;
             serde_json::to_value(features).map_err(|_| RpcError::internal_error())
+        }
+        methods::DEVICE_PING => {
+            let params = parse_params::<SerialParams>(request, "device ping params")?;
+            if params.serial.is_empty() {
+                return Err(RpcError::invalid_params("serial must not be empty"));
+            }
+            if !provider.ping(&params.serial)? {
+                return Err(RpcError::device_not_found(&params.serial));
+            }
+            Ok(json!({ "ok": true }))
         }
         methods::EXEC_RUN => {
             let value = request
@@ -909,6 +927,7 @@ mod tests {
     impl DeviceProvider for ShellProvider {
         unused_provider_method!(list() -> Result<Vec<DeviceSummary>, ProviderError>);
         unused_provider_method!(features(serial: &str) -> Result<Option<DeviceFeatures>, ProviderError>);
+        unused_provider_method!(ping(serial: &str) -> Result<bool, RpcError>);
         unused_provider_method!(exec(params: &ExecParams) -> Result<Option<ExecResult>, RpcError>);
         unused_provider_method!(sync_push(params: SyncPushParams) -> Result<SyncPushResult, RpcError>);
         unused_provider_method!(sync_pull(params: SyncPullParams) -> Result<SyncPullResult, RpcError>);
@@ -1000,6 +1019,26 @@ mod tests {
             None,
         ));
         assert_eq!(response.into_result().unwrap(), json!({ "ok": true }));
+    }
+
+    #[test]
+    fn device_ping_requires_a_known_device() {
+        let response = one_call(&RpcRequest::call(
+            RequestId::Number(2),
+            methods::DEVICE_PING,
+            Some(json!({ "serial": "KT6-TEST" })),
+        ));
+        assert_eq!(response.into_result().unwrap(), json!({ "ok": true }));
+
+        let missing = one_call(&RpcRequest::call(
+            RequestId::Number(3),
+            methods::DEVICE_PING,
+            Some(json!({ "serial": "missing" })),
+        ));
+        assert_eq!(
+            missing.error.expect("missing device must fail").code,
+            error_codes::DEVICE_NOT_FOUND
+        );
     }
 
     #[test]

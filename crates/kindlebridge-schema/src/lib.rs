@@ -22,6 +22,7 @@ pub mod methods {
     pub const SERVER_STOP: &str = "v1.server.stop";
     pub const DEVICE_LIST: &str = "v1.device.list";
     pub const DEVICE_FEATURES: &str = "v1.device.features";
+    pub const DEVICE_PING: &str = "v1.device.ping";
     pub const EXEC_RUN: &str = "v1.exec.run";
     pub const SYNC_PUSH: &str = "v1.sync.push";
     pub const SYNC_PULL: &str = "v1.sync.pull";

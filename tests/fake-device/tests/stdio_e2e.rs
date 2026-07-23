@@ -40,6 +40,11 @@ fn all_v1_discovery_methods_work_over_stdio_and_cli_rpc() {
     assert_eq!(devices.devices.len(), 1);
     assert_eq!(devices.devices[0].serial, SERIAL);
 
+    let device_ping = client
+        .call(methods::DEVICE_PING, Some(json!({ "serial": SERIAL })))
+        .unwrap();
+    assert_eq!(device_ping, json!({ "ok": true }));
+
     let features: DeviceFeatures = serde_json::from_value(
         client
             .call(methods::DEVICE_FEATURES, Some(json!({ "serial": SERIAL })))
@@ -95,6 +100,18 @@ fn all_v1_discovery_methods_work_over_stdio_and_cli_rpc() {
     .unwrap();
     let output: Value = serde_json::from_str(&output).unwrap();
     assert_eq!(output["serial"], SERIAL);
+
+    let output = execute(
+        &mut client,
+        &TopLevelCommand::Device(DeviceArgs {
+            command: DeviceCommand::Ping {
+                serial: SERIAL.to_owned(),
+            },
+        }),
+        false,
+    )
+    .unwrap();
+    assert_eq!(output, "pong");
 
     let output = execute(
         &mut client,

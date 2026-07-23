@@ -89,6 +89,7 @@ Host commands then discover USB automatically:
 ```powershell
 cargo build --package kindlebridge --package kindlebridge-server
 cargo run --package kindlebridge -- --server target/debug/kindlebridge-server.exe device list
+cargo run --package kindlebridge -- --server target/debug/kindlebridge-server.exe device ping YOUR_KINDLE_SERIAL
 cargo run --package kindlebridge -- --server target/debug/kindlebridge-server.exe exec YOUR_KINDLE_SERIAL -- uname -a
 cargo run --package kindlebridge -- --server target/debug/kindlebridge-server.exe shell YOUR_KINDLE_SERIAL
 cargo run --package kindlebridge -- --server target/debug/kindlebridge-server.exe shell YOUR_KINDLE_SERIAL -c "uname -a"
@@ -99,7 +100,9 @@ processes share its USB connection. On Windows it listens on a named pipe; on
 Linux it uses a `0600` Unix socket. It exits after ten idle minutes. Inspect or
 stop it explicitly with `kindlebridge server status` and
 `kindlebridge server stop`; `kindlebridge-server --stdio` remains available for
-tests and IDE integrations.
+tests and IDE integrations. `device ping SERIAL` performs a bounded KBP
+`PING`/`PONG` round trip through the selected Kindle; unlike `server ping`, it
+tests the real device transport.
 
 `shell` opens a persistent root terminal in `/tmp/root` with `TERM=linux`.
 Interactive stdin selects a PTY automatically; redirected stdin selects the raw

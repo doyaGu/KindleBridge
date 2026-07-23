@@ -243,6 +243,10 @@ impl DeviceProvider for ReconnectingUsbProvider {
         self.connected()?.features(serial)
     }
 
+    fn ping(&self, serial: &str) -> Result<bool, RpcError> {
+        self.rpc(|provider| provider.ping(serial))
+    }
+
     fn exec(&self, params: &ExecParams) -> Result<Option<ExecResult>, RpcError> {
         self.rpc(|provider| provider.exec(params))
     }
@@ -318,6 +322,14 @@ impl DeviceProvider for ConnectedDeviceProvider {
 
     fn features(&self, serial: &str) -> Result<Option<DeviceFeatures>, ProviderError> {
         Ok(self.find(serial).map(|device| device.features.clone()))
+    }
+
+    fn ping(&self, serial: &str) -> Result<bool, RpcError> {
+        let Some(device) = self.find(serial) else {
+            return Ok(false);
+        };
+        device.session.ping().map_err(link_rpc_error)?;
+        Ok(true)
     }
 
     fn exec(&self, params: &ExecParams) -> Result<Option<ExecResult>, RpcError> {
@@ -577,6 +589,10 @@ struct ActorDeviceSession {
 }
 
 impl ActorDeviceSession {
+    fn ping(&self) -> Result<(), LinkError> {
+        self.connection.ping().map_err(LinkError::Connection)
+    }
+
     fn connect(address: SocketAddr) -> Result<(Self, DeviceHello), LinkError> {
         let (limits, transport) = session_transport_config();
         let mut sink = TcpFrameStream::connect(address, transport)?;

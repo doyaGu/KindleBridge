@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kindlebridge_schema::device_protocol::{ServiceAccept, ServiceOpen};
 use kindlebridge_wire::{
@@ -18,8 +18,10 @@ use crate::{FrameScheduler, ScheduledFrame, TrafficClass};
 const COMMAND_QUEUE_DEPTH: usize = 64;
 const INBOUND_QUEUE_DEPTH: usize = 64;
 const INCOMING_STREAM_DEPTH: usize = 16;
+const MAX_PENDING_PINGS: usize = 64;
 const MAX_SCHEDULED_BYTES: usize = 16 * 1024 * 1024;
 const IDLE_POLL: Duration = Duration::from_millis(1);
+const DEFAULT_PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub trait FrameSource: Send + 'static {
     fn read_frame(&mut self) -> Result<Frame, String>;
@@ -51,6 +53,8 @@ pub enum ConnectionError {
     SendPending(u32),
     #[error("bounded KBP writer queue is full")]
     QueueFull,
+    #[error("KBP control ping timed out")]
+    PingTimedOut,
     #[error("invalid service response: {0}")]
     InvalidService(String),
 }
@@ -179,6 +183,24 @@ impl Connection {
             id: stream_id,
             connection: self.clone(),
             generation,
+        })
+    }
+
+    /// Round-trip one KBP control frame through the peer.
+    pub fn ping(&self) -> Result<(), ConnectionError> {
+        self.ping_timeout(DEFAULT_PING_TIMEOUT)
+    }
+
+    /// Round-trip one KBP control frame with a caller-selected deadline.
+    pub fn ping_timeout(&self, timeout: Duration) -> Result<(), ConnectionError> {
+        if timeout.is_zero() {
+            return Err(ConnectionError::PingTimedOut);
+        }
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        self.request(|response| ActorCommand::Ping {
+            generation,
+            timeout,
+            response,
         })
     }
 
@@ -315,6 +337,11 @@ enum InboundEvent {
 
 #[derive(Debug)]
 enum ActorCommand {
+    Ping {
+        generation: u64,
+        timeout: Duration,
+        response: SyncSender<Result<(), ConnectionError>>,
+    },
     Open {
         generation: u64,
         service: String,
@@ -369,7 +396,8 @@ enum ActorCommand {
 impl ActorCommand {
     const fn generation(&self) -> Option<u64> {
         match self {
-            Self::Open { generation, .. }
+            Self::Ping { generation, .. }
+            | Self::Open { generation, .. }
             | Self::Accept { generation, .. }
             | Self::Reject { generation, .. }
             | Self::SendData { generation, .. }
@@ -383,6 +411,9 @@ impl ActorCommand {
 
     fn respond_error(self, error: ConnectionError) {
         match self {
+            Self::Ping { response, .. } => {
+                let _ = response.send(Err(error));
+            }
             Self::Open { response, .. } => {
                 let _ = response.send(Err(error));
             }
@@ -405,6 +436,11 @@ impl ActorCommand {
 struct PendingSend {
     payload: Vec<u8>,
     end_stream: bool,
+    response: SyncSender<Result<(), ConnectionError>>,
+}
+
+struct PendingPing {
+    deadline: Instant,
     response: SyncSender<Result<(), ConnectionError>>,
 }
 
@@ -440,6 +476,8 @@ struct Actor<W> {
     streams: HashMap<u32, StreamEntry>,
     sequences: HashMap<u32, u32>,
     write_waiters: HashMap<(u32, u32), SyncSender<Result<(), ConnectionError>>>,
+    pending_pings: HashMap<Vec<u8>, PendingPing>,
+    next_ping_id: u64,
     control_sequence: u32,
     scheduler: FrameScheduler,
     restart: Option<Box<RestartHandler>>,
@@ -463,6 +501,8 @@ impl<W: FrameSink> Actor<W> {
             streams: HashMap::new(),
             sequences: HashMap::new(),
             write_waiters: HashMap::new(),
+            pending_pings: HashMap::new(),
+            next_ping_id: 0,
             control_sequence: 1,
             scheduler: FrameScheduler::new(MAX_SCHEDULED_BYTES),
             restart,
@@ -488,6 +528,7 @@ impl<W: FrameSink> Actor<W> {
 
     fn run(mut self, commands: Receiver<ActorCommand>, inbound: Receiver<InboundEvent>) {
         loop {
+            self.expire_pings();
             let mut progressed = false;
             match commands.try_recv() {
                 Ok(ActorCommand::Shutdown) | Err(TryRecvError::Disconnected) => break,
@@ -569,6 +610,43 @@ impl<W: FrameSink> Actor<W> {
 
     fn handle_command(&mut self, command: ActorCommand) -> Result<(), ConnectionError> {
         match command {
+            ActorCommand::Ping {
+                generation,
+                timeout,
+                response,
+            } => {
+                if self.pending_pings.len() >= MAX_PENDING_PINGS {
+                    let _ = response.send(Err(ConnectionError::QueueFull));
+                    return Ok(());
+                }
+                let ping_id = self.next_ping_id;
+                self.next_ping_id = self
+                    .next_ping_id
+                    .checked_add(1)
+                    .ok_or_else(|| ConnectionError::Protocol("ping id exhausted".to_owned()))?;
+                let mut payload = Vec::with_capacity(16);
+                payload.extend_from_slice(&generation.to_le_bytes());
+                payload.extend_from_slice(&ping_id.to_le_bytes());
+                let Some(deadline) = Instant::now().checked_add(timeout) else {
+                    let error = ConnectionError::Protocol("ping timeout is too large".to_owned());
+                    let _ = response.send(Err(error));
+                    return Ok(());
+                };
+                if let Err(error) = self.queue_frame(
+                    Command::Ping,
+                    0,
+                    payload.clone(),
+                    false,
+                    TrafficClass::Control,
+                    FrameContext::default(),
+                ) {
+                    let _ = response.send(Err(error.clone()));
+                    return Err(error);
+                }
+                self.pending_pings
+                    .insert(payload, PendingPing { deadline, response });
+                Ok(())
+            }
             ActorCommand::Open {
                 generation: _,
                 service,
@@ -787,7 +865,12 @@ impl<W: FrameSink> Actor<W> {
                 TrafficClass::Control,
                 FrameContext::default(),
             ),
-            Command::Pong => Ok(()),
+            Command::Pong => {
+                if let Some(pending) = self.pending_pings.remove(&frame.payload) {
+                    let _ = pending.response.send(Ok(()));
+                }
+                Ok(())
+            }
             Command::GoAway | Command::Error => Err(ConnectionError::Disconnected),
             _ => Err(ConnectionError::Protocol(format!(
                 "unexpected {:?} after handshake",
@@ -1149,6 +1232,18 @@ impl<W: FrameSink> Actor<W> {
         }
     }
 
+    fn expire_pings(&mut self) {
+        let now = Instant::now();
+        self.pending_pings.retain(|_, pending| {
+            if pending.deadline <= now {
+                let _ = pending.response.send(Err(ConnectionError::PingTimedOut));
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     fn fail_all(&mut self, error: ConnectionError) {
         if let Some(connection) = self.own_connection.upgrade() {
             if let Ok(mut terminal_error) = connection.terminal_error.lock() {
@@ -1170,6 +1265,9 @@ impl<W: FrameSink> Actor<W> {
         }
         for (_, response) in self.write_waiters.drain() {
             let _ = response.send(Err(error.clone()));
+        }
+        for (_, pending) in self.pending_pings.drain() {
+            let _ = pending.response.send(Err(error.clone()));
         }
         let _ = self.incoming.try_send(Err(error));
     }
@@ -1228,7 +1326,11 @@ impl<W: FrameSink> Actor<W> {
         for (_, response) in self.write_waiters.drain() {
             let _ = response.send(Err(error.clone()));
         }
+        for (_, pending) in self.pending_pings.drain() {
+            let _ = pending.response.send(Err(error.clone()));
+        }
         self.control_sequence = 1;
+        self.next_ping_id = 0;
         self.scheduler = FrameScheduler::new(MAX_SCHEDULED_BYTES);
     }
 }
