@@ -14,12 +14,11 @@ use kindlebridge_schema::device_protocol::SYNC_CREDIT_BATCH_SIZE;
 use kindlebridge_schema::device_protocol::{
     is_valid_session_id, is_valid_transfer_id, DeviceAppInstallParams, DeviceCall, DeviceHello,
     DeviceReply, HostHello, ShellOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE,
-    APP_LIST_FEATURE, APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE, APP_START_FEATURE,
-    APP_STOP_FEATURE, APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW,
-    LOG_TAIL_FEATURE, MAX_HOST_TO_DEVICE_PAYLOAD, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE,
-    PROTOCOL_VERSION, RPC_SERVICE, SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE,
-    SYNC_FEATURE, SYNC_SERVICE, SYNC_TREE_FEATURE,
+    DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, MAX_HOST_TO_DEVICE_PAYLOAD, PROTOCOL_VERSION,
+    RPC_SERVICE, SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE,
+    SYNC_SERVICE,
 };
+use kindlebridge_schema::device_rpc::{self as rpc_method, RpcMethod};
 use kindlebridge_schema::shell_protocol::{PacketSource, ShellPacket, ShellStreamState};
 use kindlebridge_schema::{
     error_codes, AppInstallParams, AppList, AppSummary, AppTargetParams, DeviceFeatures,
@@ -200,13 +199,8 @@ impl ConnectedDeviceProvider {
         let Some(device) = self.find(&params.serial) else {
             return Ok(None);
         };
-        let value = device
-            .session
-            .call(kindlebridge_schema::methods::EXEC_RUN, params)
-            .map_err(link_rpc_error)?;
-        serde_json::from_value(value)
+        self.typed_call::<rpc_method::ExecRun>(device, params)
             .map(Some)
-            .map_err(|_| RpcError::internal_error())
     }
 
     fn sync_push(&self, params: SyncPushParams) -> Result<SyncPushResult, RpcError> {
@@ -264,30 +258,15 @@ impl ConnectedDeviceProvider {
     }
 
     fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError> {
-        let device = self.require_feature(&params.serial, SYNC_FEATURE)?;
-        let value = device
-            .session
-            .call(kindlebridge_schema::methods::SYNC_STATUS, params)
-            .map_err(link_rpc_error)?;
-        serde_json::from_value(value).map_err(|_| RpcError::internal_error())
+        self.remote_call::<rpc_method::SyncStatus>(&params.serial, params)
     }
 
     fn sync_list(&self, params: &SyncListParams) -> Result<SyncListResult, RpcError> {
-        let device = self.require_feature(&params.serial, SYNC_TREE_FEATURE)?;
-        let value = device
-            .session
-            .call(kindlebridge_schema::methods::SYNC_LIST, params)
-            .map_err(link_rpc_error)?;
-        serde_json::from_value(value).map_err(|_| RpcError::internal_error())
+        self.remote_call::<rpc_method::SyncList>(&params.serial, params)
     }
 
     fn sync_mkdir(&self, params: &SyncMkdirParams) -> Result<SyncMkdirResult, RpcError> {
-        let device = self.require_feature(&params.serial, SYNC_TREE_FEATURE)?;
-        let value = device
-            .session
-            .call(kindlebridge_schema::methods::SYNC_MKDIR, params)
-            .map_err(link_rpc_error)?;
-        serde_json::from_value(value).map_err(|_| RpcError::internal_error())
+        self.remote_call::<rpc_method::SyncMkdir>(&params.serial, params)
     }
 
     fn app_install(&self, params: AppInstallParams) -> Result<AppSummary, RpcError> {
@@ -349,104 +328,50 @@ impl ConnectedDeviceProvider {
             remote_path,
             file_hash,
         };
-        let value = device
-            .session
-            .call(kindlebridge_schema::methods::APP_INSTALL, &device_params)
-            .map_err(link_rpc_error)?;
-        serde_json::from_value(value).map_err(|_| RpcError::internal_error())
+        self.typed_call::<rpc_method::AppInstall>(device, &device_params)
     }
 
     fn app_start(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        self.remote_call(
-            &params.serial,
-            APP_START_FEATURE,
-            kindlebridge_schema::methods::APP_START,
-            params,
-        )
+        self.remote_call::<rpc_method::AppStart>(&params.serial, params)
     }
 
     fn app_log(
         &self,
         params: &kindlebridge_schema::AppLogParams,
     ) -> Result<kindlebridge_schema::AppLogSnapshot, RpcError> {
-        self.remote_call(
-            &params.serial,
-            kindlebridge_schema::device_protocol::APP_LOG_FEATURE,
-            kindlebridge_schema::methods::APP_LOG,
-            params,
-        )
+        self.remote_call::<rpc_method::AppLog>(&params.serial, params)
     }
 
     fn app_stop(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        self.remote_call(
-            &params.serial,
-            APP_STOP_FEATURE,
-            kindlebridge_schema::methods::APP_STOP,
-            params,
-        )
+        self.remote_call::<rpc_method::AppStop>(&params.serial, params)
     }
 
     fn app_restart(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        self.remote_call(
-            &params.serial,
-            APP_RESTART_FEATURE,
-            kindlebridge_schema::methods::APP_RESTART,
-            params,
-        )
+        self.remote_call::<rpc_method::AppRestart>(&params.serial, params)
     }
 
     fn app_rollback(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        self.remote_call(
-            &params.serial,
-            APP_ROLLBACK_FEATURE,
-            kindlebridge_schema::methods::APP_ROLLBACK,
-            params,
-        )
+        self.remote_call::<rpc_method::AppRollback>(&params.serial, params)
     }
 
     fn app_uninstall(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        self.remote_call(
-            &params.serial,
-            APP_UNINSTALL_FEATURE,
-            kindlebridge_schema::methods::APP_UNINSTALL,
-            params,
-        )
+        self.remote_call::<rpc_method::AppUninstall>(&params.serial, params)
     }
 
     fn app_list(&self, params: &SerialParams) -> Result<AppList, RpcError> {
-        self.remote_call(
-            &params.serial,
-            APP_LIST_FEATURE,
-            kindlebridge_schema::methods::APP_LIST,
-            params,
-        )
+        self.remote_call::<rpc_method::AppList>(&params.serial, params)
     }
 
     fn process_list(&self, params: &SerialParams) -> Result<ProcessList, RpcError> {
-        self.remote_call(
-            &params.serial,
-            PROCESS_LIST_FEATURE,
-            kindlebridge_schema::methods::PROCESS_LIST,
-            params,
-        )
+        self.remote_call::<rpc_method::ProcessList>(&params.serial, params)
     }
 
     fn process_signal(&self, params: &ProcessSignalParams) -> Result<ProcessSummary, RpcError> {
-        self.remote_call(
-            &params.serial,
-            PROCESS_SIGNAL_FEATURE,
-            kindlebridge_schema::methods::PROCESS_SIGNAL,
-            params,
-        )
+        self.remote_call::<rpc_method::ProcessSignal>(&params.serial, params)
     }
 
     fn log_tail(&self, params: &LogTailParams) -> Result<LogSnapshot, RpcError> {
-        self.remote_call(
-            &params.serial,
-            LOG_TAIL_FEATURE,
-            kindlebridge_schema::methods::LOG_TAIL,
-            params,
-        )
+        self.remote_call::<rpc_method::LogTail>(&params.serial, params)
     }
 
     fn shell_open(
@@ -562,17 +487,23 @@ impl ConnectedDeviceProvider {
         }
     }
 
-    fn remote_call<T: serde::de::DeserializeOwned>(
+    fn remote_call<M: RpcMethod>(
         &self,
         serial: &str,
-        feature: &str,
-        method: &str,
-        params: &impl Serialize,
-    ) -> Result<T, RpcError> {
-        let device = self.require_feature(serial, feature)?;
+        params: &M::Params,
+    ) -> Result<M::Result, RpcError> {
+        let device = self.require_feature(serial, M::FEATURE)?;
+        self.typed_call::<M>(device, params)
+    }
+
+    fn typed_call<M: RpcMethod>(
+        &self,
+        device: &ConnectedDevice,
+        params: &M::Params,
+    ) -> Result<M::Result, RpcError> {
         let value = device
             .session
-            .call(method, params)
+            .call(M::METHOD, params)
             .map_err(link_rpc_error)?;
         serde_json::from_value(value).map_err(|_| RpcError::internal_error())
     }
