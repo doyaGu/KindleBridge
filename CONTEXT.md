@@ -20,6 +20,10 @@ _Avoid_: Sync connection, sync session
 The host-side owner of Sync Stream operations and their local-file hashing, staging, resume, cancellation, and durability rules for one connected Kindle.
 _Avoid_: Sync manager, sync session
 
+**Host Sync Operation**:
+A host-server push or pull opened by one streaming request on the local JSON-RPC link. It owns its operation ID, progress, and cancellation through the terminal response, and may drive at most one Sync Stream. Losing the local client cancels it.
+_Avoid_: Sync job, Sync Stream
+
 **Logical Sync Path**:
 A non-empty, Unicode NFC, forward-slash relative path naming one location below the KindleBridge sync root. Host absolute-root aliases and backslashes are developer input forms, not Logical Sync Paths.
 _Avoid_: Remote filesystem path, host input path
@@ -45,6 +49,14 @@ _Avoid_: Shell connection, resumable shell session
 > Developer: Does every Host RPC become a Device RPC?
 >
 > Domain expert: No. Server status and stop are local host controls, while a legacy bounded sync call can drive a Sync Stream. Host RPC describes the local call's ownership, not the device-side protocol it selects.
+>
+> Developer: Is a Host Sync Operation the same thing as its Sync Stream?
+>
+> Domain expert: No. The Host Sync Operation owns local progress, cancellation, and the terminal response. It may open one Sync Stream, while a fake device can complete it without opening any device stream.
+>
+> Developer: Does a Host Sync Operation continue after its local client disconnects?
+>
+> Domain expert: No. Disconnecting the local client cancels every Host Sync Operation it owns.
 >
 > Developer: Does reconnecting USB resume the same Sync Stream?
 >
