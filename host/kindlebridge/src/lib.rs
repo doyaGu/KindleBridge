@@ -33,7 +33,11 @@ use serde_json::{json, Value};
 use thiserror::Error;
 
 #[derive(Debug, Parser)]
-#[command(name = "kindlebridge", about = "High-speed Kindle development bridge")]
+#[command(
+    name = "kindlebridge",
+    version,
+    about = "High-speed Kindle development bridge"
+)]
 pub struct Cli {
     /// Emit machine-readable JSON.
     #[arg(long, global = true)]

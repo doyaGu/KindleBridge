@@ -22,7 +22,7 @@ const KINDLEBRIDGE_USB_SUBCLASS: u8 = 0x4b;
 const KINDLEBRIDGE_USB_PROTOCOL: u8 = 0x01;
 
 #[derive(Debug, Parser)]
-#[command(about = "KindleBridge host JSON-RPC server")]
+#[command(version, about = "KindleBridge host JSON-RPC server")]
 struct Args {
     /// Serve JSON-RPC 2.0 over stdin/stdout with LSP Content-Length framing.
     #[arg(long)]
