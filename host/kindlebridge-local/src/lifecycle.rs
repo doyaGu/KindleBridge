@@ -4,6 +4,11 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use std::ffi::{OsStr, OsString};
+#[cfg(windows)]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
 use interprocess::local_socket::{prelude::*, Stream};
 use kindlebridge_schema::{methods, ClientError, RpcClient, ServerVersion, API_VERSION};
 
@@ -106,9 +111,7 @@ fn spawn_server_and_connect(
     contract: ServerContract<'_>,
 ) -> Result<Stream, LifecycleError> {
     let program = command.get_program().to_string_lossy().into_owned();
-    prepare_server_command(&mut command);
-    let mut child = command
-        .spawn()
+    let mut child = ServerChild::spawn(&mut command)
         .map_err(|error| LifecycleError::new(format!("could not start {program}: {error}")))?;
     let started = Instant::now();
     let mut child_exit = None;
@@ -124,8 +127,7 @@ fn spawn_server_and_connect(
                     }
                     ServerCompatibility::Replace => incompatible = Some(version),
                     ServerCompatibility::Foreign => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        child.terminate();
                         return Err(foreign_server_error(&version, contract));
                     }
                 }
@@ -147,8 +149,7 @@ fn spawn_server_and_connect(
             )));
         }
         if started.elapsed() >= SERVER_START_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.terminate();
             return Err(LifecycleError::new(match incompatible {
                 Some(version) => format!(
                     "{program} launched {}, but this CLI requires {} (API {})",
@@ -163,26 +164,143 @@ fn spawn_server_and_connect(
     }
 }
 
-fn prepare_server_command(command: &mut Command) {
-    use std::process::Stdio;
+#[cfg(not(windows))]
+struct ServerChild(std::process::Child);
 
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    hide_server_window(command);
+#[cfg(not(windows))]
+impl ServerChild {
+    fn spawn(command: &mut Command) -> Result<Self, String> {
+        use std::process::Stdio;
+
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(Self)
+            .map_err(|error| error.to_string())
+    }
+
+    fn try_wait(&mut self) -> Result<Option<String>, String> {
+        self.0
+            .try_wait()
+            .map(|status| status.map(|status| status.to_string()))
+            .map_err(|error| error.to_string())
+    }
+
+    fn terminate(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 #[cfg(windows)]
-fn hide_server_window(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
+struct ServerChild(winsafe::guard::CloseHandlePiGuard);
 
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NO_WINDOW);
+#[cfg(windows)]
+impl ServerChild {
+    fn spawn(command: &mut Command) -> Result<Self, String> {
+        use winsafe::prelude::*;
+
+        let command_line = windows_command_line(command)?;
+        let mut startup = winsafe::STARTUPINFO::default();
+        winsafe::HPROCESS::CreateProcess(
+            None,
+            Some(&command_line),
+            None,
+            None,
+            false,
+            winsafe::co::CREATE::NO_WINDOW,
+            None,
+            None,
+            &mut startup,
+        )
+        .map(Self)
+        .map_err(|error| error.to_string())
+    }
+
+    fn try_wait(&mut self) -> Result<Option<String>, String> {
+        use winsafe::prelude::*;
+
+        match self
+            .0
+            .hProcess
+            .WaitForSingleObject(Some(0))
+            .map_err(|error| error.to_string())?
+        {
+            winsafe::co::WAIT::TIMEOUT => Ok(None),
+            winsafe::co::WAIT::OBJECT_0 => self
+                .0
+                .hProcess
+                .GetExitCodeProcess()
+                .map(|code| Some(format!("exit code: {code}")))
+                .map_err(|error| error.to_string()),
+            outcome => Err(format!("unexpected server wait outcome: {}", outcome.raw())),
+        }
+    }
+
+    fn terminate(&mut self) {
+        use winsafe::prelude::*;
+
+        let _ = self.0.hProcess.TerminateProcess(1);
+        let _ = self.0.hProcess.WaitForSingleObject(None);
+    }
 }
 
-#[cfg(not(windows))]
-fn hide_server_window(_command: &mut Command) {}
+#[cfg(windows)]
+fn windows_command_line(command: &Command) -> Result<String, String> {
+    let mut encoded = Vec::new();
+    append_windows_argument(&mut encoded, command.get_program())?;
+    for argument in command.get_args() {
+        encoded.push(u16::from(b' '));
+        append_windows_argument(&mut encoded, argument)?;
+    }
+    OsString::from_wide(&encoded)
+        .into_string()
+        .map_err(|_| "server command is not valid Unicode".to_owned())
+}
+
+#[cfg(windows)]
+fn append_windows_argument(encoded: &mut Vec<u16>, argument: &OsStr) -> Result<(), String> {
+    let argument: Vec<u16> = argument.encode_wide().collect();
+    if argument.contains(&0) {
+        return Err("server command contains a NUL character".to_owned());
+    }
+    let needs_quotes = argument.is_empty()
+        || argument
+            .iter()
+            .any(|unit| matches!(*unit, 0x20 | 0x09 | 0x22));
+    if !needs_quotes {
+        encoded.extend(argument);
+        return Ok(());
+    }
+
+    encoded.push(u16::from(b'"'));
+    let mut backslashes = 0;
+    for unit in argument {
+        if unit == u16::from(b'\\') {
+            backslashes += 1;
+        } else if unit == u16::from(b'"') {
+            push_backslashes(encoded, backslashes * 2 + 1);
+            encoded.push(unit);
+            backslashes = 0;
+        } else {
+            push_backslashes(encoded, backslashes);
+            encoded.push(unit);
+            backslashes = 0;
+        }
+    }
+    push_backslashes(encoded, backslashes * 2);
+    encoded.push(u16::from(b'"'));
+    Ok(())
+}
+
+#[cfg(windows)]
+fn push_backslashes(encoded: &mut Vec<u16>, count: usize) {
+    for _ in 0..count {
+        encoded.push(u16::from(b'\\'));
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServerCompatibility {
@@ -429,6 +547,33 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "local endpoint belongs to other 9 (API v9), not kindlebridge-server; stop it manually"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_arguments_follow_command_line_to_argv_rules() {
+        fn quote(argument: &str) -> String {
+            let mut encoded = Vec::new();
+            append_windows_argument(&mut encoded, OsStr::new(argument)).unwrap();
+            OsString::from_wide(&encoded).to_string_lossy().into_owned()
+        }
+
+        assert_eq!(quote("simple"), "simple");
+        assert_eq!(quote("two words"), r#""two words""#);
+        assert_eq!(quote(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(quote(r"C:\path with space\"), r#""C:\path with space\\""#);
+        assert_eq!(quote(""), r#""""#);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_server_command_rejects_embedded_nul() {
+        let argument = OsString::from_wide(&[u16::from(b'a'), 0, u16::from(b'b')]);
+        let mut encoded = Vec::new();
+        assert_eq!(
+            append_windows_argument(&mut encoded, &argument).unwrap_err(),
+            "server command contains a NUL character"
         );
     }
 }

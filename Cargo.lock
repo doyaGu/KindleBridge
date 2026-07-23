@@ -604,6 +604,7 @@ dependencies = [
  "interprocess",
  "kindlebridge-schema",
  "serde_json",
+ "winsafe",
 ]
 
 [[package]]
@@ -1474,6 +1475,12 @@ checksum = "80d0f4e272c85def139476380b12f9ac60926689dd2e01d4923222f40580869d"
 dependencies = [
  "winapi",
 ]
+
+[[package]]
+name = "winsafe"
+version = "0.0.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d6ad6cbd9c6e5144971e326303f0e453b61d82e4f72067fccf23106bccd8437"
 
 [[package]]
 name = "zeroize"
