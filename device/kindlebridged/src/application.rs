@@ -13,7 +13,7 @@ use kindlebridge_schema::{
 };
 
 use crate::app::AppSupervisor;
-use crate::services;
+mod backend;
 
 #[derive(Clone, Debug)]
 pub struct ApplicationManager {
@@ -68,7 +68,7 @@ impl ApplicationManager {
         expected_file_hash: &str,
     ) -> Result<AppSummary, RpcError> {
         let _operation = self.lock_install_operation()?;
-        services::app_install(
+        backend::app_install(
             bundle,
             expected_file_hash,
             self.activation_root(),
@@ -81,37 +81,37 @@ impl ApplicationManager {
 
     pub fn list(&self) -> Result<AppList, RpcError> {
         let _operation = self.lock_operation()?;
-        services::app_list(self.activation_root(), &self.inner.supervisor)
+        backend::app_list(self.activation_root(), &self.inner.supervisor)
     }
 
     pub fn log(&self, params: &AppLogParams) -> Result<AppLogSnapshot, RpcError> {
         let _operation = self.lock_operation()?;
-        services::app_log(self.activation_root(), &self.inner.supervisor, params)
+        backend::app_log(self.activation_root(), &self.inner.supervisor, params)
     }
 
     pub fn start(&self, app_id: &str) -> Result<AppSummary, RpcError> {
         let _operation = self.lock_operation()?;
-        services::app_start(self.activation_root(), &self.inner.supervisor, app_id)
+        backend::app_start(self.activation_root(), &self.inner.supervisor, app_id)
     }
 
     pub fn stop(&self, app_id: &str) -> Result<AppSummary, RpcError> {
         let _operation = self.lock_operation()?;
-        services::app_stop(self.activation_root(), &self.inner.supervisor, app_id)
+        backend::app_stop(self.activation_root(), &self.inner.supervisor, app_id)
     }
 
     pub fn restart(&self, app_id: &str) -> Result<AppSummary, RpcError> {
         let _operation = self.lock_operation()?;
-        services::app_restart(self.activation_root(), &self.inner.supervisor, app_id)
+        backend::app_restart(self.activation_root(), &self.inner.supervisor, app_id)
     }
 
     pub fn rollback(&self, app_id: &str) -> Result<AppSummary, RpcError> {
         let _operation = self.lock_operation()?;
-        services::app_rollback(self.activation_root(), &self.inner.supervisor, app_id)
+        backend::app_rollback(self.activation_root(), &self.inner.supervisor, app_id)
     }
 
     pub fn uninstall(&self, app_id: &str) -> Result<AppSummary, RpcError> {
         let _operation = self.lock_operation()?;
-        services::app_uninstall(self.activation_root(), &self.inner.supervisor, app_id)
+        backend::app_uninstall(self.activation_root(), &self.inner.supervisor, app_id)
     }
 
     pub fn annotate_processes(&self, processes: &mut ProcessList) -> Result<(), RpcError> {
