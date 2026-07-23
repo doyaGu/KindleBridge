@@ -27,9 +27,9 @@ use kindlebridge_bundle::read_project_manifest;
 use kindlebridge_schema::device_protocol::{ShellMode, ShellOpen, TerminalSize, SHELL_V2_FEATURE};
 use kindlebridge_schema::{
     error_codes, methods, read_json_frame, write_json_frame, AppLogParams, AppLogSnapshot,
-    ClientError, DeviceFeatures, RequestId, RpcClient, RpcRequest, RpcResponse, ShellOpenParams,
-    ShellOpenResult, StreamChannel, StreamClosedParams, StreamCreditParams, StreamDataParams,
-    StreamExitParams, StreamIdParams, StreamResizeParams, StreamWriteParams,
+    AppState, ClientError, DeviceFeatures, RequestId, RpcClient, RpcRequest, RpcResponse,
+    ShellOpenParams, ShellOpenResult, StreamChannel, StreamClosedParams, StreamCreditParams,
+    StreamDataParams, StreamExitParams, StreamIdParams, StreamResizeParams, StreamWriteParams,
     DEFAULT_MAX_CONTENT_LENGTH,
 };
 use serde::Serialize;
@@ -301,6 +301,7 @@ fn run_app_log(
     let mut warned_stdout_cap = false;
     let mut warned_stderr_cap = false;
     let mut waiting_for_device = false;
+    let mut previous_runtime = None;
 
     loop {
         let params = serde_json::to_value(AppLogParams {
@@ -337,6 +338,15 @@ fn run_app_log(
         let snapshot: AppLogSnapshot = serde_json::from_value(value)
             .map_err(|_| RunError::Message("server returned invalid app log data".to_owned()))?;
         let restarted = run_id.is_some() && snapshot.reset;
+        let runtime_message = follow.then(|| {
+            app_runtime_message(
+                &app_id,
+                previous_runtime.as_ref(),
+                &snapshot.state,
+                snapshot.pid,
+                restarted,
+            )
+        });
         if snapshot.reset {
             warned_stdout_cap = false;
             warned_stderr_cap = false;
@@ -376,6 +386,10 @@ fn run_app_log(
             eprintln!("\nwarning: {app_id} stderr capture reached its 4 MiB limit");
             warned_stderr_cap = true;
         }
+        if let Some(Some(message)) = runtime_message {
+            eprintln!("--- {message} ---");
+        }
+        previous_runtime = Some((snapshot.state, snapshot.pid));
         if !follow {
             return Ok(CommandOutput {
                 output: String::new(),
@@ -383,6 +397,32 @@ fn run_app_log(
             });
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn app_runtime_message(
+    app_id: &str,
+    previous: Option<&(AppState, Option<u32>)>,
+    state: &AppState,
+    pid: Option<u32>,
+    restarted: bool,
+) -> Option<String> {
+    let changed = match previous {
+        Some(previous) => previous.0 != *state || previous.1 != pid,
+        None => true,
+    };
+    if !changed {
+        return None;
+    }
+    match state {
+        AppState::Running if previous.is_none() || restarted => None,
+        AppState::Running => Some(pid.map_or_else(
+            || format!("{app_id} is running"),
+            |pid| format!("{app_id} is running (pid {pid})"),
+        )),
+        AppState::Stopped if previous.is_none() => Some(format!("{app_id} is stopped")),
+        AppState::Stopped => Some(format!("{app_id} exited")),
+        AppState::Failed => Some(format!("{app_id} failed")),
     }
 }
 
@@ -1606,8 +1646,48 @@ mod tests {
             )));
         }
         assert!(!is_retryable_app_log_error(&ClientError::Rpc(
-            kindlebridge_schema::RpcError::feature_unavailable("KT6-TEST", "app.log.v1")
+            kindlebridge_schema::RpcError::feature_unavailable("KT6-TEST", "app.log.v2")
         )));
         assert!(!is_retryable_app_log_error(&ClientError::InvalidResponse));
+    }
+
+    #[test]
+    fn app_log_follow_reports_terminal_state_without_duplicating_restart_markers() {
+        assert_eq!(
+            app_runtime_message("reader", None, &AppState::Running, Some(10), false),
+            None
+        );
+        assert_eq!(
+            app_runtime_message(
+                "reader",
+                Some(&(AppState::Running, Some(10))),
+                &AppState::Failed,
+                None,
+                false,
+            )
+            .as_deref(),
+            Some("reader failed")
+        );
+        assert_eq!(
+            app_runtime_message(
+                "reader",
+                Some(&(AppState::Running, Some(10))),
+                &AppState::Stopped,
+                None,
+                false,
+            )
+            .as_deref(),
+            Some("reader exited")
+        );
+        assert_eq!(
+            app_runtime_message(
+                "reader",
+                Some(&(AppState::Running, Some(10))),
+                &AppState::Running,
+                Some(11),
+                true,
+            ),
+            None
+        );
     }
 }
