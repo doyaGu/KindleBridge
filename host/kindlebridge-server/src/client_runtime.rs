@@ -17,12 +17,14 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{
-    handle_registry_request, to_value, DeviceRegistry, DeviceShellEvent, ServeError, ShellStream,
-    SyncObserver,
-};
+use super::host_rpc::handle_registry;
+use super::{DeviceRegistry, DeviceShellEvent, ServeError, ShellStream, SyncObserver};
 
 const MAX_CLIENT_SYNC_JOBS: usize = 4;
+
+fn to_value<T: Serialize>(value: T) -> Result<Value, RpcError> {
+    serde_json::to_value(value).map_err(|_| RpcError::internal_error())
+}
 
 pub(super) struct ClientRuntime<W> {
     writer: Arc<Mutex<W>>,
@@ -142,7 +144,7 @@ where
                     | methods::STREAM_CLOSE
             ) {
                 handle_stream_notification(request, &self.writer, &self.streams)?;
-            } else if let Some(response) = handle_registry_request(request, &self.registry) {
+            } else if let Some(response) = handle_registry(request, &self.registry) {
                 write_shared(&self.writer, &response)?;
             }
         }
