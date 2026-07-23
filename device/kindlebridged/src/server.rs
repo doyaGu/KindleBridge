@@ -14,12 +14,9 @@ use kindlebridge_functionfs::{
 };
 use kindlebridge_schema::device_protocol::{
     is_valid_session_id, DeviceAppInstallParams, DeviceCall, DeviceHello, DeviceReply, HostHello,
-    ShellOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE, APP_LOG_FEATURE,
-    APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE, APP_START_FEATURE, APP_STOP_FEATURE,
-    APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, EXEC_FEATURE,
-    LOG_TAIL_FEATURE, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION, RPC_SERVICE,
-    SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE, SYNC_SERVICE,
-    SYNC_TREE_FEATURE,
+    ShellOpen, SyncReply, SyncRequest, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW,
+    PROTOCOL_VERSION, RPC_SERVICE, SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE,
+    SYNC_FEATURE, SYNC_SERVICE,
 };
 use kindlebridge_schema::device_rpc::{self as rpc_method, RpcMethod};
 use kindlebridge_schema::shell_protocol::{PacketSource, ShellPacket, ShellStreamState};
@@ -62,21 +59,21 @@ const DEFAULT_LOG_PATH: &str = "/var/local/kindlebridge/usb.log";
 const SYNC_PIPELINE_QUEUE_DEPTH: usize = 3;
 const MAX_CONCURRENT_SHELLS: usize = 4;
 const DEVICE_RUNTIME_FEATURES: &[&str] = &[
-    APP_INSTALL_FEATURE,
-    APP_LIST_FEATURE,
-    APP_LOG_FEATURE,
-    APP_RESTART_FEATURE,
-    APP_ROLLBACK_FEATURE,
-    APP_START_FEATURE,
-    APP_STOP_FEATURE,
-    APP_UNINSTALL_FEATURE,
-    EXEC_FEATURE,
-    LOG_TAIL_FEATURE,
-    PROCESS_LIST_FEATURE,
-    PROCESS_SIGNAL_FEATURE,
+    rpc_method::AppInstall::FEATURE,
+    rpc_method::AppList::FEATURE,
+    rpc_method::AppLog::FEATURE,
+    rpc_method::AppRestart::FEATURE,
+    rpc_method::AppRollback::FEATURE,
+    rpc_method::AppStart::FEATURE,
+    rpc_method::AppStop::FEATURE,
+    rpc_method::AppUninstall::FEATURE,
+    rpc_method::ExecRun::FEATURE,
+    rpc_method::LogTail::FEATURE,
+    rpc_method::ProcessList::FEATURE,
+    rpc_method::ProcessSignal::FEATURE,
     SHELL_V2_FEATURE,
     SYNC_FEATURE,
-    SYNC_TREE_FEATURE,
+    rpc_method::SyncList::FEATURE,
 ];
 
 #[derive(Debug)]
@@ -1856,7 +1853,7 @@ mod tests {
 
     #[test]
     fn application_mutation_features_are_advertised_together() {
-        assert!(DEVICE_RUNTIME_FEATURES.contains(&APP_ROLLBACK_FEATURE));
-        assert!(DEVICE_RUNTIME_FEATURES.contains(&APP_UNINSTALL_FEATURE));
+        assert!(DEVICE_RUNTIME_FEATURES.contains(&rpc_method::AppRollback::FEATURE));
+        assert!(DEVICE_RUNTIME_FEATURES.contains(&rpc_method::AppUninstall::FEATURE));
     }
 }

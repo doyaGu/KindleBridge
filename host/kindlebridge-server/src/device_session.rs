@@ -13,10 +13,9 @@ use kindlebridge_bundle::{verify, BundleKind, VerifyOptions};
 use kindlebridge_schema::device_protocol::SYNC_CREDIT_BATCH_SIZE;
 use kindlebridge_schema::device_protocol::{
     is_valid_session_id, is_valid_transfer_id, DeviceAppInstallParams, DeviceCall, DeviceHello,
-    DeviceReply, HostHello, ShellOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE,
-    DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, MAX_HOST_TO_DEVICE_PAYLOAD, PROTOCOL_VERSION,
-    RPC_SERVICE, SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE,
-    SYNC_SERVICE,
+    DeviceReply, HostHello, ShellOpen, SyncReply, SyncRequest, DEFAULT_CONNECTION_WINDOW,
+    DEFAULT_STREAM_WINDOW, MAX_HOST_TO_DEVICE_PAYLOAD, PROTOCOL_VERSION, RPC_SERVICE,
+    SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE, SYNC_SERVICE,
 };
 use kindlebridge_schema::device_rpc::{self as rpc_method, RpcMethod};
 use kindlebridge_schema::shell_protocol::{PacketSource, ShellPacket, ShellStreamState};
@@ -270,7 +269,7 @@ impl ConnectedDeviceProvider {
     }
 
     fn app_install(&self, params: AppInstallParams) -> Result<AppSummary, RpcError> {
-        let device = self.require_feature(&params.serial, APP_INSTALL_FEATURE)?;
+        let device = self.require_feature(&params.serial, rpc_method::AppInstall::FEATURE)?;
         self.require_feature(&params.serial, SYNC_FEATURE)?;
         validate_host_path(&params.bundle_path)?;
         let mut file = File::open(&params.bundle_path)

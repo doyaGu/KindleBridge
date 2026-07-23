@@ -146,6 +146,10 @@ rpc_method!(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::device_protocol::DeviceCall;
+
     use super::*;
 
     #[test]
@@ -155,5 +159,54 @@ mod tests {
 
         fn assert_types<M: RpcMethod<Params = AppTargetParams, Result = AppSummary>>() {}
         assert_types::<AppStart>();
+    }
+
+    #[test]
+    fn unary_method_names_are_unique_and_app_log_keeps_its_v2_feature() {
+        let definitions = [
+            (ExecRun::METHOD, ExecRun::FEATURE),
+            (SyncStatus::METHOD, SyncStatus::FEATURE),
+            (SyncList::METHOD, SyncList::FEATURE),
+            (SyncMkdir::METHOD, SyncMkdir::FEATURE),
+            (AppInstall::METHOD, AppInstall::FEATURE),
+            (AppStart::METHOD, AppStart::FEATURE),
+            (AppStop::METHOD, AppStop::FEATURE),
+            (AppRestart::METHOD, AppRestart::FEATURE),
+            (AppRollback::METHOD, AppRollback::FEATURE),
+            (AppUninstall::METHOD, AppUninstall::FEATURE),
+            (AppList::METHOD, AppList::FEATURE),
+            (AppLog::METHOD, AppLog::FEATURE),
+            (ProcessList::METHOD, ProcessList::FEATURE),
+            (ProcessSignal::METHOD, ProcessSignal::FEATURE),
+            (LogTail::METHOD, LogTail::FEATURE),
+        ];
+        let methods: BTreeSet<_> = definitions.iter().map(|(method, _)| *method).collect();
+
+        assert_eq!(methods.len(), definitions.len());
+        assert_eq!(AppLog::METHOD, methods::APP_LOG);
+        assert_eq!(AppLog::FEATURE, APP_LOG_FEATURE);
+    }
+
+    #[test]
+    fn typed_definition_preserves_the_existing_device_call_shape() {
+        let params = AppTargetParams {
+            serial: "KT6-TEST".to_owned(),
+            app_id: "org.example.reader".to_owned(),
+        };
+        let call = DeviceCall {
+            method: AppStart::METHOD.to_owned(),
+            params: serde_json::to_value(&params).unwrap(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(call).unwrap(),
+            serde_json::json!({
+                "method": "v1.app.start",
+                "params": {
+                    "serial": "KT6-TEST",
+                    "app_id": "org.example.reader"
+                }
+            })
+        );
     }
 }
