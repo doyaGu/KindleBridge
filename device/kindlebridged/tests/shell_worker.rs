@@ -67,6 +67,7 @@ fn raw_shell_streams_stdout_stderr_and_exit_separately() {
             signal: 0,
         }
     );
+    worker.join().unwrap();
 }
 
 #[test]

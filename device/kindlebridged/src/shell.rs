@@ -40,6 +40,8 @@ pub enum ShellWorkerError {
     InputTooLarge { length: usize, maximum: usize },
     #[error("shell worker stopped")]
     WorkerStopped,
+    #[error("shell process worker panicked")]
+    WorkerPanicked,
     #[error("timed out waiting for shell output")]
     ReceiveTimeout,
 }
@@ -63,6 +65,7 @@ enum ShellCommand {
 pub struct ShellWorker {
     input: ShellInput,
     events: Receiver<ShellEvent>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +114,13 @@ impl ShellWorker {
                 RecvTimeoutError::Timeout => ShellWorkerError::ReceiveTimeout,
                 RecvTimeoutError::Disconnected => ShellWorkerError::WorkerStopped,
             })
+    }
+
+    pub fn join(mut self) -> Result<(), ShellWorkerError> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker.join().map_err(|_| ShellWorkerError::WorkerPanicked)
     }
 }
 
@@ -187,7 +197,7 @@ fn spawn_raw(open: ShellOpen) -> Result<ShellWorker, ShellWorkerError> {
     let stdout_reader = thread::spawn(move || pump_output(stdout, stdout_tx, ShellEvent::Stdout));
     let stderr_tx = event_tx.clone();
     let stderr_reader = thread::spawn(move || pump_output(stderr, stderr_tx, ShellEvent::Stderr));
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         run_raw_process(
             &mut child,
             stdin,
@@ -204,6 +214,7 @@ fn spawn_raw(open: ShellOpen) -> Result<ShellWorker, ShellWorkerError> {
             commands: command_tx,
         },
         events: event_rx,
+        worker: Some(worker),
     })
 }
 
@@ -234,7 +245,7 @@ fn spawn_pty(open: ShellOpen) -> Result<ShellWorker, ShellWorkerError> {
     let (event_tx, event_rx) = mpsc::sync_channel(SHELL_QUEUE_DEPTH);
     let output_tx = event_tx.clone();
     let output_reader = thread::spawn(move || pump_output(reader, output_tx, ShellEvent::Stdout));
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         run_pty_process(
             child,
             pair.master,
@@ -251,6 +262,7 @@ fn spawn_pty(open: ShellOpen) -> Result<ShellWorker, ShellWorkerError> {
             commands: command_tx,
         },
         events: event_rx,
+        worker: Some(worker),
     })
 }
 
