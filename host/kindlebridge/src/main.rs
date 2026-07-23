@@ -21,7 +21,7 @@ use interprocess::local_socket::{
 };
 use kindlebridge::{
     deploy_project_after_build, execute_with_status, AppCommand, Cli, CliError, CommandOutput,
-    RunArgs, ServerCommand, ShellArgs, TopLevelCommand,
+    RpcCaller, RunArgs, ServerCommand, ShellArgs, TopLevelCommand,
 };
 use kindlebridge_bundle::read_project_manifest;
 use kindlebridge_schema::device_protocol::{ShellMode, ShellOpen, TerminalSize, SHELL_V2_FEATURE};
@@ -30,7 +30,7 @@ use kindlebridge_schema::{
     AppState, ClientError, DeviceFeatures, RequestId, RpcClient, RpcRequest, RpcResponse,
     ShellOpenParams, ShellOpenResult, StreamChannel, StreamClosedParams, StreamCreditParams,
     StreamDataParams, StreamExitParams, StreamIdParams, StreamResizeParams, StreamWriteParams,
-    DEFAULT_MAX_CONTENT_LENGTH,
+    SyncProgress, SyncProgressPhase, DEFAULT_MAX_CONTENT_LENGTH,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -161,6 +161,9 @@ fn run(cli: &Cli) -> Result<CommandOutput, RunError> {
         if args.watch {
             return run_project_watch(cli, args);
         }
+    }
+    if matches!(cli.command, TopLevelCommand::Sync(_)) {
+        return run_sync(connect_or_start(cli)?, cli);
     }
     run_rpc(connect_or_start(cli)?, cli)
 }
@@ -691,6 +694,161 @@ fn run_rpc(stream: Stream, cli: &Cli) -> Result<CommandOutput, RunError> {
     let (reader, writer) = stream.split();
     let mut client = RpcClient::new(BufReader::new(reader), BufWriter::new(writer));
     execute_with_status(&mut client, &cli.command, cli.json).map_err(RunError::Command)
+}
+
+fn run_sync(stream: Stream, cli: &Cli) -> Result<CommandOutput, RunError> {
+    let (reader, writer) = stream.split();
+    let client = RpcClient::new(BufReader::new(reader), BufWriter::new(writer));
+    let mut caller = SyncProgressCaller::new(client, io::stderr().is_terminal(), !cli.json);
+    let result =
+        execute_with_status(&mut caller, &cli.command, cli.json).map_err(RunError::Command);
+    caller.finish();
+    result
+}
+
+struct SyncProgressCaller<R, W> {
+    client: RpcClient<R, W>,
+    display: SyncProgressDisplay,
+}
+
+struct SyncProgressDisplay {
+    enabled: bool,
+    terminal: bool,
+    displayed: bool,
+    last_operation: Option<String>,
+    last_transfer: Option<String>,
+    last_phase: Option<SyncProgressPhase>,
+    last_bucket: Option<u64>,
+}
+
+impl<R: BufRead, W: Write> SyncProgressCaller<R, W> {
+    fn new(client: RpcClient<R, W>, terminal: bool, enabled: bool) -> Self {
+        Self {
+            client,
+            display: SyncProgressDisplay {
+                enabled,
+                terminal,
+                displayed: false,
+                last_operation: None,
+                last_transfer: None,
+                last_phase: None,
+                last_bucket: None,
+            },
+        }
+    }
+
+    fn finish(&mut self) {
+        self.display.finish();
+    }
+}
+
+impl SyncProgressDisplay {
+    fn show(&mut self, progress: &SyncProgress) {
+        if !self.enabled {
+            return;
+        }
+        if let Some(transfer_id) = progress
+            .transfer_id
+            .as_deref()
+            .filter(|_| progress.total != 0 && progress.transferred < progress.total)
+        {
+            if self.last_transfer.as_deref() != Some(transfer_id) {
+                if self.terminal && self.displayed {
+                    eprintln!();
+                }
+                eprintln!(
+                    "resume token for {}: {transfer_id} (use --resume {transfer_id})",
+                    progress.remote_path
+                );
+                self.displayed = false;
+                self.last_transfer = Some(transfer_id.to_owned());
+            }
+        }
+        let bucket = if progress.total == 0 {
+            0
+        } else {
+            progress.transferred.saturating_mul(10) / progress.total
+        };
+        let changed_operation = self.last_operation.as_deref() != Some(&progress.operation_id);
+        let changed_phase = self.last_phase.as_ref() != Some(&progress.phase);
+        let should_print =
+            self.terminal || changed_operation || changed_phase || self.last_bucket != Some(bucket);
+        if !should_print {
+            return;
+        }
+        let phase = match progress.phase {
+            SyncProgressPhase::Hashing => "hashing",
+            SyncProgressPhase::Transferring => "transferring",
+        };
+        let status = if progress.total == 0 {
+            format!("{} transferred", format_bytes(progress.transferred))
+        } else {
+            let percentage = progress.transferred.saturating_mul(100) / progress.total;
+            format!(
+                "{} / {} ({percentage}%)",
+                format_bytes(progress.transferred),
+                format_bytes(progress.total)
+            )
+        };
+        if self.terminal {
+            eprint!("\r{phase} {}: {status}\u{1b}[K", progress.remote_path);
+            let _ = io::stderr().flush();
+        } else {
+            eprintln!("{phase} {}: {status}", progress.remote_path);
+        }
+        self.displayed = true;
+        self.last_operation = Some(progress.operation_id.clone());
+        self.last_phase = Some(progress.phase.clone());
+        self.last_bucket = Some(bucket);
+    }
+
+    fn finish(&mut self) {
+        if self.terminal && self.displayed {
+            eprintln!();
+        }
+        self.displayed = false;
+    }
+}
+
+impl<R: BufRead, W: Write> RpcCaller for SyncProgressCaller<R, W> {
+    fn call(&mut self, method: &str, params: Option<Value>) -> Result<Value, ClientError> {
+        let method = match method {
+            methods::SYNC_PUSH => methods::SYNC_PUSH_STREAM,
+            methods::SYNC_PULL => methods::SYNC_PULL_STREAM,
+            _ => return self.client.call(method, params),
+        };
+        let display = &mut self.display;
+        self.client
+            .call_with_notifications(method, params, |notification| {
+                if notification.method != methods::SYNC_PROGRESS {
+                    return Err(ClientError::InvalidResponse);
+                }
+                let progress = notification
+                    .params
+                    .clone()
+                    .ok_or(ClientError::InvalidResponse)
+                    .and_then(|value| {
+                        serde_json::from_value(value).map_err(|_| ClientError::InvalidResponse)
+                    })?;
+                display.show(&progress);
+                Ok(())
+            })
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn run_shell(cli: &Cli, args: &ShellArgs) -> Result<CommandOutput, RunError> {
@@ -1505,7 +1663,53 @@ fn command_error_code(error: &CliError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
+
+    #[test]
+    fn sync_cli_upgrades_file_transfers_to_the_progress_rpc() {
+        let mut input = Vec::new();
+        write_json_frame(
+            &mut input,
+            &RpcRequest::notification(
+                methods::SYNC_PROGRESS,
+                Some(json!({
+                    "operation_id": "op",
+                    "direction": "push",
+                    "remote_path": "payload.bin",
+                    "phase": "transferring",
+                    "transferred": 7,
+                    "total": 7
+                })),
+            ),
+        )
+        .unwrap();
+        write_json_frame(
+            &mut input,
+            &RpcResponse::success(RequestId::Number(1), json!({ "accepted_offset": 7 })),
+        )
+        .unwrap();
+        let client = RpcClient::new(BufReader::new(Cursor::new(input)), Vec::new());
+        let mut caller = SyncProgressCaller::new(client, false, false);
+
+        let result = caller
+            .call(methods::SYNC_PUSH, Some(json!({ "file": "parameters" })))
+            .unwrap();
+
+        assert_eq!(result["accepted_offset"], 7);
+        let (_, output) = caller.client.into_parts();
+        let request: RpcRequest = serde_json::from_value(
+            read_json_frame(
+                &mut BufReader::new(Cursor::new(output)),
+                DEFAULT_MAX_CONTENT_LENGTH,
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(request.method, methods::SYNC_PUSH_STREAM);
+    }
 
     #[test]
     fn watch_snapshot_detects_file_changes_additions_and_removals() {
