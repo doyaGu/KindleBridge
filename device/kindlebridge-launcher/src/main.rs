@@ -4,8 +4,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use kindlebridge_launcher::{
-    active_slot, stage_daemon, FilesystemDisableFlag, Launcher, Slot, SystemChildRunner,
-    SystemClock,
+    active_slot, rollback_daemon, stage_daemon, FilesystemDisableFlag, Launcher, Slot,
+    SystemChildRunner, SystemClock,
 };
 
 #[derive(Debug, Parser)]
@@ -36,6 +36,11 @@ enum Command {
     },
     /// Select the staged slot while the USB daemon is stopped.
     SelectStaged {
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// Restore the last confirmed daemon slot while the USB daemon is stopped.
+    Rollback {
         #[arg(long)]
         root: PathBuf,
     },
@@ -85,6 +90,10 @@ fn run(arguments: Args) -> Result<(), String> {
             std::fs::remove_file(root.join("next"))
                 .map_err(|error| format!("could not clear staged slot: {error}"))?;
             println!("selected staged slot {slot}");
+        }
+        Command::Rollback { root } => {
+            let slot = rollback_daemon(root).map_err(|error| error.to_string())?;
+            println!("restored daemon slot {slot}");
         }
         Command::Status { root } => {
             println!("{}", active_slot(root).map_err(|error| error.to_string())?);

@@ -8,6 +8,7 @@ use crate::{Error, ErrorKind, Result};
 
 const POINTER_FILE: &str = "current";
 const PENDING_FILE: &str = "launcher/pending-slot";
+pub(crate) const PREVIOUS_FILE: &str = "launcher/previous-slot";
 const STATE_FILE: &str = "launcher/watchdog-state";
 static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -399,7 +400,8 @@ impl<R: ChildRunner, C: Clock, D: DisableFlag> Launcher<R, C, D> {
             halted: false,
         };
         write_state(&self.root, &self.state)?;
-        if read_pending(&self.root)?.is_some_and(|pending| pending.target == slot) {
+        if let Some(pending) = read_pending(&self.root)?.filter(|pending| pending.target == slot) {
+            write_slot_pointer(&self.root, PREVIOUS_FILE, pending.previous)?;
             self.root.remove_file(PENDING_FILE)?;
         }
         Ok(())
@@ -448,7 +450,7 @@ fn read_heartbeat(root: &SafeRoot, relative: &str) -> Result<Option<Heartbeat>> 
     }))
 }
 
-fn validate_slot(root: &SafeRoot, slot: Slot) -> Result<SlotManifest> {
+pub(crate) fn validate_slot(root: &SafeRoot, slot: Slot) -> Result<SlotManifest> {
     let manifest = SlotManifest::load(root, slot)?;
     let executable = root.resolve(&format!("slots/{}/{}", slot.as_str(), manifest.executable))?;
     if !entry_exists(&executable)? || !fs::metadata(&executable)?.is_file() {
@@ -491,7 +493,7 @@ pub(crate) fn read_slot_pointer(root: &SafeRoot, relative: &str) -> Result<Slot>
     Slot::parse(value).map_err(|error| Error::new(ErrorKind::InvalidState, error.message))
 }
 
-fn write_slot_pointer(root: &SafeRoot, relative: &str, slot: Slot) -> Result<()> {
+pub(crate) fn write_slot_pointer(root: &SafeRoot, relative: &str, slot: Slot) -> Result<()> {
     root.atomic_write(relative, format!("{slot}\n").as_bytes())
 }
 
@@ -1000,6 +1002,39 @@ mod tests {
             }
         );
         assert_eq!(fs::read(directory.0.join("current")).unwrap(), b"A\n");
+        assert!(!directory.0.join(PENDING_FILE).exists());
+    }
+
+    #[test]
+    fn confirmed_pending_slot_records_a_one_way_rollback_point() {
+        let directory = setup_root("confirmed-rollback-point");
+        let clock = MockClock::default();
+        let mut launcher = launcher(&directory.0, clock.clone(), MockDisable::default());
+        launcher.step().unwrap();
+        launcher.request_slot(Slot::B).unwrap();
+        assert!(matches!(
+            launcher.step().unwrap(),
+            StepOutcome::Started { slot: Slot::B, .. }
+        ));
+        let request = launcher.runner_mut().requests[1].clone();
+        fs::write(
+            &request.heartbeat,
+            encode_heartbeat(&request.instance, clock.now_ms()),
+        )
+        .unwrap();
+        launcher.step().unwrap();
+        clock.advance(3001);
+        fs::write(
+            &request.heartbeat,
+            encode_heartbeat(&request.instance, clock.now_ms()),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            launcher.step().unwrap(),
+            StepOutcome::Healthy { slot: Slot::B, .. }
+        ));
+        assert_eq!(fs::read(directory.0.join(PREVIOUS_FILE)).unwrap(), b"A\n");
         assert!(!directory.0.join(PENDING_FILE).exists());
     }
 

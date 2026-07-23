@@ -12,7 +12,7 @@ mod watchdog;
 
 pub use manifest::{Slot, SlotManifest};
 pub use system::{FilesystemDisableFlag, SystemChildRunner, SystemClock};
-pub use update::{active_slot, stage_daemon, StagedUpdate};
+pub use update::{active_slot, rollback_daemon, stage_daemon, StagedUpdate};
 pub use watchdog::{
     encode_heartbeat, ChildRunner, ChildStatus, Clock, DisableFlag, Launcher, SpawnRequest,
     StepOutcome,
