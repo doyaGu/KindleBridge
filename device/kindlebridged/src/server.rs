@@ -21,10 +21,13 @@ use kindlebridge_schema::device_protocol::{
     SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE, SYNC_SERVICE,
     SYNC_TREE_FEATURE,
 };
+use kindlebridge_schema::device_rpc::{self as rpc_method, RpcMethod};
 use kindlebridge_schema::shell_protocol::{PacketSource, ShellPacket, ShellStreamState};
 use kindlebridge_schema::{
-    error_codes, methods, AppTargetParams, ExecParams, LogTailParams, ProcessSignalParams,
-    RpcError, SerialParams, SyncListParams, SyncMkdirParams, SyncStatusParams, MAX_SYNC_BLOCK_SIZE,
+    error_codes, AppList, AppLogParams, AppLogSnapshot, AppSummary, AppTargetParams, ExecParams,
+    ExecResult, LogSnapshot, LogTailParams, ProcessList, ProcessSignalParams, ProcessSummary,
+    RpcError, SerialParams, SyncListParams, SyncListResult, SyncMkdirParams, SyncMkdirResult,
+    SyncStatus, SyncStatusParams, MAX_SYNC_BLOCK_SIZE,
 };
 use kindlebridge_transport::{
     actor::{
@@ -1161,23 +1164,103 @@ fn recover_frame_boundary(stream: &mut dyn FrameIo) -> Result<(), ServerError> {
 
 fn dispatch(call: DeviceCall, config: &ServerConfig, sync_store: &SyncStore) -> DeviceReply {
     match call.method.as_str() {
-        methods::SYNC_STATUS => reply(dispatch_sync_status(call.params, config, sync_store)),
-        methods::SYNC_LIST => reply(dispatch_sync_list(call.params, config, sync_store)),
-        methods::SYNC_MKDIR => reply(dispatch_sync_mkdir(call.params, config, sync_store)),
-        methods::EXEC_RUN => reply(dispatch_exec(call.params, config)),
-        methods::APP_LIST => reply(dispatch_app_list(call.params, config)),
-        methods::PROCESS_LIST => reply(dispatch_process_list(call.params, config)),
-        methods::LOG_TAIL => reply(dispatch_log_tail(call.params, config)),
-        methods::APP_INSTALL => reply(dispatch_app_install(call.params, config, sync_store)),
-        methods::APP_START => reply(dispatch_app_start(call.params, config)),
-        methods::APP_LOG => reply(dispatch_app_log(call.params, config)),
-        methods::APP_STOP => reply(dispatch_app_stop(call.params, config)),
-        methods::APP_RESTART => reply(dispatch_app_restart(call.params, config)),
-        methods::APP_ROLLBACK => reply(dispatch_app_rollback(call.params, config)),
-        methods::APP_UNINSTALL => reply(dispatch_app_uninstall(call.params, config)),
-        methods::PROCESS_SIGNAL => reply(dispatch_process_signal(call.params, config)),
+        method if method == rpc_method::SyncStatus::METHOD => {
+            dispatch_rpc::<rpc_method::SyncStatus>(
+                call.params,
+                "expected serial and transfer_id",
+                |params| dispatch_sync_status(params, config, sync_store),
+            )
+        }
+        method if method == rpc_method::SyncList::METHOD => dispatch_rpc::<rpc_method::SyncList>(
+            call.params,
+            "expected serial, remote_path, cursor, and limit",
+            |params| dispatch_sync_list(params, config, sync_store),
+        ),
+        method if method == rpc_method::SyncMkdir::METHOD => dispatch_rpc::<rpc_method::SyncMkdir>(
+            call.params,
+            "expected serial and remote_path",
+            |params| dispatch_sync_mkdir(params, config, sync_store),
+        ),
+        method if method == rpc_method::ExecRun::METHOD => dispatch_rpc::<rpc_method::ExecRun>(
+            call.params,
+            "expected serial, argv, cwd, environment, and timeout_ms",
+            |params| dispatch_exec(params, config),
+        ),
+        method if method == rpc_method::AppList::METHOD => {
+            dispatch_rpc::<rpc_method::AppList>(call.params, "expected serial", |params| {
+                dispatch_app_list(params, config)
+            })
+        }
+        method if method == rpc_method::ProcessList::METHOD => {
+            dispatch_rpc::<rpc_method::ProcessList>(call.params, "expected serial", |params| {
+                dispatch_process_list(params, config)
+            })
+        }
+        method if method == rpc_method::LogTail::METHOD => dispatch_rpc::<rpc_method::LogTail>(
+            call.params,
+            "expected serial, cursor, and limit",
+            |params| dispatch_log_tail(params, config),
+        ),
+        method if method == rpc_method::AppInstall::METHOD => {
+            dispatch_rpc::<rpc_method::AppInstall>(
+                call.params,
+                "expected serial, remote_path, and file_hash",
+                |params| dispatch_app_install(params, config, sync_store),
+            )
+        }
+        method if method == rpc_method::AppStart::METHOD => dispatch_rpc::<rpc_method::AppStart>(
+            call.params,
+            "expected serial and app_id",
+            |params| dispatch_app_start(params, config),
+        ),
+        method if method == rpc_method::AppLog::METHOD => dispatch_rpc::<rpc_method::AppLog>(
+            call.params,
+            "expected serial, app_id, run_id, cursors, and max_bytes",
+            |params| dispatch_app_log(params, config),
+        ),
+        method if method == rpc_method::AppStop::METHOD => dispatch_rpc::<rpc_method::AppStop>(
+            call.params,
+            "expected serial and app_id",
+            |params| dispatch_app_stop(params, config),
+        ),
+        method if method == rpc_method::AppRestart::METHOD => {
+            dispatch_rpc::<rpc_method::AppRestart>(
+                call.params,
+                "expected serial and app_id",
+                |params| dispatch_app_restart(params, config),
+            )
+        }
+        method if method == rpc_method::AppRollback::METHOD => {
+            dispatch_rpc::<rpc_method::AppRollback>(
+                call.params,
+                "expected serial and app_id",
+                |params| dispatch_app_rollback(params, config),
+            )
+        }
+        method if method == rpc_method::AppUninstall::METHOD => {
+            dispatch_rpc::<rpc_method::AppUninstall>(
+                call.params,
+                "expected serial and app_id",
+                |params| dispatch_app_uninstall(params, config),
+            )
+        }
+        method if method == rpc_method::ProcessSignal::METHOD => {
+            dispatch_rpc::<rpc_method::ProcessSignal>(
+                call.params,
+                "expected serial, pid, and signal",
+                |params| dispatch_process_signal(params, config),
+            )
+        }
         _ => DeviceReply::failure(RpcError::method_not_found(&call.method)),
     }
+}
+
+fn dispatch_rpc<M: RpcMethod>(
+    params: serde_json::Value,
+    detail: &'static str,
+    handler: impl FnOnce(M::Params) -> Result<M::Result, RpcError>,
+) -> DeviceReply {
+    reply(decode_params::<M::Params>(params, detail).and_then(handler))
 }
 
 fn reply<T: Serialize>(result: Result<T, RpcError>) -> DeviceReply {
@@ -1190,11 +1273,10 @@ fn reply<T: Serialize>(result: Result<T, RpcError>) -> DeviceReply {
 }
 
 fn dispatch_sync_status(
-    params: serde_json::Value,
+    params: SyncStatusParams,
     config: &ServerConfig,
     sync_store: &SyncStore,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<SyncStatusParams>(params, "expected serial and transfer_id")?;
+) -> Result<SyncStatus, RpcError> {
     require_serial(&params.serial, config)?;
     sync_store
         .status(&params.transfer_id)
@@ -1202,12 +1284,10 @@ fn dispatch_sync_status(
 }
 
 fn dispatch_sync_list(
-    params: serde_json::Value,
+    params: SyncListParams,
     config: &ServerConfig,
     sync_store: &SyncStore,
-) -> Result<impl Serialize, RpcError> {
-    let params =
-        decode_params::<SyncListParams>(params, "expected serial, remote_path, cursor, and limit")?;
+) -> Result<SyncListResult, RpcError> {
     require_serial(&params.serial, config)?;
     sync_store
         .list_directory(&params.remote_path, params.cursor.as_deref(), params.limit)
@@ -1215,25 +1295,17 @@ fn dispatch_sync_list(
 }
 
 fn dispatch_sync_mkdir(
-    params: serde_json::Value,
+    params: SyncMkdirParams,
     config: &ServerConfig,
     sync_store: &SyncStore,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<SyncMkdirParams>(params, "expected serial and remote_path")?;
+) -> Result<SyncMkdirResult, RpcError> {
     require_serial(&params.serial, config)?;
     sync_store
         .create_directory(&params.remote_path)
         .map_err(StoreError::into_rpc)
 }
 
-fn dispatch_exec(
-    params: serde_json::Value,
-    config: &ServerConfig,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<ExecParams>(
-        params,
-        "expected serial, argv, cwd, environment, and timeout_ms",
-    )?;
+fn dispatch_exec(params: ExecParams, config: &ServerConfig) -> Result<ExecResult, RpcError> {
     require_serial(&params.serial, config)?;
     match exec::run(&params) {
         Ok(result) => Ok(result),
@@ -1256,20 +1328,15 @@ fn dispatch_exec(
     }
 }
 
-fn dispatch_app_list(
-    params: serde_json::Value,
-    config: &ServerConfig,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<SerialParams>(params, "expected serial")?;
+fn dispatch_app_list(params: SerialParams, config: &ServerConfig) -> Result<AppList, RpcError> {
     require_serial(&params.serial, config)?;
     config.applications.list()
 }
 
 fn dispatch_process_list(
-    params: serde_json::Value,
+    params: SerialParams,
     config: &ServerConfig,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<SerialParams>(params, "expected serial")?;
+) -> Result<ProcessList, RpcError> {
     require_serial(&params.serial, config)?;
     let mut list = services::process_list(&config.proc_root)?;
     config.applications.annotate_processes(&mut list)?;
@@ -1277,10 +1344,9 @@ fn dispatch_process_list(
 }
 
 fn dispatch_process_signal(
-    params: serde_json::Value,
+    params: ProcessSignalParams,
     config: &ServerConfig,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<ProcessSignalParams>(params, "expected serial, pid, and signal")?;
+) -> Result<ProcessSummary, RpcError> {
     require_serial(&params.serial, config)?;
     config
         .applications
@@ -1289,23 +1355,18 @@ fn dispatch_process_signal(
 }
 
 fn dispatch_log_tail(
-    params: serde_json::Value,
+    params: LogTailParams,
     config: &ServerConfig,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<LogTailParams>(params, "expected serial, cursor, and limit")?;
+) -> Result<LogSnapshot, RpcError> {
     require_serial(&params.serial, config)?;
     services::log_tail(&config.log_path, &params)
 }
 
 fn dispatch_app_install(
-    params: serde_json::Value,
+    params: DeviceAppInstallParams,
     config: &ServerConfig,
     sync_store: &SyncStore,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<DeviceAppInstallParams>(
-        params,
-        "expected serial, remote_path, and file_hash",
-    )?;
+) -> Result<AppSummary, RpcError> {
     require_serial(&params.serial, config)?;
     let mut bundle = sync_store
         .open_committed(&params.remote_path)
@@ -1314,58 +1375,49 @@ fn dispatch_app_install(
 }
 
 fn dispatch_app_start(
-    params: serde_json::Value,
+    params: AppTargetParams,
     config: &ServerConfig,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
+) -> Result<AppSummary, RpcError> {
     require_serial(&params.serial, config)?;
     config.applications.start(&params.app_id)
 }
 
 fn dispatch_app_log(
-    params: serde_json::Value,
+    params: AppLogParams,
     config: &ServerConfig,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<kindlebridge_schema::AppLogParams>(
-        params,
-        "expected serial, app_id, run_id, cursors, and max_bytes",
-    )?;
+) -> Result<AppLogSnapshot, RpcError> {
     require_serial(&params.serial, config)?;
     config.applications.log(&params)
 }
 
 fn dispatch_app_stop(
-    params: serde_json::Value,
+    params: AppTargetParams,
     config: &ServerConfig,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
+) -> Result<AppSummary, RpcError> {
     require_serial(&params.serial, config)?;
     config.applications.stop(&params.app_id)
 }
 
 fn dispatch_app_restart(
-    params: serde_json::Value,
+    params: AppTargetParams,
     config: &ServerConfig,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
+) -> Result<AppSummary, RpcError> {
     require_serial(&params.serial, config)?;
     config.applications.restart(&params.app_id)
 }
 
 fn dispatch_app_rollback(
-    params: serde_json::Value,
+    params: AppTargetParams,
     config: &ServerConfig,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
+) -> Result<AppSummary, RpcError> {
     require_serial(&params.serial, config)?;
     config.applications.rollback(&params.app_id)
 }
 
 fn dispatch_app_uninstall(
-    params: serde_json::Value,
+    params: AppTargetParams,
     config: &ServerConfig,
-) -> Result<impl Serialize, RpcError> {
-    let params = decode_params::<AppTargetParams>(params, "expected serial and app_id")?;
+) -> Result<AppSummary, RpcError> {
     require_serial(&params.serial, config)?;
     config.applications.uninstall(&params.app_id)
 }
@@ -1495,6 +1547,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Condvar, Mutex};
     use std::time::Duration;
+
+    use kindlebridge_schema::methods;
 
     use super::*;
 
