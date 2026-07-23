@@ -12,13 +12,12 @@ use std::cell::Cell;
 
 use kindlebridge_schema::device_protocol::is_valid_transfer_id;
 use kindlebridge_schema::{
-    error_codes, RpcError, SyncEntry, SyncEntryKind, SyncListResult, SyncMkdirResult, SyncStatus,
-    TransferDirection, TransferState,
+    error_codes, LogicalSyncPath, LogicalSyncPathError, RpcError, SyncEntry, SyncEntryKind,
+    SyncListResult, SyncMkdirResult, SyncStatus, TransferDirection, TransferState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
-use unicode_normalization::UnicodeNormalization;
 
 pub const SYNC_BLOCK_SIZE: u64 = 65_536;
 // A checkpoint forces both data and metadata to stable storage. On the Kindle
@@ -37,65 +36,9 @@ thread_local! {
     static HASH_PREFIX_CALLS: Cell<u64> = const { Cell::new(0) };
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct LogicalPath(String);
-
-impl LogicalPath {
-    pub fn parse(value: impl Into<String>) -> Result<Self, PathError> {
-        let value = value.into();
-        if value.is_empty() || value.starts_with('/') || value.contains('\\') {
-            return Err(PathError::NotRelative);
-        }
-        if value.len() > 1_024 {
-            return Err(PathError::TooLong);
-        }
-        if value.chars().any(|character| character.is_control()) {
-            return Err(PathError::ControlCharacter);
-        }
-        if value.nfc().ne(value.chars()) {
-            return Err(PathError::NotNfc);
-        }
-        for component in value.split('/') {
-            if component.is_empty() || matches!(component, "." | "..") {
-                return Err(PathError::InvalidComponent);
-            }
-            if component.len() > 255 {
-                return Err(PathError::ComponentTooLong);
-            }
-        }
-        Ok(Self(value))
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    #[must_use]
-    pub fn ascii_case_fold_key(&self) -> String {
-        self.0.to_ascii_lowercase()
-    }
-}
-
-#[derive(Debug, Error, Eq, PartialEq)]
-pub enum PathError {
-    #[error("path must be non-empty, relative, and use forward slashes")]
-    NotRelative,
-    #[error("path exceeds 1024 UTF-8 bytes")]
-    TooLong,
-    #[error("path component exceeds 255 UTF-8 bytes")]
-    ComponentTooLong,
-    #[error("path contains an empty, dot, or dot-dot component")]
-    InvalidComponent,
-    #[error("path contains a control character")]
-    ControlCharacter,
-    #[error("path is not Unicode NFC")]
-    NotNfc,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncFileSpec {
-    pub path: LogicalPath,
+    pub path: LogicalSyncPath,
     pub size: u64,
     pub digest: [u8; 32],
 }
@@ -144,7 +87,7 @@ pub enum SyncPhase {
 pub struct SyncTransaction {
     id: String,
     phase: SyncPhase,
-    files: BTreeMap<LogicalPath, SyncFileState>,
+    files: BTreeMap<LogicalSyncPath, SyncFileState>,
 }
 
 impl SyncTransaction {
@@ -155,7 +98,7 @@ impl SyncTransaction {
         }
 
         let mut files = BTreeMap::new();
-        let mut folded_paths = BTreeMap::<String, LogicalPath>::new();
+        let mut folded_paths = BTreeMap::<String, LogicalSyncPath>::new();
         for spec in specs {
             let folded = spec.path.ascii_case_fold_key();
             if let Some(previous) = folded_paths.insert(folded, spec.path.clone()) {
@@ -199,7 +142,7 @@ impl SyncTransaction {
 
     pub fn record_block(
         &mut self,
-        path: &LogicalPath,
+        path: &LogicalSyncPath,
         index: u32,
         raw_len: u64,
         digest: [u8; 32],
@@ -229,7 +172,7 @@ impl SyncTransaction {
 
     pub fn verify_file(
         &mut self,
-        path: &LogicalPath,
+        path: &LogicalSyncPath,
         actual_digest: [u8; 32],
     ) -> Result<(), SyncError> {
         self.require_receiving()?;
@@ -279,14 +222,14 @@ pub enum SyncError {
     #[error("invalid transaction id")]
     InvalidTransactionId,
     #[error("duplicate path: {0:?}")]
-    DuplicatePath(LogicalPath),
+    DuplicatePath(LogicalSyncPath),
     #[error("ASCII case-fold collision between {first:?} and {second:?}")]
     CaseCollision {
-        first: LogicalPath,
-        second: LogicalPath,
+        first: LogicalSyncPath,
+        second: LogicalSyncPath,
     },
     #[error("unknown path: {0:?}")]
-    UnknownPath(LogicalPath),
+    UnknownPath(LogicalSyncPath),
     #[error("invalid block index: {0}")]
     InvalidBlockIndex(u32),
     #[error("invalid block length: expected {expected}, got {actual}")]
@@ -357,7 +300,7 @@ impl SyncStore {
         total_size: u64,
         file_hash: &str,
     ) -> Result<PushTransfer, StoreError> {
-        let logical = LogicalPath::parse(remote_path.to_owned())?;
+        let logical = LogicalSyncPath::parse(remote_path.to_owned())?;
         parse_hash(file_hash)?;
         self.ensure_layout()?;
 
@@ -426,7 +369,7 @@ impl SyncStore {
         remote_path: &str,
         offset: u64,
     ) -> Result<PullTransfer, StoreError> {
-        let logical = LogicalPath::parse(remote_path.to_owned())?;
+        let logical = LogicalSyncPath::parse(remote_path.to_owned())?;
         self.ensure_layout()?;
         let target = self.open_existing_target(&logical)?;
         let mut file = File::open(target)?;
@@ -492,13 +435,13 @@ impl SyncStore {
     /// Open a fully committed sync file through the same confined path checks
     /// used by pull. Staging files and absolute/traversal paths are unreachable.
     pub fn open_committed(&self, remote_path: &str) -> Result<File, StoreError> {
-        let logical = LogicalPath::parse(remote_path.to_owned())?;
+        let logical = LogicalSyncPath::parse(remote_path.to_owned())?;
         self.ensure_layout()?;
         File::open(self.open_existing_target(&logical)?).map_err(StoreError::Io)
     }
 
     pub fn create_directory(&self, remote_path: &str) -> Result<SyncMkdirResult, StoreError> {
-        let logical = LogicalPath::parse(remote_path.to_owned())?;
+        let logical = LogicalSyncPath::parse(remote_path.to_owned())?;
         self.ensure_layout()?;
         let mut current = self.root.clone();
         let mut created = false;
@@ -529,14 +472,14 @@ impl SyncStore {
         if limit == 0 || limit > 1024 {
             return Err(StoreError::InvalidListLimit);
         }
-        let logical = LogicalPath::parse(remote_path.to_owned())?;
+        let logical = LogicalSyncPath::parse(remote_path.to_owned())?;
         let cursor = cursor
             .map(|value| {
-                let parsed = LogicalPath::parse(value.to_owned())?;
+                let parsed = LogicalSyncPath::parse(value.to_owned())?;
                 if parsed.as_str().contains('/') {
-                    return Err(PathError::InvalidComponent);
+                    return Err(LogicalSyncPathError::InvalidComponent);
                 }
-                Ok(parsed.0)
+                Ok(parsed.into_string())
             })
             .transpose()?;
         self.ensure_layout()?;
@@ -551,7 +494,7 @@ impl SyncStore {
                 .file_name()
                 .into_string()
                 .map_err(|_| StoreError::UnsafePath)?;
-            let name = LogicalPath::parse(name)?.0;
+            let name = LogicalSyncPath::parse(name)?.into_string();
             let metadata = fs::symlink_metadata(entry.path())?;
             let (kind, size) = if metadata.file_type().is_symlink() {
                 return Err(StoreError::UnsafePath);
@@ -624,7 +567,7 @@ impl SyncStore {
         Ok(())
     }
 
-    fn commit_target(&self, logical: &LogicalPath, staging: &Path) -> Result<(), StoreError> {
+    fn commit_target(&self, logical: &LogicalSyncPath, staging: &Path) -> Result<(), StoreError> {
         let target = self.prepare_target(logical)?;
         if target.exists() {
             let metadata = fs::symlink_metadata(&target)?;
@@ -638,7 +581,7 @@ impl SyncStore {
         Ok(())
     }
 
-    fn prepare_target(&self, logical: &LogicalPath) -> Result<PathBuf, StoreError> {
+    fn prepare_target(&self, logical: &LogicalSyncPath) -> Result<PathBuf, StoreError> {
         let mut current = self.root.clone();
         let mut components = logical.as_str().split('/').peekable();
         while let Some(component) = components.next() {
@@ -658,7 +601,7 @@ impl SyncStore {
         Ok(current)
     }
 
-    fn open_existing_target(&self, logical: &LogicalPath) -> Result<PathBuf, StoreError> {
+    fn open_existing_target(&self, logical: &LogicalSyncPath) -> Result<PathBuf, StoreError> {
         let mut current = self.root.clone();
         for component in logical.as_str().split('/') {
             current.push(component);
@@ -679,7 +622,7 @@ impl SyncStore {
         Ok(current)
     }
 
-    fn open_existing_directory(&self, logical: &LogicalPath) -> Result<PathBuf, StoreError> {
+    fn open_existing_directory(&self, logical: &LogicalSyncPath) -> Result<PathBuf, StoreError> {
         let mut current = self.root.clone();
         for component in logical.as_str().split('/') {
             current.push(component);
@@ -813,7 +756,7 @@ impl PushTransfer {
             return Err(StoreError::ChecksumMismatch);
         }
         drop(file);
-        let logical = LogicalPath::parse(self.metadata.remote_path.clone())?;
+        let logical = LogicalSyncPath::parse(self.metadata.remote_path.clone())?;
         self.store
             .commit_target(&logical, &self.store.part_path(&self.metadata.transfer_id))?;
         self.metadata.state = TransferState::Complete;
@@ -883,7 +826,7 @@ impl PullTransfer {
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error(transparent)]
-    Path(#[from] PathError),
+    Path(#[from] LogicalSyncPathError),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -1031,18 +974,25 @@ mod tests {
     #[test]
     fn rejects_escape_and_non_normalized_paths() {
         assert_eq!(
-            LogicalPath::parse("../etc/passwd"),
-            Err(PathError::InvalidComponent)
+            LogicalSyncPath::parse("../etc/passwd"),
+            Err(LogicalSyncPathError::InvalidComponent)
         );
         assert_eq!(
-            LogicalPath::parse("assets/e\u{301}.txt"),
-            Err(PathError::NotNfc)
+            LogicalSyncPath::parse("assets/e\u{301}.txt"),
+            Err(LogicalSyncPathError::NotNfc)
         );
     }
 
     #[test]
+    fn path_errors_keep_the_precise_invalid_params_shape() {
+        let error = StoreError::Path(LogicalSyncPathError::NotNfc).into_rpc();
+
+        assert_eq!(error, RpcError::invalid_params("path is not Unicode NFC"));
+    }
+
+    #[test]
     fn resumable_blocks_are_idempotent_but_not_replaceable() {
-        let path = LogicalPath::parse("bin/app").unwrap();
+        let path = LogicalSyncPath::parse("bin/app").unwrap();
         let file_digest = [9; 32];
         let mut transaction = SyncTransaction::new(
             "tx-1",
@@ -1076,12 +1026,12 @@ mod tests {
             "tx",
             vec![
                 SyncFileSpec {
-                    path: LogicalPath::parse("Assets/Icon.png").unwrap(),
+                    path: LogicalSyncPath::parse("Assets/Icon.png").unwrap(),
                     size: 0,
                     digest: [0; 32],
                 },
                 SyncFileSpec {
-                    path: LogicalPath::parse("assets/icon.png").unwrap(),
+                    path: LogicalSyncPath::parse("assets/icon.png").unwrap(),
                     size: 0,
                     digest: [0; 32],
                 },
@@ -1218,7 +1168,7 @@ mod tests {
         assert_eq!(pull.finish().unwrap().state, TransferState::Complete);
         assert!(matches!(
             store.begin_pull(None, "../outside", 0),
-            Err(StoreError::Path(PathError::InvalidComponent))
+            Err(StoreError::Path(LogicalSyncPathError::InvalidComponent))
         ));
         fs::remove_dir_all(root).unwrap();
     }
