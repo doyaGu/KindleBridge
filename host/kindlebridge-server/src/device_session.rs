@@ -75,11 +75,6 @@ pub struct ConnectedDeviceProvider {
     devices: Vec<ConnectedDevice>,
 }
 
-pub struct ReconnectingUsbProvider {
-    criteria: UsbMatch,
-    current: Mutex<Option<std::sync::Arc<ConnectedDeviceProvider>>>,
-}
-
 impl ConnectedDeviceProvider {
     pub fn connect(addresses: &[SocketAddr]) -> Result<Self, ProviderError> {
         let mut devices = Vec::with_capacity(addresses.len());
@@ -171,175 +166,12 @@ impl ConnectedDeviceProvider {
             .find(|device| device.summary.serial == serial)
     }
 
-    fn is_online(&self) -> bool {
+    pub(crate) fn is_online(&self) -> bool {
         !self.devices.is_empty()
             && self
                 .devices
                 .iter()
                 .all(|device| device.session.connection.is_online())
-    }
-}
-
-impl ReconnectingUsbProvider {
-    #[must_use]
-    pub fn new(criteria: UsbMatch) -> Self {
-        Self {
-            criteria,
-            current: Mutex::new(None),
-        }
-    }
-
-    fn connected(&self) -> Result<std::sync::Arc<ConnectedDeviceProvider>, ProviderError> {
-        let mut current = self
-            .current
-            .lock()
-            .map_err(|_| ProviderError::new("USB provider state is unavailable"))?;
-        if let Some(provider) = current.as_ref().filter(|provider| provider.is_online()) {
-            return Ok(std::sync::Arc::clone(provider));
-        }
-        *current = None;
-        let provider = std::sync::Arc::new(ConnectedDeviceProvider::connect_usb(&self.criteria)?);
-        if provider.is_online() {
-            *current = Some(std::sync::Arc::clone(&provider));
-        }
-        Ok(provider)
-    }
-
-    fn invalidate(&self, failed: &std::sync::Arc<ConnectedDeviceProvider>) {
-        if let Ok(mut current) = self.current.lock() {
-            if current
-                .as_ref()
-                .is_some_and(|provider| std::sync::Arc::ptr_eq(provider, failed))
-            {
-                *current = None;
-            }
-        }
-    }
-
-    fn rpc<T>(
-        &self,
-        operation: impl FnOnce(&ConnectedDeviceProvider) -> Result<T, RpcError>,
-    ) -> Result<T, RpcError> {
-        let provider = self.connected().map_err(|error| {
-            RpcError::new(error_codes::SERVER_NOT_READY, "Device link is unavailable")
-                .with_data(serde_json::json!({ "reason": error.to_string() }))
-        })?;
-        let result = operation(&provider);
-        if result
-            .as_ref()
-            .is_err_and(|error| error.code == error_codes::SERVER_NOT_READY)
-        {
-            self.invalidate(&provider);
-        }
-        result
-    }
-}
-
-impl DeviceProvider for ReconnectingUsbProvider {
-    fn list(&self) -> Result<Vec<DeviceSummary>, ProviderError> {
-        self.connected()?.list()
-    }
-
-    fn features(&self, serial: &str) -> Result<Option<DeviceFeatures>, ProviderError> {
-        self.connected()?.features(serial)
-    }
-
-    fn ping(&self, serial: &str) -> Result<bool, RpcError> {
-        self.rpc(|provider| provider.ping(serial))
-    }
-
-    fn exec(&self, params: &ExecParams) -> Result<Option<ExecResult>, RpcError> {
-        self.rpc(|provider| provider.exec(params))
-    }
-
-    fn sync_push(&self, params: SyncPushParams) -> Result<SyncPushResult, RpcError> {
-        self.rpc(|provider| provider.sync_push(params))
-    }
-
-    fn sync_push_observed(
-        &self,
-        params: SyncPushParams,
-        observer: &SyncObserver,
-    ) -> Result<SyncPushResult, RpcError> {
-        self.rpc(|provider| provider.sync_push_observed(params, observer))
-    }
-
-    fn sync_pull(&self, params: SyncPullParams) -> Result<SyncPullResult, RpcError> {
-        self.rpc(|provider| provider.sync_pull(params))
-    }
-
-    fn sync_pull_observed(
-        &self,
-        params: SyncPullParams,
-        observer: &SyncObserver,
-    ) -> Result<SyncPullResult, RpcError> {
-        self.rpc(|provider| provider.sync_pull_observed(params, observer))
-    }
-
-    fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError> {
-        self.rpc(|provider| provider.sync_status(params))
-    }
-
-    fn sync_list(&self, params: &SyncListParams) -> Result<SyncListResult, RpcError> {
-        self.rpc(|provider| provider.sync_list(params))
-    }
-
-    fn sync_mkdir(&self, params: &SyncMkdirParams) -> Result<SyncMkdirResult, RpcError> {
-        self.rpc(|provider| provider.sync_mkdir(params))
-    }
-
-    fn app_install(&self, params: AppInstallParams) -> Result<AppSummary, RpcError> {
-        self.rpc(|provider| provider.app_install(params))
-    }
-
-    fn app_start(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        self.rpc(|provider| provider.app_start(params))
-    }
-
-    fn app_log(
-        &self,
-        params: &kindlebridge_schema::AppLogParams,
-    ) -> Result<kindlebridge_schema::AppLogSnapshot, RpcError> {
-        self.rpc(|provider| provider.app_log(params))
-    }
-
-    fn app_stop(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        self.rpc(|provider| provider.app_stop(params))
-    }
-
-    fn app_restart(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        self.rpc(|provider| provider.app_restart(params))
-    }
-
-    fn app_rollback(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        self.rpc(|provider| provider.app_rollback(params))
-    }
-
-    fn app_uninstall(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
-        self.rpc(|provider| provider.app_uninstall(params))
-    }
-
-    fn app_list(&self, params: &SerialParams) -> Result<AppList, RpcError> {
-        self.rpc(|provider| provider.app_list(params))
-    }
-
-    fn process_list(&self, params: &SerialParams) -> Result<ProcessList, RpcError> {
-        self.rpc(|provider| provider.process_list(params))
-    }
-
-    fn process_signal(&self, params: &ProcessSignalParams) -> Result<ProcessSummary, RpcError> {
-        self.rpc(|provider| provider.process_signal(params))
-    }
-
-    fn log_tail(&self, params: &LogTailParams) -> Result<LogSnapshot, RpcError> {
-        self.rpc(|provider| provider.log_tail(params))
-    }
-
-    fn shell_open(
-        &self,
-        params: &kindlebridge_schema::ShellOpenParams,
-    ) -> Result<std::sync::Arc<dyn crate::ShellStream>, RpcError> {
-        self.rpc(|provider| DeviceProvider::shell_open(provider, params))
     }
 }
 

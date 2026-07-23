@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use interprocess::local_socket::prelude::*;
 use kindlebridge_server::{
-    reset_server_stop_requested, serve_streaming, server_stop_requested, ConnectedDeviceProvider,
-    DeviceProvider, DeviceRecord, MemoryDeviceProvider, ReconnectingUsbProvider,
+    reset_server_stop_requested, serve_streaming, server_stop_requested, DeviceRecord,
+    DeviceRegistry, MemoryDeviceProvider,
 };
 use kindlebridge_transport_usb::UsbMatch;
 
@@ -83,19 +83,16 @@ fn run(args: Args) -> Result<(), String> {
         return Err("--usb-serial requires --usb".to_owned());
     }
     let _parent_watchdog = start_parent_watchdog(args.parent_watchdog)?;
-    let provider: Arc<dyn DeviceProvider> = if args.usb {
-        Arc::new(ReconnectingUsbProvider::new(UsbMatch {
+    let registry = if args.usb {
+        DeviceRegistry::connect_usb(UsbMatch {
             vendor_id: AMAZON_VENDOR_ID,
             product_id: args.usb_product_id,
             interface_subclass: KINDLEBRIDGE_USB_SUBCLASS,
             interface_protocol: KINDLEBRIDGE_USB_PROTOCOL,
             serial_number: args.usb_serial,
-        }))
+        })
     } else if !args.tcp_device.is_empty() {
-        Arc::new(
-            ConnectedDeviceProvider::connect(&args.tcp_device)
-                .map_err(|error| error.to_string())?,
-        )
+        DeviceRegistry::connect_tcp(&args.tcp_device).map_err(|error| error.to_string())?
     } else {
         let records = match args.devices_file {
             Some(path) => {
@@ -107,24 +104,22 @@ fn run(args: Args) -> Result<(), String> {
             }
             None => Vec::new(),
         };
-        Arc::new(MemoryDeviceProvider::new(records))
+        DeviceRegistry::direct(Arc::new(MemoryDeviceProvider::new(records)))
     };
+    let registry = Arc::new(registry);
     if args.stdio {
         serve_streaming(
             &mut BufReader::new(io::stdin()),
             BufWriter::new(io::stdout()),
-            provider,
+            registry,
         )
         .map_err(|error| error.to_string())
     } else {
-        run_local_service(provider, Duration::from_secs(args.idle_timeout_secs))
+        run_local_service(registry, Duration::from_secs(args.idle_timeout_secs))
     }
 }
 
-fn run_local_service(
-    provider: Arc<dyn DeviceProvider>,
-    idle_timeout: Duration,
-) -> Result<(), String> {
+fn run_local_service(registry: Arc<DeviceRegistry>, idle_timeout: Duration) -> Result<(), String> {
     reset_server_stop_requested();
     let listener = kindlebridge_local::bind().map_err(|error| error.to_string())?;
 
@@ -137,7 +132,7 @@ fn run_local_service(
         match listener.accept() {
             Ok(connection) => {
                 active_clients.fetch_add(1, Ordering::AcqRel);
-                let provider = Arc::clone(&provider);
+                let registry = Arc::clone(&registry);
                 let active_clients = Arc::clone(&active_clients);
                 thread::Builder::new()
                     .name("kindlebridge-local-client".to_owned())
@@ -147,7 +142,7 @@ fn run_local_service(
                         let _ = serve_streaming(
                             &mut BufReader::new(reader),
                             BufWriter::new(writer),
-                            provider,
+                            registry,
                         );
                     })
                     .map_err(|error| format!("could not start local client worker: {error}"))?;

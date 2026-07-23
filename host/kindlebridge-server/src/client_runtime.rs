@@ -18,7 +18,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::{
-    handle_request, to_value, DeviceProvider, DeviceShellEvent, ServeError, ShellStream,
+    handle_registry_request, to_value, DeviceRegistry, DeviceShellEvent, ServeError, ShellStream,
     SyncObserver,
 };
 
@@ -26,16 +26,16 @@ const MAX_CLIENT_SYNC_JOBS: usize = 4;
 
 pub(super) struct ClientRuntime<W> {
     writer: Arc<Mutex<W>>,
-    provider: Arc<dyn DeviceProvider>,
+    registry: Arc<DeviceRegistry>,
     streams: Arc<Mutex<HashMap<String, Arc<dyn ShellStream>>>>,
     sync_jobs: Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>,
 }
 
 impl<W> ClientRuntime<W> {
-    pub(super) fn new(writer: W, provider: Arc<dyn DeviceProvider>) -> Self {
+    pub(super) fn new(writer: W, registry: Arc<DeviceRegistry>) -> Self {
         Self {
             writer: Arc::new(Mutex::new(writer)),
-            provider,
+            registry,
             streams: Arc::new(Mutex::new(HashMap::new())),
             sync_jobs: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -81,13 +81,13 @@ impl<W> Drop for ClientRuntime<W> {
 pub(super) fn serve_streaming<R, W>(
     reader: &mut R,
     writer: W,
-    provider: Arc<dyn DeviceProvider>,
+    registry: Arc<DeviceRegistry>,
 ) -> Result<(), ServeError>
 where
     R: BufRead,
     W: Write + Send + 'static,
 {
-    ClientRuntime::new(writer, provider).serve(reader)
+    ClientRuntime::new(writer, registry).serve(reader)
 }
 
 pub(super) fn cancel_sync_jobs(jobs: &Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>) {
@@ -126,12 +126,12 @@ where
             };
 
             if request.method == methods::SHELL_OPEN {
-                handle_shell_open(request, &self.writer, &self.provider, &self.streams)?;
+                handle_shell_open(request, &self.writer, &self.registry, &self.streams)?;
             } else if matches!(
                 request.method.as_str(),
                 methods::SYNC_PUSH_STREAM | methods::SYNC_PULL_STREAM
             ) {
-                handle_sync_open(request, &self.writer, &self.provider, &self.sync_jobs)?;
+                handle_sync_open(request, &self.writer, &self.registry, &self.sync_jobs)?;
             } else if request.method == methods::SYNC_CANCEL {
                 handle_sync_cancel(request, &self.sync_jobs);
             } else if matches!(
@@ -142,7 +142,7 @@ where
                     | methods::STREAM_CLOSE
             ) {
                 handle_stream_notification(request, &self.writer, &self.streams)?;
-            } else if let Some(response) = handle_request(request, self.provider.as_ref()) {
+            } else if let Some(response) = handle_registry_request(request, &self.registry) {
                 write_shared(&self.writer, &response)?;
             }
         }
@@ -152,7 +152,7 @@ where
 pub(super) fn handle_sync_open<W: Write + Send + 'static>(
     request: RpcRequest,
     writer: &Arc<Mutex<W>>,
-    provider: &Arc<dyn DeviceProvider>,
+    registry: &Arc<DeviceRegistry>,
     jobs: &Arc<Mutex<HashMap<String, Arc<SyncObserver>>>>,
 ) -> Result<(), ServeError> {
     let Some(id) = request.id else {
@@ -195,7 +195,7 @@ pub(super) fn handle_sync_open<W: Write + Send + 'static>(
     let method = request.method;
     let params = request.params;
     let writer = Arc::clone(writer);
-    let provider = Arc::clone(provider);
+    let registry = Arc::clone(registry);
     let jobs = Arc::clone(jobs);
     thread::spawn(move || {
         let result = if method == methods::SYNC_PUSH_STREAM {
@@ -217,7 +217,7 @@ pub(super) fn handle_sync_open<W: Write + Send + 'static>(
                         &operation_id,
                         TransferDirection::Push,
                         &remote_path,
-                        || provider.sync_push_observed(params, &observer),
+                        || registry.rpc(|provider| provider.sync_push_observed(params, &observer)),
                     )
                 }
                 Err(error) => Err(error),
@@ -238,7 +238,7 @@ pub(super) fn handle_sync_open<W: Write + Send + 'static>(
                         &operation_id,
                         TransferDirection::Pull,
                         &remote_path,
-                        || provider.sync_pull_observed(params, &observer),
+                        || registry.rpc(|provider| provider.sync_pull_observed(params, &observer)),
                     )
                 }
                 Err(error) => Err(error),
@@ -324,7 +324,7 @@ fn handle_sync_cancel(request: RpcRequest, jobs: &Arc<Mutex<HashMap<String, Arc<
 pub(super) fn handle_shell_open<W: Write + Send + 'static>(
     request: RpcRequest,
     writer: &Arc<Mutex<W>>,
-    provider: &Arc<dyn DeviceProvider>,
+    registry: &Arc<DeviceRegistry>,
     streams: &Arc<Mutex<HashMap<String, Arc<dyn ShellStream>>>>,
 ) -> Result<(), ServeError> {
     let Some(id) = request.id else {
@@ -338,7 +338,7 @@ pub(super) fn handle_shell_open<W: Write + Send + 'static>(
                 RpcError::invalid_params("expected serial and valid shell open fields")
             })
         })
-        .and_then(|params| provider.shell_open(&params))
+        .and_then(|params| registry.rpc(|provider| provider.shell_open(&params)))
         .and_then(|shell| {
             let stream_id = random_stream_id().map_err(|_| RpcError::internal_error())?;
             streams

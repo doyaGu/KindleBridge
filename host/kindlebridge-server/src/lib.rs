@@ -1,6 +1,7 @@
 //! `KindleBridge` host RPC server.
 
 mod client_runtime;
+mod device_registry;
 mod device_session;
 mod runtime;
 
@@ -42,9 +43,8 @@ use runtime::RuntimeState;
 
 static SERVER_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-pub use device_session::{
-    ConnectedDeviceProvider, DeviceShell, DeviceShellEvent, ReconnectingUsbProvider,
-};
+pub use device_registry::DeviceRegistry;
+pub use device_session::{ConnectedDeviceProvider, DeviceShell, DeviceShellEvent};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRecord {
@@ -661,6 +661,14 @@ fn dispatch<P: DeviceProvider + ?Sized>(
     }
 }
 
+fn handle_registry_request(request: RpcRequest, registry: &DeviceRegistry) -> Option<RpcResponse> {
+    let result = registry.rpc(|provider| dispatch(&request, provider));
+    request.id.map(|id| match result {
+        Ok(value) => RpcResponse::success(id, value),
+        Err(error) => RpcResponse::failure(id, error),
+    })
+}
+
 #[must_use]
 pub fn server_stop_requested() -> bool {
     SERVER_STOP_REQUESTED.load(Ordering::Acquire)
@@ -691,7 +699,7 @@ fn require_empty_params(params: Option<&Value>) -> Result<(), RpcError> {
     }
 }
 
-fn provider_rpc_error(error: ProviderError) -> RpcError {
+pub(crate) fn provider_rpc_error(error: ProviderError) -> RpcError {
     // Most provider details can contain host paths or transport internals. Only errors
     // explicitly constructed as public are safe and actionable at the CLI boundary.
     RpcError::new(
@@ -740,13 +748,13 @@ pub fn serve<R: BufRead, W: Write, P: DeviceProvider + ?Sized>(
 pub fn serve_streaming<R, W>(
     reader: &mut R,
     writer: W,
-    provider: Arc<dyn DeviceProvider>,
+    registry: Arc<DeviceRegistry>,
 ) -> Result<(), ServeError>
 where
     R: BufRead,
     W: Write + Send + 'static,
 {
-    client_runtime::serve_streaming(reader, writer, provider)
+    client_runtime::serve_streaming(reader, writer, registry)
 }
 
 #[cfg(test)]
@@ -980,14 +988,14 @@ mod tests {
             )),
             DeviceShellEvent::Closed,
         ]));
-        let provider: Arc<dyn DeviceProvider> = Arc::new(ShellProvider {
+        let registry = Arc::new(DeviceRegistry::direct(Arc::new(ShellProvider {
             shell: Arc::clone(&shell),
-        });
+        })));
         let output = SharedOutput::default();
         let writer = Arc::new(Mutex::new(output.clone()));
         let streams = Arc::new(Mutex::new(HashMap::new()));
 
-        handle_shell_open(shell_open_request(), &writer, &provider, &streams).unwrap();
+        handle_shell_open(shell_open_request(), &writer, &registry, &streams).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         while output.frames.load(Ordering::Acquire) < 5 && Instant::now() < deadline {
             thread::yield_now();
@@ -1028,7 +1036,7 @@ mod tests {
         let source =
             std::env::temp_dir().join(format!("kindlebridge-progress-{}.bin", std::process::id()));
         fs::write(&source, b"progress payload").unwrap();
-        let provider: Arc<dyn DeviceProvider> = Arc::new(provider());
+        let registry = Arc::new(DeviceRegistry::direct(Arc::new(provider())));
         let output = SharedOutput::default();
         let writer = Arc::new(Mutex::new(output.clone()));
         let jobs = Arc::new(Mutex::new(HashMap::new()));
@@ -1047,7 +1055,7 @@ mod tests {
             ),
         );
 
-        handle_sync_open(request, &writer, &provider, &jobs).unwrap();
+        handle_sync_open(request, &writer, &registry, &jobs).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         while (!jobs.lock().unwrap().is_empty() || output.frames.load(Ordering::Acquire) < 2)
             && Instant::now() < deadline
@@ -1076,7 +1084,10 @@ mod tests {
         let shell = Arc::new(FakeShell::new([]));
         let first = Arc::new(SyncObserver::default());
         let second = Arc::new(SyncObserver::default());
-        let runtime = ClientRuntime::new(Vec::<u8>::new(), Arc::new(provider()));
+        let runtime = ClientRuntime::new(
+            Vec::<u8>::new(),
+            Arc::new(DeviceRegistry::direct(Arc::new(provider()))),
+        );
         let shell_stream: Arc<dyn ShellStream> = shell.clone();
         runtime.track_shell("shell".to_owned(), shell_stream);
         runtime.track_sync("first".to_owned(), Arc::clone(&first));
@@ -1096,7 +1107,10 @@ mod tests {
         let shell = Arc::new(FakeShell::new([]));
         let observer = Arc::new(SyncObserver::default());
         {
-            let runtime = ClientRuntime::new(Vec::<u8>::new(), Arc::new(provider()));
+            let runtime = ClientRuntime::new(
+                Vec::<u8>::new(),
+                Arc::new(DeviceRegistry::direct(Arc::new(provider()))),
+            );
             let shell_stream: Arc<dyn ShellStream> = shell.clone();
             runtime.track_shell("shell".to_owned(), shell_stream);
             runtime.track_sync("sync".to_owned(), Arc::clone(&observer));
