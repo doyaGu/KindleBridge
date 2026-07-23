@@ -43,7 +43,10 @@ case "$command_name" in
     sleep)
         record "sleep $*"
         if test "${KINDLEBRIDGE_TEST_REAL_SLEEP:-0}" = 1; then
-            /usr/bin/sleep 0.05
+            # Keep lifecycle tests fast, but leave enough wall-clock time for
+            # a background monitor to pass through nohup and exec on a busy
+            # shared CI runner before its PID ownership is inspected.
+            /usr/bin/sleep 0.2
         fi
         ;;
     lipc-get-prop)
