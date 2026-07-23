@@ -100,6 +100,10 @@ fn raw_shell_streams_32_mib_without_truncation() {
         match worker.recv_timeout(Duration::from_secs(30)).unwrap() {
             ShellEvent::Stdout(bytes) => {
                 assert!(bytes.iter().all(|byte| *byte == 0));
+                assert!(
+                    bytes.len()
+                        <= kindlebridge_schema::shell_protocol::USB_ALIGNED_SHELL_PACKET_PAYLOAD
+                );
                 received += bytes.len();
             }
             ShellEvent::Stderr(bytes) => panic!("unexpected stderr: {bytes:?}"),

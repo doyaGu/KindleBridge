@@ -598,6 +598,7 @@ dependencies = [
 name = "kindlebridge-schema"
 version = "0.1.0-dev.36"
 dependencies = [
+ "kindlebridge-wire",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

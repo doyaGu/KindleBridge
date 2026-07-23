@@ -6,6 +6,10 @@ use crate::device_protocol::TerminalSize;
 
 pub const MAX_SHELL_PACKET_PAYLOAD: usize = 16 * 1024;
 const HEADER_LENGTH: usize = 5;
+/// Preferred data payload for the production 16 KiB FunctionFS request.
+/// The Shell packet and fixed KBP header then fit in exactly one request.
+pub const USB_ALIGNED_SHELL_PACKET_PAYLOAD: usize =
+    16 * 1024 - kindlebridge_wire::HEADER_LEN - HEADER_LENGTH;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PacketSource {

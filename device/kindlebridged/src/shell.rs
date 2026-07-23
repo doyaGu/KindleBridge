@@ -8,7 +8,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use kindlebridge_schema::device_protocol::{ShellMode, ShellOpen, TerminalSize};
-use kindlebridge_schema::shell_protocol::{ShellExit, MAX_SHELL_PACKET_PAYLOAD};
+use kindlebridge_schema::shell_protocol::{
+    ShellExit, MAX_SHELL_PACKET_PAYLOAD, USB_ALIGNED_SHELL_PACKET_PAYLOAD,
+};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use thiserror::Error;
 
@@ -311,7 +313,7 @@ fn pump_output(
     events: SyncSender<ShellEvent>,
     event: fn(Vec<u8>) -> ShellEvent,
 ) {
-    let mut buffer = vec![0_u8; MAX_SHELL_PACKET_PAYLOAD];
+    let mut buffer = vec![0_u8; USB_ALIGNED_SHELL_PACKET_PAYLOAD];
     loop {
         match reader.read(&mut buffer) {
             Ok(0) | Err(_) => break,

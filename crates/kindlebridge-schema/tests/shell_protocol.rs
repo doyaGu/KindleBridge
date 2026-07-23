@@ -3,8 +3,16 @@ use kindlebridge_schema::device_protocol::{
 };
 use kindlebridge_schema::shell_protocol::{
     PacketSource, ShellExit, ShellPacket, ShellPacketError, ShellStreamError, ShellStreamState,
-    MAX_SHELL_PACKET_PAYLOAD,
+    MAX_SHELL_PACKET_PAYLOAD, USB_ALIGNED_SHELL_PACKET_PAYLOAD,
 };
+
+#[test]
+fn preferred_shell_payload_fills_one_safe_functionfs_request() {
+    assert_eq!(
+        kindlebridge_wire::HEADER_LEN + 5 + USB_ALIGNED_SHELL_PACKET_PAYLOAD,
+        16 * 1024
+    );
+}
 
 #[test]
 fn shell_packets_have_stable_adb_compatible_golden_bytes() {

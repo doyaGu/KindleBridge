@@ -35,7 +35,8 @@ const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SERVER_ENDPOINT_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const INPUT_POLL: Duration = Duration::from_millis(50);
-const MAX_INPUT_PACKET: usize = kindlebridge_schema::shell_protocol::MAX_SHELL_PACKET_PAYLOAD;
+const MAX_INPUT_PACKET: usize =
+    kindlebridge_schema::shell_protocol::USB_ALIGNED_SHELL_PACKET_PAYLOAD;
 
 fn main() -> ExitCode {
     let json_requested = std::env::args_os().any(|argument| argument == "--json");
