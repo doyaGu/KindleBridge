@@ -19,6 +19,7 @@ use kindlebridge::{
     RpcCaller, RunArgs, ServerCommand, TopLevelCommand,
 };
 use kindlebridge_bundle::read_project_manifest;
+use kindlebridge_schema::host_rpc::{self, RpcMethod as HostRpcMethod};
 use kindlebridge_schema::{
     error_codes, methods, AppLogParams, AppLogSnapshot, AppState, ClientError, RpcClient,
     SyncProgress, SyncProgressPhase,
@@ -311,7 +312,7 @@ fn run_app_log(
             max_bytes: Some(max_bytes),
         })
         .map_err(|_| RunError::Message("could not encode app log request".to_owned()))?;
-        let value = match client.call(methods::APP_LOG, Some(params)) {
+        let value = match client.call(host_rpc::AppLog::METHOD, Some(params)) {
             Ok(value) => {
                 if waiting_for_device {
                     eprintln!("--- {app_id} log connection restored ---");

@@ -5,10 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Args;
 use kindlebridge_bundle::{build_project_bundle, read_project_manifest};
-use kindlebridge_schema::{methods, AppInstallParams, AppSummary, AppTargetParams};
+use kindlebridge_schema::{AppInstallParams, AppSummary, AppTargetParams};
 use serde_json::json;
 
-use super::{app, call_typed, normalize_host_path, CliError, RpcCaller};
+use super::{app, call_method, host_rpc, normalize_host_path, CliError, RpcCaller};
 
 #[derive(Clone, Debug, Args)]
 pub struct RunArgs {
@@ -74,18 +74,16 @@ fn run_project<C: RpcCaller>(
         .map_err(|error| CliError::Project(error.to_string()))?;
 
     let bundle_path = normalize_host_path(output.to_string_lossy().as_ref())?;
-    let (_, installed): (_, AppSummary) = call_typed(
+    let (_, installed): (_, AppSummary) = call_method::<_, host_rpc::AppInstall>(
         caller,
-        methods::APP_INSTALL,
         &AppInstallParams {
             serial: args.serial.clone(),
             bundle_path,
         },
         "run install",
     )?;
-    let (started_value, started): (_, AppSummary) = call_typed(
+    let (started_value, started): (_, AppSummary) = call_method::<_, host_rpc::AppStart>(
         caller,
-        methods::APP_START,
         &AppTargetParams {
             serial: args.serial.clone(),
             app_id: built.id.clone(),

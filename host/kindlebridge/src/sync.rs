@@ -4,14 +4,14 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand};
 use kindlebridge_schema::{
-    methods, SyncEntryKind, SyncListParams, SyncListResult, SyncMkdirParams, SyncMkdirResult,
+    SyncEntryKind, SyncListParams, SyncListResult, SyncMkdirParams, SyncMkdirResult,
     SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams,
     TransferState, DEFAULT_SYNC_BLOCK_SIZE, MAX_SYNC_BLOCK_SIZE,
 };
 use serde_json::json;
 
 use super::{
-    call_typed, normalize_host_path, pretty_json, CliError, RpcCaller, DEVICE_SYNC_ROOT,
+    call_method, host_rpc, normalize_host_path, pretty_json, CliError, RpcCaller, DEVICE_SYNC_ROOT,
     MAX_SYNC_TREE_ENTRIES,
 };
 
@@ -101,9 +101,8 @@ pub(super) fn execute<C: RpcCaller>(
                 Err(error) => return Err(CliError::LocalTree(error.to_string())),
             }
             let started = Instant::now();
-            let (value, result): (_, SyncPushResult) = call_typed(
+            let (value, result): (_, SyncPushResult) = call_method::<_, host_rpc::SyncPush>(
                 caller,
-                methods::SYNC_PUSH,
                 &SyncPushParams {
                     serial: serial.clone(),
                     local_path: local_path.clone(),
@@ -149,9 +148,8 @@ pub(super) fn execute<C: RpcCaller>(
                 );
             }
             let started = Instant::now();
-            let (value, result): (_, SyncPullResult) = call_typed(
+            let (value, result): (_, SyncPullResult) = call_method::<_, host_rpc::SyncPull>(
                 caller,
-                methods::SYNC_PULL,
                 &SyncPullParams {
                     serial: serial.clone(),
                     remote_path: remote_path.clone(),
@@ -179,9 +177,8 @@ pub(super) fn execute<C: RpcCaller>(
             serial,
             transfer_id,
         } => {
-            let (value, status): (_, SyncStatus) = call_typed(
+            let (value, status): (_, SyncStatus) = call_method::<_, host_rpc::SyncStatus>(
                 caller,
-                methods::SYNC_STATUS,
                 &SyncStatusParams {
                     serial: serial.clone(),
                     transfer_id: transfer_id.clone(),
@@ -218,9 +215,8 @@ fn sync_push_directory<C: RpcCaller>(
     let mut created_directories = 0_u64;
     for relative in std::iter::once("").chain(tree.directories.iter().map(String::as_str)) {
         let remote_path = join_remote_path(remote_root, relative);
-        let (_, result): (_, SyncMkdirResult) = call_typed(
+        let (_, result): (_, SyncMkdirResult) = call_method::<_, host_rpc::SyncMkdir>(
             caller,
-            methods::SYNC_MKDIR,
             &SyncMkdirParams {
                 serial: serial.to_owned(),
                 remote_path,
@@ -234,9 +230,8 @@ fn sync_push_directory<C: RpcCaller>(
     let mut transfers = Vec::with_capacity(tree.files.len());
     for (relative, local_path) in &tree.files {
         let remote_path = join_remote_path(remote_root, relative);
-        let (_, result): (_, SyncPushResult) = call_typed(
+        let (_, result): (_, SyncPushResult) = call_method::<_, host_rpc::SyncPush>(
             caller,
-            methods::SYNC_PUSH,
             &SyncPushParams {
                 serial: serial.to_owned(),
                 local_path: local_path.to_string_lossy().into_owned(),
@@ -293,9 +288,8 @@ fn sync_pull_directory<C: RpcCaller>(
         while let Some((remote_directory, relative_directory)) = pending.pop() {
             let mut cursor = None;
             loop {
-                let (_, page): (_, SyncListResult) = call_typed(
+                let (_, page): (_, SyncListResult) = call_method::<_, host_rpc::SyncList>(
                     caller,
-                    methods::SYNC_LIST,
                     &SyncListParams {
                         serial: serial.to_owned(),
                         remote_path: remote_directory.clone(),
@@ -316,18 +310,18 @@ fn sync_pull_directory<C: RpcCaller>(
                             pending.push((remote_path, relative_path));
                         }
                         SyncEntryKind::File => {
-                            let (_, pulled): (_, SyncPullResult) = call_typed(
-                                caller,
-                                methods::SYNC_PULL,
-                                &SyncPullParams {
-                                    serial: serial.to_owned(),
-                                    remote_path,
-                                    local_path: local_path.to_string_lossy().into_owned(),
-                                    transfer_id: None,
-                                    block_size,
-                                },
-                                "sync directory pull",
-                            )?;
+                            let (_, pulled): (_, SyncPullResult) =
+                                call_method::<_, host_rpc::SyncPull>(
+                                    caller,
+                                    &SyncPullParams {
+                                        serial: serial.to_owned(),
+                                        remote_path,
+                                        local_path: local_path.to_string_lossy().into_owned(),
+                                        transfer_id: None,
+                                        block_size,
+                                    },
+                                    "sync directory pull",
+                                )?;
                             if pulled.state != TransferState::Complete
                                 || pulled.total_size != entry.size
                                 || pulled.received_size != entry.size

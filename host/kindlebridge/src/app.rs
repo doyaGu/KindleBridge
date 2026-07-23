@@ -2,12 +2,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use clap::{Args, Subcommand};
 use kindlebridge_schema::{
-    methods, AppInstallParams, AppList, AppLogParams, AppLogSnapshot, AppState, AppSummary,
-    AppTargetParams, SerialParams,
+    AppInstallParams, AppList, AppLogParams, AppLogSnapshot, AppState, AppSummary, AppTargetParams,
+    SerialParams,
 };
 use serde_json::Value;
 
-use super::{call_typed, normalize_host_path, pretty_json, CliError, RpcCaller};
+use super::{call_method, host_rpc, normalize_host_path, pretty_json, CliError, RpcCaller};
 
 #[derive(Debug, Args)]
 pub struct AppArgs {
@@ -69,9 +69,8 @@ pub(super) fn execute<C: RpcCaller>(
             bundle_path,
         } => {
             let bundle_path = normalize_host_path(bundle_path)?;
-            let (value, app): (_, AppSummary) = call_typed(
+            let (value, app): (_, AppSummary) = call_method::<_, host_rpc::AppInstall>(
                 caller,
-                methods::APP_INSTALL,
                 &AppInstallParams {
                     serial: serial.clone(),
                     bundle_path,
@@ -81,9 +80,8 @@ pub(super) fn execute<C: RpcCaller>(
             format_result(value, &app, json_output)
         }
         AppCommand::List { serial } => {
-            let (value, list): (_, AppList) = call_typed(
+            let (value, list): (_, AppList) = call_method::<_, host_rpc::AppList>(
                 caller,
-                methods::APP_LIST,
                 &SerialParams {
                     serial: serial.clone(),
                 },
@@ -113,9 +111,8 @@ pub(super) fn execute<C: RpcCaller>(
                     "app log --follow requires the streaming CLI path".to_owned(),
                 ));
             }
-            let (value, snapshot): (_, AppLogSnapshot) = call_typed(
+            let (value, snapshot): (_, AppLogSnapshot) = call_method::<_, host_rpc::AppLog>(
                 caller,
-                methods::APP_LOG,
                 &AppLogParams {
                     serial: serial.clone(),
                     app_id: app_id.clone(),
@@ -143,25 +140,30 @@ pub(super) fn execute<C: RpcCaller>(
         | AppCommand::Restart { serial, app_id }
         | AppCommand::Rollback { serial, app_id }
         | AppCommand::Uninstall { serial, app_id } => {
-            let method = match command {
-                AppCommand::Start { .. } => methods::APP_START,
-                AppCommand::Stop { .. } => methods::APP_STOP,
-                AppCommand::Restart { .. } => methods::APP_RESTART,
-                AppCommand::Rollback { .. } => methods::APP_ROLLBACK,
-                AppCommand::Uninstall { .. } => methods::APP_UNINSTALL,
+            let params = AppTargetParams {
+                serial: serial.clone(),
+                app_id: app_id.clone(),
+            };
+            let (value, app) = match command {
+                AppCommand::Start { .. } => {
+                    call_method::<_, host_rpc::AppStart>(caller, &params, "app operation")
+                }
+                AppCommand::Stop { .. } => {
+                    call_method::<_, host_rpc::AppStop>(caller, &params, "app operation")
+                }
+                AppCommand::Restart { .. } => {
+                    call_method::<_, host_rpc::AppRestart>(caller, &params, "app operation")
+                }
+                AppCommand::Rollback { .. } => {
+                    call_method::<_, host_rpc::AppRollback>(caller, &params, "app operation")
+                }
+                AppCommand::Uninstall { .. } => {
+                    call_method::<_, host_rpc::AppUninstall>(caller, &params, "app operation")
+                }
                 AppCommand::Install { .. } | AppCommand::Log { .. } | AppCommand::List { .. } => {
                     unreachable!()
                 }
-            };
-            let (value, app): (_, AppSummary) = call_typed(
-                caller,
-                method,
-                &AppTargetParams {
-                    serial: serial.clone(),
-                    app_id: app_id.clone(),
-                },
-                "app operation",
-            )?;
+            }?;
             format_result(value, &app, json_output)
         }
     }

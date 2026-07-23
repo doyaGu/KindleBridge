@@ -20,14 +20,14 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 #[cfg(test)]
 use base64::Engine;
 use clap::{Args, Parser, Subcommand};
+use kindlebridge_schema::host_rpc::{self, RpcMethod as HostRpcMethod};
+#[cfg(test)]
+use kindlebridge_schema::{methods, DeviceList};
 use kindlebridge_schema::{
-    methods, ClientError, DeviceFeatures, DeviceList, DeviceState, ExecParams, ExecResult,
-    LogSnapshot, LogTailParams, ProcessList, ProcessSignalParams, ProcessSummary, RpcClient,
-    SerialParams, ServerVersion, SyncPushParams, SyncPushResult, TransferState,
-    DEFAULT_SYNC_BLOCK_SIZE,
+    ClientError, DeviceState, ExecParams, ExecResult, LogSnapshot, LogTailParams, ProcessList,
+    ProcessSignalParams, ProcessSummary, RpcClient, SerialParams, SyncPushParams, SyncPushResult,
+    TransferState, DEFAULT_SYNC_BLOCK_SIZE,
 };
-use serde::de::DeserializeOwned;
-use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -310,8 +310,8 @@ pub fn execute<C: RpcCaller>(
     match command {
         TopLevelCommand::Server(args) => match args.command {
             ServerCommand::Ping => {
-                let result = caller.call(methods::SERVER_PING, None)?;
-                require_ping(&result)?;
+                let (result, ping) = call_empty::<_, host_rpc::ServerPing>(caller, "server ping")?;
+                require_ping(ping.ok)?;
                 if json_output {
                     pretty_json(&result)
                 } else {
@@ -319,9 +319,8 @@ pub fn execute<C: RpcCaller>(
                 }
             }
             ServerCommand::Version => {
-                let result = caller.call(methods::SERVER_VERSION, None)?;
-                let version: ServerVersion = serde_json::from_value(result.clone())
-                    .map_err(|_| CliError::InvalidResult { kind: "version" })?;
+                let (result, version) =
+                    call_empty::<_, host_rpc::ServerVersion>(caller, "version")?;
                 if json_output {
                     pretty_json(&result)
                 } else {
@@ -332,18 +331,16 @@ pub fn execute<C: RpcCaller>(
                 }
             }
             ServerCommand::Status => {
-                let result = caller.call(methods::SERVER_STATUS, None)?;
+                let (result, status) =
+                    call_empty::<_, host_rpc::ServerStatus>(caller, "server status")?;
                 if json_output {
                     pretty_json(&result)
                 } else {
-                    Ok(format!(
-                        "running (pid {})",
-                        result["pid"].as_u64().unwrap_or_default()
-                    ))
+                    Ok(format!("running (pid {})", status.pid))
                 }
             }
             ServerCommand::Stop => {
-                let result = caller.call(methods::SERVER_STOP, None)?;
+                let (result, _) = call_empty::<_, host_rpc::ServerStop>(caller, "server stop")?;
                 if json_output {
                     pretty_json(&result)
                 } else {
@@ -353,12 +350,7 @@ pub fn execute<C: RpcCaller>(
         },
         TopLevelCommand::Device(args) => match &args.command {
             DeviceCommand::List => {
-                let result = caller.call(methods::DEVICE_LIST, None)?;
-                let list: DeviceList = serde_json::from_value(result.clone()).map_err(|_| {
-                    CliError::InvalidResult {
-                        kind: "device list",
-                    }
-                })?;
+                let (result, list) = call_empty::<_, host_rpc::DeviceList>(caller, "device list")?;
                 if json_output {
                     pretty_json(&result)
                 } else if list.devices.is_empty() {
@@ -384,9 +376,14 @@ pub fn execute<C: RpcCaller>(
                 }
             }
             DeviceCommand::Ping { serial } => {
-                let result =
-                    caller.call(methods::DEVICE_PING, Some(json!({ "serial": serial })))?;
-                require_ping(&result)?;
+                let (result, ping) = call_method::<_, host_rpc::DevicePing>(
+                    caller,
+                    &SerialParams {
+                        serial: serial.clone(),
+                    },
+                    "device ping",
+                )?;
+                require_ping(ping.ok)?;
                 if json_output {
                     pretty_json(&result)
                 } else {
@@ -394,14 +391,13 @@ pub fn execute<C: RpcCaller>(
                 }
             }
             DeviceCommand::Features { serial } => {
-                let result =
-                    caller.call(methods::DEVICE_FEATURES, Some(json!({ "serial": serial })))?;
-                let features: DeviceFeatures =
-                    serde_json::from_value(result.clone()).map_err(|_| {
-                        CliError::InvalidResult {
-                            kind: "device features",
-                        }
-                    })?;
+                let (result, features) = call_method::<_, host_rpc::DeviceFeatures>(
+                    caller,
+                    &kindlebridge_schema::DeviceFeaturesParams {
+                        serial: serial.clone(),
+                    },
+                    "device features",
+                )?;
                 if json_output {
                     pretty_json(&result)
                 } else {
@@ -443,9 +439,8 @@ fn execute_daemon<C: RpcCaller>(
     } = command;
     let (digest, size) = hash_update_binary(device_binary)?;
     let remote_path = format!("staging/daemon/{digest}/kindlebridged");
-    let (_, pushed): (_, SyncPushResult) = call_typed(
+    let (_, pushed): (_, SyncPushResult) = call_method::<_, host_rpc::SyncPush>(
         caller,
-        methods::SYNC_PUSH,
         &SyncPushParams {
             serial: serial.clone(),
             local_path: device_binary.clone(),
@@ -546,9 +541,8 @@ fn call_exec_checked<C: RpcCaller>(
     argv: Vec<String>,
     step: &'static str,
 ) -> Result<ExecResult, CliError> {
-    let (_, result): (_, ExecResult) = call_typed(
+    let (_, result): (_, ExecResult) = call_method::<_, host_rpc::ExecRun>(
         caller,
-        methods::EXEC_RUN,
         &ExecParams {
             serial: serial.to_owned(),
             argv,
@@ -603,23 +597,17 @@ fn execute_exec<C: RpcCaller>(
     timeout_ms: u64,
     json_output: bool,
 ) -> Result<CommandOutput, CliError> {
-    let result = caller.call(
-        methods::EXEC_RUN,
-        Some(
-            serde_json::to_value(ExecParams {
-                serial: serial.to_owned(),
-                argv,
-                cwd: None,
-                environment: BTreeMap::new(),
-                timeout_ms,
-            })
-            .map_err(|_| CliError::InvalidResult {
-                kind: "exec params",
-            })?,
-        ),
+    let (result, exec) = call_method::<_, host_rpc::ExecRun>(
+        caller,
+        &ExecParams {
+            serial: serial.to_owned(),
+            argv,
+            cwd: None,
+            environment: BTreeMap::new(),
+            timeout_ms,
+        },
+        "exec",
     )?;
-    let exec: ExecResult = serde_json::from_value(result.clone())
-        .map_err(|_| CliError::InvalidResult { kind: "exec" })?;
     let exit_code = exec.exit_code;
     let output = if json_output {
         pretty_json(&result)
@@ -643,9 +631,8 @@ fn execute_process<C: RpcCaller>(
 ) -> Result<String, CliError> {
     match command {
         ProcessCommand::List { serial } => {
-            let (value, list): (_, ProcessList) = call_typed(
+            let (value, list): (_, ProcessList) = call_method::<_, host_rpc::ProcessList>(
                 caller,
-                methods::PROCESS_LIST,
                 &SerialParams {
                     serial: serial.clone(),
                 },
@@ -669,9 +656,8 @@ fn execute_process<C: RpcCaller>(
             pid,
             signal,
         } => {
-            let (value, process): (_, ProcessSummary) = call_typed(
+            let (value, process): (_, ProcessSummary) = call_method::<_, host_rpc::ProcessSignal>(
                 caller,
-                methods::PROCESS_SIGNAL,
                 &ProcessSignalParams {
                     serial: serial.clone(),
                     pid: *pid,
@@ -702,9 +688,8 @@ fn execute_log<C: RpcCaller>(
             cursor,
             limit,
         } => {
-            let (value, snapshot): (_, LogSnapshot) = call_typed(
+            let (value, snapshot): (_, LogSnapshot) = call_method::<_, host_rpc::LogTail>(
                 caller,
-                methods::LOG_TAIL,
                 &LogTailParams {
                     serial: serial.clone(),
                     cursor: *cursor,
@@ -731,14 +716,26 @@ fn execute_log<C: RpcCaller>(
     }
 }
 
-fn call_typed<C: RpcCaller, P: Serialize, T: DeserializeOwned>(
+fn call_method<C: RpcCaller, M: HostRpcMethod>(
     caller: &mut C,
-    method: &str,
-    params: &P,
+    params: &M::Params,
     kind: &'static str,
-) -> Result<(Value, T), CliError> {
+) -> Result<(Value, M::Result), CliError> {
     let params = serde_json::to_value(params).map_err(|_| CliError::InvalidResult { kind })?;
-    let value = caller.call(method, Some(params))?;
+    let value = caller.call(M::METHOD, Some(params))?;
+    let typed =
+        serde_json::from_value(value.clone()).map_err(|_| CliError::InvalidResult { kind })?;
+    Ok((value, typed))
+}
+
+fn call_empty<C: RpcCaller, M>(
+    caller: &mut C,
+    kind: &'static str,
+) -> Result<(Value, M::Result), CliError>
+where
+    M: HostRpcMethod<Params = kindlebridge_schema::EmptyParams>,
+{
+    let value = caller.call(M::METHOD, None)?;
     let typed =
         serde_json::from_value(value.clone()).map_err(|_| CliError::InvalidResult { kind })?;
     Ok((value, typed))
@@ -756,8 +753,8 @@ fn normalize_host_path(path: &str) -> Result<String, CliError> {
     Ok(absolute.to_string_lossy().into_owned())
 }
 
-fn require_ping(value: &Value) -> Result<(), CliError> {
-    if value.get("ok").and_then(Value::as_bool) == Some(true) {
+fn require_ping(ok: bool) -> Result<(), CliError> {
+    if ok {
         Ok(())
     } else {
         Err(CliError::InvalidResult { kind: "ping" })
