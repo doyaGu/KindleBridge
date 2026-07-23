@@ -16,7 +16,7 @@ use kindlebridge_schema::device_protocol::{
     APP_STOP_FEATURE, APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW,
     LOG_TAIL_FEATURE, MAX_HOST_TO_DEVICE_PAYLOAD, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE,
     PROTOCOL_VERSION, RPC_SERVICE, SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE,
-    SYNC_FEATURE, SYNC_SERVICE,
+    SYNC_FEATURE, SYNC_SERVICE, SYNC_TREE_FEATURE,
 };
 #[cfg(test)]
 use kindlebridge_schema::device_protocol::{ServiceAccept, ServiceOpen, SYNC_CREDIT_BATCH_SIZE};
@@ -24,9 +24,9 @@ use kindlebridge_schema::shell_protocol::{PacketSource, ShellPacket, ShellStream
 use kindlebridge_schema::{
     error_codes, AppInstallParams, AppList, AppSummary, AppTargetParams, DeviceFeatures,
     DeviceState, DeviceSummary, ExecParams, ExecResult, LogSnapshot, LogTailParams, ProcessList,
-    ProcessSignalParams, ProcessSummary, RpcError, SerialParams, SyncPullParams, SyncPullResult,
-    SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams, TransferState,
-    MAX_SYNC_BLOCK_SIZE,
+    ProcessSignalParams, ProcessSummary, RpcError, SerialParams, SyncListParams, SyncListResult,
+    SyncMkdirParams, SyncMkdirResult, SyncPullParams, SyncPullResult, SyncPushParams,
+    SyncPushResult, SyncStatus, SyncStatusParams, TransferState, MAX_SYNC_BLOCK_SIZE,
 };
 use kindlebridge_transport::{
     actor::{
@@ -263,6 +263,14 @@ impl DeviceProvider for ReconnectingUsbProvider {
         self.rpc(|provider| provider.sync_status(params))
     }
 
+    fn sync_list(&self, params: &SyncListParams) -> Result<SyncListResult, RpcError> {
+        self.rpc(|provider| provider.sync_list(params))
+    }
+
+    fn sync_mkdir(&self, params: &SyncMkdirParams) -> Result<SyncMkdirResult, RpcError> {
+        self.rpc(|provider| provider.sync_mkdir(params))
+    }
+
     fn app_install(&self, params: AppInstallParams) -> Result<AppSummary, RpcError> {
         self.rpc(|provider| provider.app_install(params))
     }
@@ -390,6 +398,24 @@ impl DeviceProvider for ConnectedDeviceProvider {
         let value = device
             .session
             .call(kindlebridge_schema::methods::SYNC_STATUS, params)
+            .map_err(link_rpc_error)?;
+        serde_json::from_value(value).map_err(|_| RpcError::internal_error())
+    }
+
+    fn sync_list(&self, params: &SyncListParams) -> Result<SyncListResult, RpcError> {
+        let device = self.require_feature(&params.serial, SYNC_TREE_FEATURE)?;
+        let value = device
+            .session
+            .call(kindlebridge_schema::methods::SYNC_LIST, params)
+            .map_err(link_rpc_error)?;
+        serde_json::from_value(value).map_err(|_| RpcError::internal_error())
+    }
+
+    fn sync_mkdir(&self, params: &SyncMkdirParams) -> Result<SyncMkdirResult, RpcError> {
+        let device = self.require_feature(&params.serial, SYNC_TREE_FEATURE)?;
+        let value = device
+            .session
+            .call(kindlebridge_schema::methods::SYNC_MKDIR, params)
             .map_err(link_rpc_error)?;
         serde_json::from_value(value).map_err(|_| RpcError::internal_error())
     }
@@ -2787,6 +2813,7 @@ mod tests {
                 kindlebridge_schema::device_protocol::PROCESS_LIST_FEATURE,
                 kindlebridge_schema::device_protocol::PROCESS_SIGNAL_FEATURE,
                 kindlebridge_schema::device_protocol::SHELL_V2_FEATURE,
+                kindlebridge_schema::device_protocol::SYNC_TREE_FEATURE,
                 kindlebridge_schema::device_protocol::SYNC_FEATURE,
             ]
         );

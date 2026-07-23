@@ -4,6 +4,7 @@ use kindlebridge_schema::device_protocol::{
     APP_INSTALL_FEATURE, APP_LIST_FEATURE, APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE,
     APP_START_FEATURE, APP_STOP_FEATURE, APP_UNINSTALL_FEATURE, EXEC_FEATURE, LOG_TAIL_FEATURE,
     PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION, RPC_SERVICE, SYNC_FEATURE,
+    SYNC_TREE_FEATURE,
 };
 use kindlebridge_schema::{DeviceState, DeviceSummary};
 use kindlebridge_server::{DeviceRecord, MemoryDeviceProvider};
@@ -34,6 +35,7 @@ pub fn provider() -> MemoryDeviceProvider {
             PROCESS_LIST_FEATURE.to_owned(),
             PROCESS_SIGNAL_FEATURE.to_owned(),
             SYNC_FEATURE.to_owned(),
+            SYNC_TREE_FEATURE.to_owned(),
         ],
     }])
 }

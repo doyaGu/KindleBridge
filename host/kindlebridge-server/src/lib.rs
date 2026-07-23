@@ -19,9 +19,9 @@ use kindlebridge_schema::{
     LogSnapshot, LogTailParams, ProcessList, ProcessSignalParams, ProcessSummary, RequestId,
     RpcError, RpcRequest, RpcResponse, SerialParams, ServerVersion, ShellOpenParams,
     ShellOpenResult, StreamChannel, StreamClosedParams, StreamCreditParams, StreamDataParams,
-    StreamExitParams, StreamIdParams, StreamResizeParams, StreamWriteParams, SyncPullParams,
-    SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams,
-    DEFAULT_MAX_CONTENT_LENGTH,
+    StreamExitParams, StreamIdParams, StreamResizeParams, StreamWriteParams, SyncListParams,
+    SyncListResult, SyncMkdirParams, SyncMkdirResult, SyncPullParams, SyncPullResult,
+    SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams, DEFAULT_MAX_CONTENT_LENGTH,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -87,6 +87,8 @@ pub trait DeviceProvider: Send + Sync {
     fn sync_push(&self, params: SyncPushParams) -> Result<SyncPushResult, RpcError>;
     fn sync_pull(&self, params: SyncPullParams) -> Result<SyncPullResult, RpcError>;
     fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError>;
+    fn sync_list(&self, params: &SyncListParams) -> Result<SyncListResult, RpcError>;
+    fn sync_mkdir(&self, params: &SyncMkdirParams) -> Result<SyncMkdirResult, RpcError>;
     fn app_install(&self, params: AppInstallParams) -> Result<AppSummary, RpcError>;
     fn app_start(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError>;
     fn app_stop(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError>;
@@ -217,6 +219,16 @@ impl DeviceProvider for MemoryDeviceProvider {
     fn sync_status(&self, params: &SyncStatusParams) -> Result<SyncStatus, RpcError> {
         self.ensure_device(&params.serial)?;
         self.runtime()?.sync_status(params)
+    }
+
+    fn sync_list(&self, params: &SyncListParams) -> Result<SyncListResult, RpcError> {
+        self.ensure_device(&params.serial)?;
+        self.runtime()?.sync_list(params)
+    }
+
+    fn sync_mkdir(&self, params: &SyncMkdirParams) -> Result<SyncMkdirResult, RpcError> {
+        self.ensure_device(&params.serial)?;
+        self.runtime()?.sync_mkdir(params)
     }
 
     fn app_install(&self, params: AppInstallParams) -> Result<AppSummary, RpcError> {
@@ -416,6 +428,14 @@ fn dispatch<P: DeviceProvider + ?Sized>(
         methods::SYNC_STATUS => {
             let params = parse_params::<SyncStatusParams>(request, "sync status params")?;
             to_value(provider.sync_status(&params)?)
+        }
+        methods::SYNC_LIST => {
+            let params = parse_params::<SyncListParams>(request, "sync list params")?;
+            to_value(provider.sync_list(&params)?)
+        }
+        methods::SYNC_MKDIR => {
+            let params = parse_params::<SyncMkdirParams>(request, "sync mkdir params")?;
+            to_value(provider.sync_mkdir(&params)?)
         }
         methods::APP_INSTALL => {
             let params = parse_params::<AppInstallParams>(request, "app install params")?;
@@ -943,6 +963,8 @@ mod tests {
         unused_provider_method!(sync_push(params: SyncPushParams) -> Result<SyncPushResult, RpcError>);
         unused_provider_method!(sync_pull(params: SyncPullParams) -> Result<SyncPullResult, RpcError>);
         unused_provider_method!(sync_status(params: &SyncStatusParams) -> Result<SyncStatus, RpcError>);
+        unused_provider_method!(sync_list(params: &SyncListParams) -> Result<SyncListResult, RpcError>);
+        unused_provider_method!(sync_mkdir(params: &SyncMkdirParams) -> Result<SyncMkdirResult, RpcError>);
         unused_provider_method!(app_install(params: AppInstallParams) -> Result<AppSummary, RpcError>);
         unused_provider_method!(app_start(params: &AppTargetParams) -> Result<AppSummary, RpcError>);
         unused_provider_method!(app_stop(params: &AppTargetParams) -> Result<AppSummary, RpcError>);

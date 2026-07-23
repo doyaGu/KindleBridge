@@ -206,6 +206,7 @@ fn all_v1_discovery_methods_work_over_stdio_and_cli_rpc() {
             "process.list.v1",
             "process.signal.v1",
             "rpc.v1",
+            "sync.tree.v1",
             "sync.v1"
         ]
     );
@@ -283,10 +284,16 @@ fn stateful_sync_app_process_and_log_flow_works_over_stdio() {
     let unique = format!("{}-{}", std::process::id(), SERIAL);
     let source = std::env::temp_dir().join(format!("kindlebridge-source-{unique}.bin"));
     let destination = std::env::temp_dir().join(format!("kindlebridge-pull-{unique}.bin"));
+    let tree_source = std::env::temp_dir().join(format!("kindlebridge-tree-source-{unique}"));
+    let tree_destination = std::env::temp_dir().join(format!("kindlebridge-tree-pull-{unique}"));
     let app_v1 = std::env::temp_dir().join(format!("kindlebridge-app-v1-{unique}.kbb"));
     let app_v2 = std::env::temp_dir().join(format!("kindlebridge-app-v2-{unique}.kbb"));
     let payload: Vec<u8> = (0_u16..4096).flat_map(u16::to_le_bytes).collect();
     fs::write(&source, &payload).unwrap();
+    fs::create_dir_all(tree_source.join("empty")).unwrap();
+    fs::create_dir_all(tree_source.join("nested")).unwrap();
+    fs::write(tree_source.join("root.txt"), b"root").unwrap();
+    fs::write(tree_source.join("nested/child.bin"), [0_u8, 1, 2, 3]).unwrap();
 
     let pushed = execute(
         &mut client,
@@ -324,12 +331,52 @@ fn stateful_sync_app_process_and_log_flow_works_over_stdio() {
                 local_path: destination.to_string_lossy().into_owned(),
                 block_size: 193,
                 resume: None,
+                recursive: false,
             },
         }),
         false,
     )
     .unwrap();
     assert_eq!(fs::read(&destination).unwrap(), payload);
+
+    execute(
+        &mut client,
+        &TopLevelCommand::Sync(SyncArgs {
+            command: SyncCommand::Push {
+                serial: SERIAL.to_owned(),
+                local_path: tree_source.to_string_lossy().into_owned(),
+                remote_path: "dev/tree".to_owned(),
+                block_size: 193,
+                resume: None,
+            },
+        }),
+        false,
+    )
+    .unwrap();
+    execute(
+        &mut client,
+        &TopLevelCommand::Sync(SyncArgs {
+            command: SyncCommand::Pull {
+                serial: SERIAL.to_owned(),
+                remote_path: "dev/tree".to_owned(),
+                local_path: tree_destination.to_string_lossy().into_owned(),
+                block_size: 193,
+                resume: None,
+                recursive: true,
+            },
+        }),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(tree_destination.join("root.txt")).unwrap(),
+        b"root"
+    );
+    assert_eq!(
+        fs::read(tree_destination.join("nested/child.bin")).unwrap(),
+        [0_u8, 1, 2, 3]
+    );
+    assert!(tree_destination.join("empty").is_dir());
 
     let app_id = "org.kindlebridge.e2e";
     write_test_bundle(&app_v1, app_id, "1.0.0", 1);
@@ -478,6 +525,8 @@ fn stateful_sync_app_process_and_log_flow_works_over_stdio() {
 
     fs::remove_file(source).unwrap();
     fs::remove_file(destination).unwrap();
+    fs::remove_dir_all(tree_source).unwrap();
+    fs::remove_dir_all(tree_destination).unwrap();
     fs::remove_file(app_v1).unwrap();
     fs::remove_file(app_v2).unwrap();
     drop(client);

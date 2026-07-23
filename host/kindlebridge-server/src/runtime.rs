@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::fs::File;
 use std::path::Path;
@@ -7,8 +7,9 @@ use kindlebridge_bundle::{verify, BundleKind, VerifyOptions};
 use kindlebridge_schema::{
     error_codes, AppInstallParams, AppList, AppLogChunk, AppLogParams, AppLogSnapshot, AppState,
     AppSummary, AppTargetParams, LogEntry, LogSnapshot, LogTailParams, ProcessList, ProcessSignal,
-    ProcessSignalParams, ProcessState, ProcessSummary, RpcError, SerialParams, SyncPullParams,
-    SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams,
+    ProcessSignalParams, ProcessState, ProcessSummary, RpcError, SerialParams, SyncEntry,
+    SyncEntryKind, SyncListParams, SyncListResult, SyncMkdirParams, SyncMkdirResult,
+    SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams,
     TransferDirection, TransferState,
 };
 use serde_json::json;
@@ -59,6 +60,7 @@ pub(crate) struct RuntimeState {
     next_transfer: u64,
     next_pid: u32,
     files: BTreeMap<(String, String), Vec<u8>>,
+    directories: BTreeSet<(String, String)>,
     transfers: BTreeMap<String, Transfer>,
     apps: BTreeMap<(String, String), AppRuntime>,
     processes: BTreeMap<(String, u32), ProcessSummary>,
@@ -72,6 +74,7 @@ impl Default for RuntimeState {
             next_transfer: 1,
             next_pid: 2000,
             files: BTreeMap::new(),
+            directories: BTreeSet::new(),
             transfers: BTreeMap::new(),
             apps: BTreeMap::new(),
             processes: BTreeMap::new(),
@@ -126,8 +129,15 @@ impl RuntimeState {
         if transfer.data != data {
             return Err(invalid_state("resume source does not match accepted data"));
         }
+        if self
+            .directories
+            .contains(&(params.serial.clone(), params.remote_path.clone()))
+        {
+            return Err(invalid_state("remote path is a directory"));
+        }
         self.files
             .insert((params.serial.clone(), params.remote_path.clone()), data);
+        add_parent_directories(&mut self.directories, &params.serial, &params.remote_path);
         self.log(
             &params.serial,
             "info",
@@ -206,6 +216,92 @@ impl RuntimeState {
             next_offset: transfer.next_offset,
             total_size: transfer.total_size,
             state: transfer.state.clone(),
+        })
+    }
+
+    pub(crate) fn sync_mkdir(
+        &mut self,
+        params: &SyncMkdirParams,
+    ) -> Result<SyncMkdirResult, RpcError> {
+        validate_path(&params.remote_path)?;
+        if self
+            .files
+            .contains_key(&(params.serial.clone(), params.remote_path.clone()))
+        {
+            return Err(invalid_state("remote path is a file"));
+        }
+        add_parent_directories(&mut self.directories, &params.serial, &params.remote_path);
+        let created = self
+            .directories
+            .insert((params.serial.clone(), params.remote_path.clone()));
+        Ok(SyncMkdirResult {
+            remote_path: params.remote_path.clone(),
+            created,
+        })
+    }
+
+    pub(crate) fn sync_list(&self, params: &SyncListParams) -> Result<SyncListResult, RpcError> {
+        validate_path(&params.remote_path)?;
+        if params.limit == 0 || params.limit > 1024 {
+            return Err(RpcError::invalid_params(
+                "directory list limit must be between 1 and 1024",
+            ));
+        }
+        if !self
+            .directories
+            .contains(&(params.serial.clone(), params.remote_path.clone()))
+        {
+            return Err(file_not_found(&params.remote_path));
+        }
+        let prefix = format!("{}/", params.remote_path);
+        let mut entries = BTreeMap::<String, SyncEntry>::new();
+        for (serial, path) in &self.directories {
+            if serial == &params.serial {
+                if let Some(name) = immediate_child(path, &prefix) {
+                    entries.entry(name.clone()).or_insert(SyncEntry {
+                        name,
+                        kind: SyncEntryKind::Directory,
+                        size: 0,
+                    });
+                }
+            }
+        }
+        for ((serial, path), data) in &self.files {
+            if serial == &params.serial {
+                if let Some(name) = immediate_child(path, &prefix) {
+                    let nested = path[prefix.len()..].contains('/');
+                    entries.entry(name.clone()).or_insert(SyncEntry {
+                        name,
+                        kind: if nested {
+                            SyncEntryKind::Directory
+                        } else {
+                            SyncEntryKind::File
+                        },
+                        size: if nested {
+                            0
+                        } else {
+                            u64::try_from(data.len()).unwrap_or(u64::MAX)
+                        },
+                    });
+                }
+            }
+        }
+        let mut entries = entries
+            .into_values()
+            .filter(|entry| {
+                params
+                    .cursor
+                    .as_ref()
+                    .map_or(true, |cursor| entry.name > *cursor)
+            })
+            .collect::<Vec<_>>();
+        let limit = usize::try_from(params.limit).map_err(|_| RpcError::internal_error())?;
+        let next_cursor = (entries.len() > limit).then(|| entries[limit - 1].name.clone());
+        entries.truncate(limit);
+        Ok(SyncListResult {
+            remote_path: params.remote_path.clone(),
+            entries,
+            next_cursor,
         })
     }
 
@@ -512,6 +608,20 @@ fn empty_app_log_chunk(cursor: u64) -> AppLogChunk {
         data_base64: String::new(),
         capped: false,
     }
+}
+
+fn add_parent_directories(directories: &mut BTreeSet<(String, String)>, serial: &str, path: &str) {
+    let mut parent = path;
+    while let Some((next, _)) = parent.rsplit_once('/') {
+        directories.insert((serial.to_owned(), next.to_owned()));
+        parent = next;
+    }
+}
+
+fn immediate_child(path: &str, prefix: &str) -> Option<String> {
+    let suffix = path.strip_prefix(prefix)?;
+    let name = suffix.split('/').next()?;
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 fn validate_transfer(

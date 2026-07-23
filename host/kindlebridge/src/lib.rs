@@ -15,8 +15,9 @@ use kindlebridge_schema::{
     methods, AppInstallParams, AppList, AppLogParams, AppLogSnapshot, AppState, AppSummary,
     AppTargetParams, ClientError, DeviceFeatures, DeviceList, DeviceState, ExecParams, ExecResult,
     LogSnapshot, LogTailParams, ProcessList, ProcessSignalParams, ProcessSummary, RpcClient,
-    SerialParams, ServerVersion, SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult,
-    SyncStatus, SyncStatusParams, TransferState, DEFAULT_SYNC_BLOCK_SIZE, MAX_SYNC_BLOCK_SIZE,
+    SerialParams, ServerVersion, SyncEntryKind, SyncListParams, SyncListResult, SyncMkdirParams,
+    SyncMkdirResult, SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus,
+    SyncStatusParams, TransferState, DEFAULT_SYNC_BLOCK_SIZE, MAX_SYNC_BLOCK_SIZE,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -79,7 +80,7 @@ pub enum TopLevelCommand {
     Exec(ExecArgs),
     /// Open a persistent PTY/raw shell. Without -c, starts an interactive terminal.
     Shell(ShellArgs),
-    /// Transfer files with resumable block checksums.
+    /// Transfer files and directory trees with resumable block checksums.
     Sync(SyncArgs),
     /// Stage device daemon updates for offline A/B activation.
     Daemon(DaemonArgs),
@@ -164,11 +165,11 @@ pub struct SyncArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SyncCommand {
-    /// Push a local file to a device.
+    /// Push a local file or directory tree to a device.
     Push {
         /// Stable device serial from `device list`.
         serial: String,
-        /// Local source file.
+        /// Local source file or directory.
         local_path: String,
         /// Relative device path, or an absolute path below `/mnt/us/kindlebridge-data`.
         remote_path: String,
@@ -179,7 +180,7 @@ pub enum SyncCommand {
         #[arg(long)]
         resume: Option<String>,
     },
-    /// Pull a device file to the host.
+    /// Pull a device file, or a directory tree with --recursive, to the host.
     Pull {
         /// Stable device serial from `device list`.
         serial: String,
@@ -193,6 +194,9 @@ pub enum SyncCommand {
         /// Continue a previously interrupted transfer by its transfer ID.
         #[arg(long)]
         resume: Option<String>,
+        /// Pull a directory tree instead of one file.
+        #[arg(short = 'r', long, conflicts_with = "resume")]
+        recursive: bool,
     },
     /// Inspect a resumable transfer.
     Status { serial: String, transfer_id: String },
@@ -354,12 +358,19 @@ pub enum CliError {
     Project(String),
     #[error("build command failed with exit code {exit_code}{detail}")]
     BuildFailed { exit_code: i32, detail: String },
+    #[error(
+        "directory sync cannot use one --resume ID; rerun the directory command without --resume"
+    )]
+    DirectoryResumeUnsupported,
+    #[error("could not sync local directory: {0}")]
+    LocalTree(String),
 }
 
 const DEVICE_LAUNCHER: &str = "/var/local/kindlebridge/control/bin/kindlebridge-launcher";
 const DEVICE_RUNTIME_ROOT: &str = "/var/local/kindlebridge/control/runtime";
 const DEVICE_SYNC_ROOT: &str = "/mnt/us/kindlebridge-data";
 const MAX_UPDATE_BINARY_SIZE: u64 = 32 * 1024 * 1024;
+const MAX_SYNC_TREE_ENTRIES: usize = 100_000;
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct CommandOutput {
@@ -932,6 +943,29 @@ fn execute_sync<C: RpcCaller>(
             let block_size = u32::try_from(*block_size).map_err(|_| CliError::InvalidBlockSize)?;
             let local_path = normalize_host_path(local_path)?;
             let remote_path = normalize_remote_path(remote_path)?;
+            match fs::symlink_metadata(&local_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(CliError::LocalTree(
+                        "source must not be a symbolic link".to_owned(),
+                    ));
+                }
+                Ok(metadata) if metadata.is_dir() => {
+                    if resume.is_some() {
+                        return Err(CliError::DirectoryResumeUnsupported);
+                    }
+                    return sync_push_directory(
+                        caller,
+                        serial,
+                        Path::new(&local_path),
+                        &remote_path,
+                        block_size,
+                        json_output,
+                    );
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(CliError::LocalTree(error.to_string())),
+            }
             let started = Instant::now();
             let (value, result): (_, SyncPushResult) = call_typed(
                 caller,
@@ -965,10 +999,21 @@ fn execute_sync<C: RpcCaller>(
             local_path,
             block_size,
             resume,
+            recursive,
         } => {
             validate_block_size(usize::try_from(*block_size).unwrap_or(usize::MAX))?;
             let remote_path = normalize_remote_path(remote_path)?;
             let local_path = normalize_host_path(local_path)?;
+            if *recursive {
+                return sync_pull_directory(
+                    caller,
+                    serial,
+                    &remote_path,
+                    Path::new(&local_path),
+                    *block_size,
+                    json_output,
+                );
+            }
             let started = Instant::now();
             let (value, result): (_, SyncPullResult) = call_typed(
                 caller,
@@ -1023,6 +1068,264 @@ fn execute_sync<C: RpcCaller>(
                 .to_lowercase())
             }
         }
+    }
+}
+
+fn sync_push_directory<C: RpcCaller>(
+    caller: &mut C,
+    serial: &str,
+    local_root: &Path,
+    remote_root: &str,
+    block_size: u32,
+    json_output: bool,
+) -> Result<String, CliError> {
+    let started = Instant::now();
+    let tree = collect_local_tree(local_root)?;
+    let mut created_directories = 0_u64;
+    for relative in std::iter::once("").chain(tree.directories.iter().map(String::as_str)) {
+        let remote_path = join_remote_path(remote_root, relative);
+        let (_, result): (_, SyncMkdirResult) = call_typed(
+            caller,
+            methods::SYNC_MKDIR,
+            &SyncMkdirParams {
+                serial: serial.to_owned(),
+                remote_path,
+            },
+            "sync mkdir",
+        )?;
+        created_directories += u64::from(result.created);
+    }
+
+    let mut bytes = 0_u64;
+    let mut transfers = Vec::with_capacity(tree.files.len());
+    for (relative, local_path) in &tree.files {
+        let remote_path = join_remote_path(remote_root, relative);
+        let (_, result): (_, SyncPushResult) = call_typed(
+            caller,
+            methods::SYNC_PUSH,
+            &SyncPushParams {
+                serial: serial.to_owned(),
+                local_path: local_path.to_string_lossy().into_owned(),
+                remote_path,
+                transfer_id: None,
+                block_size,
+            },
+            "sync directory push",
+        )?;
+        bytes = bytes.saturating_add(result.accepted_offset);
+        transfers.push(result.transfer_id);
+    }
+    format_tree_summary(
+        "push",
+        local_root.to_string_lossy().as_ref(),
+        remote_root,
+        tree.files.len(),
+        tree.directories.len() + 1,
+        created_directories,
+        bytes,
+        transfers,
+        started.elapsed(),
+        json_output,
+    )
+}
+
+fn sync_pull_directory<C: RpcCaller>(
+    caller: &mut C,
+    serial: &str,
+    remote_root: &str,
+    local_root: &Path,
+    block_size: u32,
+    json_output: bool,
+) -> Result<String, CliError> {
+    if local_root.exists() {
+        return Err(CliError::LocalTree(format!(
+            "destination already exists: {}",
+            local_root.display()
+        )));
+    }
+    let parent = local_root
+        .parent()
+        .ok_or_else(|| CliError::LocalTree("destination has no parent".to_owned()))?;
+    fs::create_dir_all(parent).map_err(|error| CliError::LocalTree(error.to_string()))?;
+    fs::create_dir(local_root).map_err(|error| CliError::LocalTree(error.to_string()))?;
+
+    let started = Instant::now();
+    let result = (|| {
+        let mut pending = vec![(remote_root.to_owned(), PathBuf::new())];
+        let mut files = 0_usize;
+        let mut directories = 1_usize;
+        let mut bytes = 0_u64;
+        let mut transfers = Vec::new();
+        while let Some((remote_directory, relative_directory)) = pending.pop() {
+            let mut cursor = None;
+            loop {
+                let (_, page): (_, SyncListResult) = call_typed(
+                    caller,
+                    methods::SYNC_LIST,
+                    &SyncListParams {
+                        serial: serial.to_owned(),
+                        remote_path: remote_directory.clone(),
+                        cursor: cursor.clone(),
+                        limit: 256,
+                    },
+                    "sync directory list",
+                )?;
+                for entry in page.entries {
+                    let remote_path = join_remote_path(&remote_directory, &entry.name);
+                    let relative_path = relative_directory.join(&entry.name);
+                    let local_path = local_root.join(&relative_path);
+                    match entry.kind {
+                        SyncEntryKind::Directory => {
+                            fs::create_dir(&local_path)
+                                .map_err(|error| CliError::LocalTree(error.to_string()))?;
+                            directories += 1;
+                            pending.push((remote_path, relative_path));
+                        }
+                        SyncEntryKind::File => {
+                            let (_, pulled): (_, SyncPullResult) = call_typed(
+                                caller,
+                                methods::SYNC_PULL,
+                                &SyncPullParams {
+                                    serial: serial.to_owned(),
+                                    remote_path,
+                                    local_path: local_path.to_string_lossy().into_owned(),
+                                    transfer_id: None,
+                                    block_size,
+                                },
+                                "sync directory pull",
+                            )?;
+                            if pulled.state != TransferState::Complete
+                                || pulled.total_size != entry.size
+                                || pulled.received_size != entry.size
+                            {
+                                return Err(CliError::InvalidResult {
+                                    kind: "sync directory pull size",
+                                });
+                            }
+                            files += 1;
+                            bytes = bytes.saturating_add(pulled.received_size);
+                            transfers.push(pulled.transfer_id);
+                        }
+                    }
+                }
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+        }
+        format_tree_summary(
+            "pull",
+            remote_root,
+            local_root.to_string_lossy().as_ref(),
+            files,
+            directories,
+            u64::try_from(directories).unwrap_or(u64::MAX),
+            bytes,
+            transfers,
+            started.elapsed(),
+            json_output,
+        )
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(local_root);
+    }
+    result
+}
+
+struct LocalTree {
+    directories: Vec<String>,
+    files: Vec<(String, PathBuf)>,
+}
+
+fn collect_local_tree(root: &Path) -> Result<LocalTree, CliError> {
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    let mut pending = vec![(root.to_owned(), String::new())];
+    while let Some((directory, relative)) = pending.pop() {
+        let mut entries = fs::read_dir(&directory)
+            .map_err(|error| CliError::LocalTree(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| CliError::LocalTree(error.to_string()))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries.into_iter().rev() {
+            if directories.len().saturating_add(files.len()) >= MAX_SYNC_TREE_ENTRIES {
+                return Err(CliError::LocalTree(
+                    "directory tree contains more than 100000 entries".to_owned(),
+                ));
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| CliError::LocalTree("path is not valid Unicode".to_owned()))?;
+            let child_relative = if relative.is_empty() {
+                name
+            } else {
+                format!("{relative}/{name}")
+            };
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|error| CliError::LocalTree(error.to_string()))?;
+            if metadata.file_type().is_symlink() {
+                return Err(CliError::LocalTree(format!(
+                    "symbolic links are not supported: {}",
+                    entry.path().display()
+                )));
+            }
+            if metadata.is_dir() {
+                directories.push(child_relative.clone());
+                pending.push((entry.path(), child_relative));
+            } else if metadata.is_file() {
+                files.push((child_relative, entry.path()));
+            } else {
+                return Err(CliError::LocalTree(format!(
+                    "special files are not supported: {}",
+                    entry.path().display()
+                )));
+            }
+        }
+    }
+    directories.sort();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(LocalTree { directories, files })
+}
+
+fn join_remote_path(root: &str, relative: &str) -> String {
+    if relative.is_empty() {
+        root.to_owned()
+    } else {
+        format!("{root}/{relative}")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_tree_summary(
+    direction: &str,
+    source: &str,
+    destination: &str,
+    files: usize,
+    directories: usize,
+    created_directories: u64,
+    bytes: u64,
+    transfers: Vec<String>,
+    elapsed: Duration,
+    json_output: bool,
+) -> Result<String, CliError> {
+    if json_output {
+        pretty_json(&json!({
+            "direction": direction,
+            "source": source,
+            "destination": destination,
+            "files": files,
+            "directories": directories,
+            "created_directories": created_directories,
+            "bytes": bytes,
+            "transfer_ids": transfers,
+        }))
+    } else {
+        Ok(format!(
+            "{direction}ed {files} files in {directories} directories ({bytes} bytes) in {:.2} s",
+            elapsed.as_secs_f64()
+        ))
     }
 }
 
@@ -1527,6 +1830,120 @@ mod tests {
             panic!("expected sync push command");
         };
         assert_eq!(block_size, 256 * 1024);
+    }
+
+    #[test]
+    fn directory_push_creates_empty_directories_and_pushes_files_in_stable_order() {
+        let root =
+            std::env::temp_dir().join(format!("kindlebridge-cli-tree-push-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("empty")).unwrap();
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        fs::write(root.join("nested/b.txt"), b"bb").unwrap();
+        let mut caller = RecordingCaller {
+            calls: Vec::new(),
+            replies: VecDeque::from([
+                json!({"remote_path":"tree","created":true}),
+                json!({"remote_path":"tree/empty","created":true}),
+                json!({"remote_path":"tree/nested","created":true}),
+                json!({"transfer_id":"push-a","accepted_offset":1,"state":"complete"}),
+                json!({"transfer_id":"push-b","accepted_offset":2,"state":"complete"}),
+            ]),
+        };
+        let output = execute(
+            &mut caller,
+            &TopLevelCommand::Sync(SyncArgs {
+                command: SyncCommand::Push {
+                    serial: "KT6-TEST".to_owned(),
+                    local_path: root.to_string_lossy().into_owned(),
+                    remote_path: "tree".to_owned(),
+                    block_size: 65_536,
+                    resume: None,
+                },
+            }),
+            true,
+        )
+        .unwrap();
+        let result: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(result["files"], 2);
+        assert_eq!(result["directories"], 3);
+        assert_eq!(
+            caller
+                .calls
+                .iter()
+                .map(|call| call.0.as_str())
+                .collect::<Vec<_>>(),
+            [
+                methods::SYNC_MKDIR,
+                methods::SYNC_MKDIR,
+                methods::SYNC_MKDIR,
+                methods::SYNC_PUSH,
+                methods::SYNC_PUSH,
+            ]
+        );
+        assert_eq!(
+            caller.calls[3].1.as_ref().unwrap()["remote_path"],
+            "tree/a.txt"
+        );
+        assert_eq!(
+            caller.calls[4].1.as_ref().unwrap()["remote_path"],
+            "tree/nested/b.txt"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recursive_pull_materializes_files_and_empty_directories() {
+        let root =
+            std::env::temp_dir().join(format!("kindlebridge-cli-tree-pull-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut caller = RecordingCaller {
+            calls: Vec::new(),
+            replies: VecDeque::from([
+                json!({
+                    "remote_path":"tree",
+                    "entries":[
+                        {"name":"a.txt","kind":"file","size":1},
+                        {"name":"empty","kind":"directory","size":0}
+                    ]
+                }),
+                json!({
+                    "transfer_id":"pull-a",
+                    "total_size":1,
+                    "received_size":1,
+                    "state":"complete"
+                }),
+                json!({"remote_path":"tree/empty","entries":[]}),
+            ]),
+        };
+        let output = execute(
+            &mut caller,
+            &TopLevelCommand::Sync(SyncArgs {
+                command: SyncCommand::Pull {
+                    serial: "KT6-TEST".to_owned(),
+                    remote_path: "tree".to_owned(),
+                    local_path: root.to_string_lossy().into_owned(),
+                    block_size: 65_536,
+                    resume: None,
+                    recursive: true,
+                },
+            }),
+            true,
+        )
+        .unwrap();
+        let result: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(result["files"], 1);
+        assert!(root.join("empty").is_dir());
+        assert_eq!(
+            caller
+                .calls
+                .iter()
+                .map(|call| call.0.as_str())
+                .collect::<Vec<_>>(),
+            [methods::SYNC_LIST, methods::SYNC_PULL, methods::SYNC_LIST]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1498,6 +1498,8 @@ fn command_error_code(error: &CliError) -> &'static str {
         CliError::UpdateRejected { .. } => "UPDATE_REJECTED",
         CliError::Project(_) => "INVALID_PROJECT",
         CliError::BuildFailed { .. } => "BUILD_FAILED",
+        CliError::DirectoryResumeUnsupported => "INVALID_RESUME",
+        CliError::LocalTree(_) => "HOST_IO_ERROR",
     }
 }
 
