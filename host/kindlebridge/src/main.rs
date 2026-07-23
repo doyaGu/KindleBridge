@@ -956,6 +956,11 @@ fn command_error_code(error: &CliError) -> &'static str {
         CliError::InvalidBlockSize => "INVALID_BLOCK_SIZE",
         CliError::InvalidRemotePath { .. } => "INVALID_REMOTE_PATH",
         CliError::RemotePathCollision { .. } => "INVALID_REMOTE_PATH",
+        CliError::InvalidDeviceSyncPath { .. } | CliError::DevicePathCollision { .. } => {
+            "INVALID_SERVER_RESULT"
+        }
+        CliError::RemoteTreeChanged(_) => "REMOTE_TREE_CHANGED",
+        CliError::RemoteTreeTooLarge(_) => "INVALID_SERVER_RESULT",
         CliError::CurrentDirectory(_) => "HOST_IO_ERROR",
         CliError::InvalidUpdateBinary(_) => "INVALID_UPDATE_BINARY",
         CliError::StreamingShellRequired => "STREAMING_SHELL_REQUIRED",

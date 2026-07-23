@@ -142,7 +142,7 @@ pub(super) fn execute<C: RpcCaller>(
                 return sync_pull_directory(
                     caller,
                     serial,
-                    remote_path.as_str(),
+                    &remote_path,
                     Path::new(&local_path),
                     *block_size,
                     json_output,
@@ -260,7 +260,7 @@ fn sync_push_directory<C: RpcCaller>(
 fn sync_pull_directory<C: RpcCaller>(
     caller: &mut C,
     serial: &str,
-    remote_root: &str,
+    remote_root: &LogicalSyncPath,
     local_root: &Path,
     block_size: u32,
     json_output: bool,
@@ -274,80 +274,61 @@ fn sync_pull_directory<C: RpcCaller>(
     let parent = local_root
         .parent()
         .ok_or_else(|| CliError::LocalTree("destination has no parent".to_owned()))?;
+
+    let started = Instant::now();
+    let manifest = collect_remote_tree(caller, serial, remote_root)?;
     fs::create_dir_all(parent).map_err(|error| CliError::LocalTree(error.to_string()))?;
     fs::create_dir(local_root).map_err(|error| CliError::LocalTree(error.to_string()))?;
 
-    let started = Instant::now();
     let result = (|| {
-        let mut pending = vec![(remote_root.to_owned(), PathBuf::new())];
-        let mut files = 0_usize;
-        let mut directories = 1_usize;
-        let mut bytes = 0_u64;
-        let mut transfers = Vec::new();
-        while let Some((remote_directory, relative_directory)) = pending.pop() {
-            let mut cursor = None;
-            loop {
-                let (_, page): (_, SyncListResult) = call_method::<_, host_rpc::SyncList>(
-                    caller,
-                    &SyncListParams {
-                        serial: serial.to_owned(),
-                        remote_path: remote_directory.clone(),
-                        cursor: cursor.clone(),
-                        limit: 256,
-                    },
-                    "sync directory list",
-                )?;
-                for entry in page.entries {
-                    let remote_path = join_remote_path(&remote_directory, &entry.name);
-                    let relative_path = relative_directory.join(&entry.name);
-                    let local_path = local_root.join(&relative_path);
-                    match entry.kind {
-                        SyncEntryKind::Directory => {
-                            fs::create_dir(&local_path)
-                                .map_err(|error| CliError::LocalTree(error.to_string()))?;
-                            directories += 1;
-                            pending.push((remote_path, relative_path));
-                        }
-                        SyncEntryKind::File => {
-                            let (_, pulled): (_, SyncPullResult) =
-                                call_method::<_, host_rpc::SyncPull>(
-                                    caller,
-                                    &SyncPullParams {
-                                        serial: serial.to_owned(),
-                                        remote_path,
-                                        local_path: local_path.to_string_lossy().into_owned(),
-                                        transfer_id: None,
-                                        block_size,
-                                    },
-                                    "sync directory pull",
-                                )?;
-                            if pulled.state != TransferState::Complete
-                                || pulled.total_size != entry.size
-                                || pulled.received_size != entry.size
-                            {
-                                return Err(CliError::InvalidResult {
-                                    kind: "sync directory pull size",
-                                });
-                            }
-                            files += 1;
-                            bytes = bytes.saturating_add(pulled.received_size);
-                            transfers.push(pulled.transfer_id);
-                        }
-                    }
-                }
-                cursor = page.next_cursor;
-                if cursor.is_none() {
-                    break;
-                }
-            }
+        for directory in manifest
+            .directories
+            .iter()
+            .filter(|directory| !directory.relative_path.is_empty())
+        {
+            fs::create_dir(local_tree_path(local_root, &directory.relative_path))
+                .map_err(|error| CliError::LocalTree(error.to_string()))?;
         }
+
+        let mut bytes = 0_u64;
+        let mut transfers = Vec::with_capacity(manifest.files.len());
+        for file in &manifest.files {
+            let local_path = local_tree_path(local_root, &file.relative_path);
+            let (_, pulled): (_, SyncPullResult) = call_method::<_, host_rpc::SyncPull>(
+                caller,
+                &SyncPullParams {
+                    serial: serial.to_owned(),
+                    remote_path: file.remote_path.as_str().to_owned(),
+                    local_path: local_path.to_string_lossy().into_owned(),
+                    transfer_id: None,
+                    block_size,
+                },
+                "sync directory pull",
+            )?;
+            if pulled.state != TransferState::Complete
+                || pulled.total_size != file.size
+                || pulled.received_size != file.size
+            {
+                return Err(CliError::InvalidResult {
+                    kind: "sync directory pull size",
+                });
+            }
+            bytes = bytes.saturating_add(pulled.received_size);
+            transfers.push(pulled.transfer_id);
+        }
+
+        let final_manifest = collect_remote_tree(caller, serial, remote_root)?;
+        if final_manifest != manifest {
+            return Err(CliError::RemoteTreeChanged(remote_root.as_str().to_owned()));
+        }
+
         format_tree_summary(
             "pull",
-            remote_root,
+            remote_root.as_str(),
             local_root.to_string_lossy().as_ref(),
-            files,
-            directories,
-            u64::try_from(directories).unwrap_or(u64::MAX),
+            manifest.files.len(),
+            manifest.directories.len(),
+            u64::try_from(manifest.directories.len()).unwrap_or(u64::MAX),
             bytes,
             transfers,
             started.elapsed(),
@@ -358,6 +339,188 @@ fn sync_pull_directory<C: RpcCaller>(
         let _ = fs::remove_dir_all(local_root);
     }
     result
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteTreeManifest {
+    directories: Vec<RemoteDirectory>,
+    files: Vec<RemoteFile>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteDirectory {
+    remote_path: LogicalSyncPath,
+    relative_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteFile {
+    remote_path: LogicalSyncPath,
+    relative_path: String,
+    size: u64,
+}
+
+fn collect_remote_tree<C: RpcCaller>(
+    caller: &mut C,
+    serial: &str,
+    remote_root: &LogicalSyncPath,
+) -> Result<RemoteTreeManifest, CliError> {
+    let root = RemoteDirectory {
+        remote_path: remote_root.clone(),
+        relative_path: String::new(),
+    };
+    let mut folded_paths = BTreeMap::new();
+    register_device_path(remote_root, &mut folded_paths)?;
+    let mut directories = vec![root.clone()];
+    let mut files = Vec::new();
+    let mut pending = vec![root];
+
+    while let Some(directory) = pending.pop() {
+        let mut cursor = None;
+        loop {
+            let (_, page): (_, SyncListResult) = call_method::<_, host_rpc::SyncList>(
+                caller,
+                &SyncListParams {
+                    serial: serial.to_owned(),
+                    remote_path: directory.remote_path.as_str().to_owned(),
+                    cursor: cursor.clone(),
+                    limit: 256,
+                },
+                "sync directory list",
+            )?;
+            if page.remote_path != directory.remote_path.as_str() {
+                return Err(CliError::InvalidResult {
+                    kind: "sync directory list path",
+                });
+            }
+            let entry_count = page.entries.len();
+            if entry_count > 256 || (page.next_cursor.is_some() && entry_count != 256) {
+                return Err(CliError::InvalidResult {
+                    kind: "sync directory list page",
+                });
+            }
+
+            let mut previous_name = cursor.clone();
+            let mut last_name = None;
+            for entry in page.entries {
+                if directories
+                    .len()
+                    .saturating_sub(1)
+                    .saturating_add(files.len())
+                    >= MAX_SYNC_TREE_ENTRIES
+                {
+                    return Err(CliError::RemoteTreeTooLarge(
+                        remote_root.as_str().to_owned(),
+                    ));
+                }
+
+                let name = parse_device_entry_name(&entry.name)?;
+                if previous_name
+                    .as_deref()
+                    .is_some_and(|previous| name.as_str() <= previous)
+                {
+                    return Err(CliError::InvalidResult {
+                        kind: "sync directory list ordering",
+                    });
+                }
+                previous_name = Some(name.as_str().to_owned());
+                last_name = previous_name.clone();
+
+                let remote_path = join_device_logical_path(&directory.remote_path, name.as_str())?;
+                register_device_path(&remote_path, &mut folded_paths)?;
+                let relative_path = join_relative_path(&directory.relative_path, name.as_str());
+                match entry.kind {
+                    SyncEntryKind::Directory => {
+                        if entry.size != 0 {
+                            return Err(CliError::InvalidResult {
+                                kind: "sync directory entry size",
+                            });
+                        }
+                        let child = RemoteDirectory {
+                            remote_path,
+                            relative_path,
+                        };
+                        directories.push(child.clone());
+                        pending.push(child);
+                    }
+                    SyncEntryKind::File => files.push(RemoteFile {
+                        remote_path,
+                        relative_path,
+                        size: entry.size,
+                    }),
+                }
+            }
+
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            let next_cursor = parse_device_entry_name(&next_cursor)?;
+            if last_name.as_deref() != Some(next_cursor.as_str()) {
+                return Err(CliError::InvalidResult {
+                    kind: "sync directory list cursor",
+                });
+            }
+            cursor = Some(next_cursor.into_string());
+        }
+    }
+
+    directories.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(RemoteTreeManifest { directories, files })
+}
+
+fn parse_device_entry_name(name: &str) -> Result<LogicalSyncPath, CliError> {
+    let path = LogicalSyncPath::parse(name.to_owned()).map_err(|error| {
+        CliError::InvalidDeviceSyncPath {
+            path: name.to_owned(),
+            reason: error.to_string(),
+        }
+    })?;
+    if path.as_str().contains('/') {
+        return Err(CliError::InvalidDeviceSyncPath {
+            path: name.to_owned(),
+            reason: "directory entry names must contain one component".to_owned(),
+        });
+    }
+    Ok(path)
+}
+
+fn join_device_logical_path(
+    root: &LogicalSyncPath,
+    name: &str,
+) -> Result<LogicalSyncPath, CliError> {
+    let path = format!("{}/{name}", root.as_str());
+    LogicalSyncPath::parse(path.clone()).map_err(|error| CliError::InvalidDeviceSyncPath {
+        path,
+        reason: error.to_string(),
+    })
+}
+
+fn register_device_path(
+    path: &LogicalSyncPath,
+    folded_paths: &mut BTreeMap<String, String>,
+) -> Result<(), CliError> {
+    if let Some(first) = folded_paths.insert(path.ascii_case_fold_key(), path.as_str().to_owned()) {
+        return Err(CliError::DevicePathCollision {
+            first,
+            second: path.as_str().to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn join_relative_path(root: &str, name: &str) -> String {
+    if root.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{root}/{name}")
+    }
+}
+
+fn local_tree_path(root: &Path, relative: &str) -> PathBuf {
+    relative
+        .split('/')
+        .fold(root.to_owned(), |path, component| path.join(component))
 }
 
 struct LocalTree {
@@ -467,14 +630,6 @@ fn join_logical_path(root: &LogicalSyncPath, relative: &str) -> Result<LogicalSy
         path,
         reason: error.to_string(),
     })
-}
-
-fn join_remote_path(root: &str, relative: &str) -> String {
-    if relative.is_empty() {
-        root.to_owned()
-    } else {
-        format!("{root}/{relative}")
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

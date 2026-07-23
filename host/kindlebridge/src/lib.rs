@@ -249,6 +249,14 @@ pub enum CliError {
     InvalidRemotePath { path: String, reason: String },
     #[error("device paths collide after ASCII case folding: {first:?} and {second:?}")]
     RemotePathCollision { first: String, second: String },
+    #[error("device returned invalid sync path {path:?}: {reason}")]
+    InvalidDeviceSyncPath { path: String, reason: String },
+    #[error("device paths collide after ASCII case folding: {first:?} and {second:?}")]
+    DevicePathCollision { first: String, second: String },
+    #[error("device directory changed while it was being pulled: {0}; retry the command")]
+    RemoteTreeChanged(String),
+    #[error("device directory contains more than 100000 entries: {0}")]
+    RemoteTreeTooLarge(String),
     #[error("could not resolve the current host directory: {0}")]
     CurrentDirectory(#[source] std::io::Error),
     #[error("invalid update binary: {0}")]
@@ -1038,11 +1046,19 @@ mod tests {
                         {"name":"empty","kind":"directory","size":0}
                     ]
                 }),
+                json!({"remote_path":"tree/empty","entries":[]}),
                 json!({
                     "transfer_id":"pull-a",
                     "total_size":1,
                     "received_size":1,
                     "state":"complete"
+                }),
+                json!({
+                    "remote_path":"tree",
+                    "entries":[
+                        {"name":"a.txt","kind":"file","size":1},
+                        {"name":"empty","kind":"directory","size":0}
+                    ]
                 }),
                 json!({"remote_path":"tree/empty","entries":[]}),
             ]),
@@ -1071,9 +1087,153 @@ mod tests {
                 .iter()
                 .map(|call| call.0.as_str())
                 .collect::<Vec<_>>(),
-            [methods::SYNC_LIST, methods::SYNC_PULL, methods::SYNC_LIST]
+            [
+                methods::SYNC_LIST,
+                methods::SYNC_LIST,
+                methods::SYNC_PULL,
+                methods::SYNC_LIST,
+                methods::SYNC_LIST,
+            ]
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recursive_pull_rejects_invalid_device_paths_before_local_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "kindlebridge-cli-tree-invalid-pull-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut caller = RecordingCaller {
+            calls: Vec::new(),
+            replies: VecDeque::from([json!({
+                "remote_path":"tree",
+                "entries":[{"name":"e\u{301}.txt","kind":"file","size":1}]
+            })]),
+        };
+
+        let error = execute(
+            &mut caller,
+            &TopLevelCommand::Sync(SyncArgs {
+                command: SyncCommand::Pull {
+                    serial: "KT6-TEST".to_owned(),
+                    remote_path: "tree".to_owned(),
+                    local_path: root.to_string_lossy().into_owned(),
+                    block_size: 65_536,
+                    resume: None,
+                    recursive: true,
+                },
+            }),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CliError::InvalidDeviceSyncPath { path, reason }
+                if path == "e\u{301}.txt" && reason == "path is not Unicode NFC"
+        ));
+        assert_eq!(caller.calls.len(), 1);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn recursive_pull_rejects_device_case_collisions_before_local_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "kindlebridge-cli-tree-collision-pull-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut caller = RecordingCaller {
+            calls: Vec::new(),
+            replies: VecDeque::from([json!({
+                "remote_path":"tree",
+                "entries":[
+                    {"name":"Assets","kind":"directory","size":0},
+                    {"name":"assets","kind":"directory","size":0}
+                ]
+            })]),
+        };
+
+        let error = execute(
+            &mut caller,
+            &TopLevelCommand::Sync(SyncArgs {
+                command: SyncCommand::Pull {
+                    serial: "KT6-TEST".to_owned(),
+                    remote_path: "tree".to_owned(),
+                    local_path: root.to_string_lossy().into_owned(),
+                    block_size: 65_536,
+                    resume: None,
+                    recursive: true,
+                },
+            }),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CliError::DevicePathCollision { first, second }
+                if first == "tree/Assets" && second == "tree/assets"
+        ));
+        assert_eq!(caller.calls.len(), 1);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn recursive_pull_removes_the_result_if_the_device_manifest_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "kindlebridge-cli-tree-changing-pull-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut caller = RecordingCaller {
+            calls: Vec::new(),
+            replies: VecDeque::from([
+                json!({
+                    "remote_path":"tree",
+                    "entries":[{"name":"a.txt","kind":"file","size":1}]
+                }),
+                json!({
+                    "transfer_id":"pull-a",
+                    "total_size":1,
+                    "received_size":1,
+                    "state":"complete"
+                }),
+                json!({
+                    "remote_path":"tree",
+                    "entries":[{"name":"a.txt","kind":"file","size":2}]
+                }),
+            ]),
+        };
+
+        let error = execute(
+            &mut caller,
+            &TopLevelCommand::Sync(SyncArgs {
+                command: SyncCommand::Pull {
+                    serial: "KT6-TEST".to_owned(),
+                    remote_path: "tree".to_owned(),
+                    local_path: root.to_string_lossy().into_owned(),
+                    block_size: 65_536,
+                    resume: None,
+                    recursive: true,
+                },
+            }),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CliError::RemoteTreeChanged(path) if path == "tree"));
+        assert_eq!(
+            caller
+                .calls
+                .iter()
+                .map(|call| call.0.as_str())
+                .collect::<Vec<_>>(),
+            [methods::SYNC_LIST, methods::SYNC_PULL, methods::SYNC_LIST]
+        );
+        assert!(!root.exists());
     }
 
     #[test]
