@@ -14,13 +14,14 @@ use base64::Engine;
 use kindlebridge_schema::shell_protocol::ShellPacket;
 use kindlebridge_schema::{
     error_codes, methods, parse_request_value, read_frame, write_json_frame, AppInstallParams,
-    AppList, AppSummary, AppTargetParams, DeviceFeatures, DeviceFeaturesParams, DeviceList,
-    DeviceSummary, ExecParams, ExecResult, FramingError, LogSnapshot, LogTailParams, ProcessList,
-    ProcessSignalParams, ProcessSummary, RequestId, RpcError, RpcRequest, RpcResponse,
-    SerialParams, ServerVersion, ShellOpenParams, ShellOpenResult, StreamChannel,
-    StreamClosedParams, StreamCreditParams, StreamDataParams, StreamExitParams, StreamIdParams,
-    StreamResizeParams, StreamWriteParams, SyncPullParams, SyncPullResult, SyncPushParams,
-    SyncPushResult, SyncStatus, SyncStatusParams, DEFAULT_MAX_CONTENT_LENGTH,
+    AppList, AppLogParams, AppLogSnapshot, AppSummary, AppTargetParams, DeviceFeatures,
+    DeviceFeaturesParams, DeviceList, DeviceSummary, ExecParams, ExecResult, FramingError,
+    LogSnapshot, LogTailParams, ProcessList, ProcessSignalParams, ProcessSummary, RequestId,
+    RpcError, RpcRequest, RpcResponse, SerialParams, ServerVersion, ShellOpenParams,
+    ShellOpenResult, StreamChannel, StreamClosedParams, StreamCreditParams, StreamDataParams,
+    StreamExitParams, StreamIdParams, StreamResizeParams, StreamWriteParams, SyncPullParams,
+    SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams,
+    DEFAULT_MAX_CONTENT_LENGTH,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,7 @@ pub trait DeviceProvider: Send + Sync {
     fn app_rollback(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError>;
     fn app_uninstall(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError>;
     fn app_list(&self, params: &SerialParams) -> Result<AppList, RpcError>;
+    fn app_log(&self, params: &AppLogParams) -> Result<AppLogSnapshot, RpcError>;
     fn process_list(&self, params: &SerialParams) -> Result<ProcessList, RpcError>;
     fn process_signal(&self, params: &ProcessSignalParams) -> Result<ProcessSummary, RpcError>;
     fn log_tail(&self, params: &LogTailParams) -> Result<LogSnapshot, RpcError>;
@@ -250,6 +252,11 @@ impl DeviceProvider for MemoryDeviceProvider {
     fn app_list(&self, params: &SerialParams) -> Result<AppList, RpcError> {
         self.ensure_device(&params.serial)?;
         Ok(self.runtime()?.app_list(params))
+    }
+
+    fn app_log(&self, params: &AppLogParams) -> Result<AppLogSnapshot, RpcError> {
+        self.ensure_device(&params.serial)?;
+        self.runtime()?.app_log(params)
     }
 
     fn process_list(&self, params: &SerialParams) -> Result<ProcessList, RpcError> {
@@ -433,6 +440,10 @@ fn dispatch<P: DeviceProvider + ?Sized>(
         methods::APP_LIST => {
             let params = parse_params::<SerialParams>(request, "serial params")?;
             to_value(provider.app_list(&params)?)
+        }
+        methods::APP_LOG => {
+            let params = parse_params::<AppLogParams>(request, "app log params")?;
+            to_value(provider.app_log(&params)?)
         }
         methods::PROCESS_LIST => {
             let params = parse_params::<SerialParams>(request, "serial params")?;
@@ -939,6 +950,7 @@ mod tests {
         unused_provider_method!(app_rollback(params: &AppTargetParams) -> Result<AppSummary, RpcError>);
         unused_provider_method!(app_uninstall(params: &AppTargetParams) -> Result<AppSummary, RpcError>);
         unused_provider_method!(app_list(params: &SerialParams) -> Result<AppList, RpcError>);
+        unused_provider_method!(app_log(params: &AppLogParams) -> Result<AppLogSnapshot, RpcError>);
         unused_provider_method!(process_list(params: &SerialParams) -> Result<ProcessList, RpcError>);
         unused_provider_method!(process_signal(params: &ProcessSignalParams) -> Result<ProcessSummary, RpcError>);
         unused_provider_method!(log_tail(params: &LogTailParams) -> Result<LogSnapshot, RpcError>);

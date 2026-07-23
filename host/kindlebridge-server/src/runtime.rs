@@ -5,10 +5,11 @@ use std::path::Path;
 
 use kindlebridge_bundle::{verify, BundleKind, VerifyOptions};
 use kindlebridge_schema::{
-    error_codes, AppInstallParams, AppList, AppState, AppSummary, AppTargetParams, LogEntry,
-    LogSnapshot, LogTailParams, ProcessList, ProcessSignal, ProcessSignalParams, ProcessState,
-    ProcessSummary, RpcError, SerialParams, SyncPullParams, SyncPullResult, SyncPushParams,
-    SyncPushResult, SyncStatus, SyncStatusParams, TransferDirection, TransferState,
+    error_codes, AppInstallParams, AppList, AppLogChunk, AppLogParams, AppLogSnapshot, AppState,
+    AppSummary, AppTargetParams, LogEntry, LogSnapshot, LogTailParams, ProcessList, ProcessSignal,
+    ProcessSignalParams, ProcessState, ProcessSummary, RpcError, SerialParams, SyncPullParams,
+    SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams,
+    TransferDirection, TransferState,
 };
 use serde_json::json;
 
@@ -372,6 +373,24 @@ impl RuntimeState {
         AppList { apps }
     }
 
+    pub(crate) fn app_log(&self, params: &AppLogParams) -> Result<AppLogSnapshot, RpcError> {
+        let app = self
+            .apps
+            .get(&(params.serial.clone(), params.app_id.clone()))
+            .ok_or_else(|| app_not_found(&params.app_id))?;
+        let run_id = format!("fake-{}", app.pid.unwrap_or(0));
+        let reset = params.run_id.as_deref() != Some(run_id.as_str());
+        let stdout_cursor = if reset { 0 } else { params.stdout_cursor };
+        let stderr_cursor = if reset { 0 } else { params.stderr_cursor };
+        Ok(AppLogSnapshot {
+            app_id: params.app_id.clone(),
+            run_id,
+            reset,
+            stdout: empty_app_log_chunk(stdout_cursor),
+            stderr: empty_app_log_chunk(stderr_cursor),
+        })
+    }
+
     pub(crate) fn process_list(&self, params: &SerialParams) -> ProcessList {
         let processes = self
             .processes
@@ -481,6 +500,15 @@ impl RuntimeState {
         if logs.len() > MAX_LOG_ENTRIES {
             logs.pop_front();
         }
+    }
+}
+
+fn empty_app_log_chunk(cursor: u64) -> AppLogChunk {
+    AppLogChunk {
+        cursor,
+        next_cursor: cursor,
+        data_base64: String::new(),
+        capped: false,
     }
 }
 

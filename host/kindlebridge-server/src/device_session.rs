@@ -271,6 +271,13 @@ impl DeviceProvider for ReconnectingUsbProvider {
         self.rpc(|provider| provider.app_start(params))
     }
 
+    fn app_log(
+        &self,
+        params: &kindlebridge_schema::AppLogParams,
+    ) -> Result<kindlebridge_schema::AppLogSnapshot, RpcError> {
+        self.rpc(|provider| provider.app_log(params))
+    }
+
     fn app_stop(&self, params: &AppTargetParams) -> Result<AppSummary, RpcError> {
         self.rpc(|provider| provider.app_stop(params))
     }
@@ -458,6 +465,18 @@ impl DeviceProvider for ConnectedDeviceProvider {
             &params.serial,
             APP_START_FEATURE,
             kindlebridge_schema::methods::APP_START,
+            params,
+        )
+    }
+
+    fn app_log(
+        &self,
+        params: &kindlebridge_schema::AppLogParams,
+    ) -> Result<kindlebridge_schema::AppLogSnapshot, RpcError> {
+        self.remote_call(
+            &params.serial,
+            kindlebridge_schema::device_protocol::APP_LOG_FEATURE,
+            kindlebridge_schema::methods::APP_LOG,
             params,
         )
     }
@@ -2757,6 +2776,7 @@ mod tests {
             vec![
                 kindlebridge_schema::device_protocol::APP_INSTALL_FEATURE,
                 kindlebridge_schema::device_protocol::APP_LIST_FEATURE,
+                kindlebridge_schema::device_protocol::APP_LOG_FEATURE,
                 kindlebridge_schema::device_protocol::APP_RESTART_FEATURE,
                 kindlebridge_schema::device_protocol::APP_ROLLBACK_FEATURE,
                 kindlebridge_schema::device_protocol::APP_START_FEATURE,
