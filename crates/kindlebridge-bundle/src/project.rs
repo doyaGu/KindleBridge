@@ -14,6 +14,7 @@ use crate::{
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevelopmentConfig {
+    #[serde(default)]
     pub build: Vec<String>,
     pub input: PathBuf,
     pub signing_key: PathBuf,
@@ -235,6 +236,24 @@ mod tests {
     use super::*;
     use crate::inspect_bytes;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn development_build_is_optional_for_prebuilt_input_trees() {
+        let manifest: ProjectManifest = toml::from_str(
+            r#"
+kind = "application"
+id = "org.example.script"
+version = "0.1.0"
+release = 1
+
+[development]
+input = "root"
+signing_key = "dev.key"
+"#,
+        )
+        .unwrap();
+        assert!(manifest.development.unwrap().build.is_empty());
+    }
 
     #[test]
     fn development_manifest_builds_with_an_overridden_release_and_replaces_output() {

@@ -246,12 +246,20 @@ watch = ["src", "meson.build", "kindlebridge.toml"]
 
 The command is an argument array and is executed directly from the manifest
 directory, without host-shell reparsing. The other paths are also relative to
-that directory. A one-shot run builds, creates a verified KBB, installs it
+that directory. `build` may be omitted for scripts or already-built input
+trees. A one-shot run builds, creates a verified KBB, installs it
 atomically, and starts the declared application:
 
 ```powershell
 kindlebridge run YOUR_KINDLE_SERIAL
 kindlebridge run YOUR_KINDLE_SERIAL --watch
+```
+
+The checked-in `examples/hello` project can be run without a compiler:
+
+```powershell
+kindlebridge-bundle key init --output examples/hello/.kindlebridge/dev.key
+kindlebridge run YOUR_KINDLE_SERIAL --manifest examples/hello/kindlebridge.toml
 ```
 
 Watch mode debounces changes to the explicitly listed paths and reconnects to

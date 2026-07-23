@@ -1,0 +1,26 @@
+kind = "application"
+id = "org.kindlebridge.example.hello"
+version = "0.1.0"
+release = 1
+channel = "dev"
+target = "kindlehf"
+firmware_min = [5, 16, 3]
+entrypoints = { main = "bin/hello.sh" }
+publisher_name = "Local KindleBridge developer"
+
+[permissions]
+requested = []
+optional = []
+
+[process]
+restart = "never"
+stop_timeout_ms = 1000
+
+[data]
+policy = "ephemeral"
+schema = 1
+
+[development]
+input = "bundle-root"
+signing_key = ".kindlebridge/dev.key"
+watch = ["bundle-root", "kindlebridge.toml"]

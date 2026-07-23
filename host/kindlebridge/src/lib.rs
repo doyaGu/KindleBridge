@@ -527,38 +527,8 @@ pub fn run_project_once<C: RpcCaller>(
             manifest_path.display()
         ))
     })?;
-    let (program, arguments) = development.build.split_first().ok_or_else(|| {
-        CliError::Project("[development].build must contain a program".to_owned())
-    })?;
-    let mut command = Command::new(program);
-    command.args(arguments).current_dir(project_root);
-    if json_output {
-        let output = command.output().map_err(|error| {
-            CliError::Project(format!("could not start build command {program}: {error}"))
-        })?;
-        if !output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let combined = format!("{stdout}{stderr}").trim().to_owned();
-            return Err(CliError::BuildFailed {
-                exit_code: output.status.code().unwrap_or(1),
-                detail: if combined.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {combined}")
-                },
-            });
-        }
-    } else {
-        let status = command.status().map_err(|error| {
-            CliError::Project(format!("could not start build command {program}: {error}"))
-        })?;
-        if !status.success() {
-            return Err(CliError::BuildFailed {
-                exit_code: status.code().unwrap_or(1),
-                detail: String::new(),
-            });
-        }
+    if let Some((program, arguments)) = development.build.split_first() {
+        run_project_build(program, arguments, project_root, json_output)?;
     }
 
     let input = resolve_project_path(project_root, &development.input);
@@ -611,6 +581,45 @@ pub fn run_project_once<C: RpcCaller>(
             format_app_result(started_value, &started, false)?
         ))
     }
+}
+
+fn run_project_build(
+    program: &str,
+    arguments: &[String],
+    project_root: &Path,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let mut command = Command::new(program);
+    command.args(arguments).current_dir(project_root);
+    if json_output {
+        let output = command.output().map_err(|error| {
+            CliError::Project(format!("could not start build command {program}: {error}"))
+        })?;
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let combined = format!("{stdout}{stderr}").trim().to_owned();
+            return Err(CliError::BuildFailed {
+                exit_code: output.status.code().unwrap_or(1),
+                detail: if combined.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {combined}")
+                },
+            });
+        }
+    } else {
+        let status = command.status().map_err(|error| {
+            CliError::Project(format!("could not start build command {program}: {error}"))
+        })?;
+        if !status.success() {
+            return Err(CliError::BuildFailed {
+                exit_code: status.code().unwrap_or(1),
+                detail: String::new(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn next_development_release(root: &Path, manifest_release: u64) -> Result<u64, CliError> {
