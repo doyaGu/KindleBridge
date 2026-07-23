@@ -570,6 +570,8 @@ pub struct AppLogSnapshot {
     pub app_id: String,
     pub run_id: String,
     pub reset: bool,
+    pub state: AppState,
+    pub pid: Option<u32>,
     pub stdout: AppLogChunk,
     pub stderr: AppLogChunk,
 }

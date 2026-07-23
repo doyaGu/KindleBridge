@@ -2003,7 +2003,7 @@ fn dispatch_app_log(
         "expected serial, app_id, run_id, cursors, and max_bytes",
     )?;
     require_serial(&params.serial, config)?;
-    services::app_log(&config.activation_root, &params)
+    services::app_log(&config.activation_root, &config.app_supervisor, &params)
 }
 
 fn dispatch_app_stop(

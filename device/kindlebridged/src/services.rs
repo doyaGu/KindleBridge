@@ -244,14 +244,7 @@ fn app_summary_from_generation(
                 "committed activation does not contain the installed app",
             )
         })?;
-    let status = supervisor
-        .status(&entry.id, entry.bundle_root)
-        .map_err(|error| app_runtime_error("status", &entry.id, &error))?;
-    let (state, pid) = match status {
-        RuntimeStatus::Stopped => (AppState::Stopped, None),
-        RuntimeStatus::Running(pid) => (AppState::Running, Some(pid)),
-        RuntimeStatus::Failed => (AppState::Failed, None),
-    };
+    let (state, pid) = application_runtime_state(supervisor, entry)?;
     let store = InstallStore::open(activation_root, APP_BLOCK_QUOTA_BYTES)
         .map_err(|error| invalid_device_state(error.to_string()))?;
     Ok(AppSummary {
@@ -309,14 +302,7 @@ fn app_list_unlocked(
                 entry.id
             ))
         })?;
-        let status = supervisor
-            .status(&entry.id, entry.bundle_root)
-            .map_err(|error| app_runtime_error("status", &entry.id, &error))?;
-        let (state, pid) = match status {
-            RuntimeStatus::Stopped => (AppState::Stopped, None),
-            RuntimeStatus::Running(pid) => (AppState::Running, Some(pid)),
-            RuntimeStatus::Failed => (AppState::Failed, None),
-        };
+        let (state, pid) = application_runtime_state(supervisor, entry)?;
         let summary = AppSummary {
             app_id: entry.id.clone(),
             version: entry.code_version.clone(),
@@ -344,8 +330,13 @@ pub fn app_start(
     app_start_unlocked(activation_root, supervisor, app_id)
 }
 
-pub fn app_log(activation_root: &Path, params: &AppLogParams) -> Result<AppLogSnapshot, RpcError> {
-    active_application_entry(activation_root, &params.app_id)?;
+pub fn app_log(
+    activation_root: &Path,
+    supervisor: &AppSupervisor,
+    params: &AppLogParams,
+) -> Result<AppLogSnapshot, RpcError> {
+    let (_active, entry) = active_application_entry(activation_root, &params.app_id)?;
+    let (state, pid) = application_runtime_state(supervisor, &entry)?;
     let limit = params.max_bytes.unwrap_or(16 * 1024);
     if limit == 0 || limit > MAX_APP_LOG_READ {
         return Err(RpcError::invalid_params(
@@ -363,6 +354,8 @@ pub fn app_log(activation_root: &Path, params: &AppLogParams) -> Result<AppLogSn
                 app_id: params.app_id.clone(),
                 run_id: "not-started".to_owned(),
                 reset: params.run_id.as_deref() != Some("not-started"),
+                state,
+                pid,
                 stdout: empty_app_log_chunk(),
                 stderr: empty_app_log_chunk(),
             });
@@ -379,6 +372,8 @@ pub fn app_log(activation_root: &Path, params: &AppLogParams) -> Result<AppLogSn
         app_id: params.app_id.clone(),
         run_id,
         reset,
+        state,
+        pid,
         stdout: read_app_log_chunk(&root.join("stdout.log"), stdout_cursor, limit)?,
         stderr: read_app_log_chunk(&root.join("stderr.log"), stderr_cursor, limit)?,
     })
@@ -745,6 +740,20 @@ fn active_application_entry(
         .cloned()
         .ok_or_else(|| app_not_found(app_id))?;
     Ok((active, entry))
+}
+
+fn application_runtime_state(
+    supervisor: &AppSupervisor,
+    entry: &ActivationEntry,
+) -> Result<(AppState, Option<u32>), RpcError> {
+    let status = supervisor
+        .status(&entry.id, entry.bundle_root)
+        .map_err(|error| app_runtime_error("status", &entry.id, &error))?;
+    Ok(match status {
+        RuntimeStatus::Stopped => (AppState::Stopped, None),
+        RuntimeStatus::Running(pid) => (AppState::Running, Some(pid)),
+        RuntimeStatus::Failed => (AppState::Failed, None),
+    })
 }
 
 fn app_runtime_error(operation: &str, app_id: &str, error: &RuntimeError) -> RpcError {
@@ -1440,9 +1449,11 @@ mod tests {
             stderr_cursor: 0,
             max_bytes: Some(4),
         };
-        let not_started = app_log(&activation_root, &params).unwrap();
+        let not_started = app_log(&activation_root, &supervisor, &params).unwrap();
         assert_eq!(not_started.run_id, "not-started");
         assert!(not_started.reset);
+        assert_eq!(not_started.state, AppState::Stopped);
+        assert_eq!(not_started.pid, None);
         assert_eq!(not_started.stdout.next_cursor, 0);
 
         let logs = activation_root
@@ -1456,7 +1467,7 @@ mod tests {
 
         params.run_id = Some(not_started.run_id);
         params.stdout_cursor = 99;
-        let first = app_log(&activation_root, &params).unwrap();
+        let first = app_log(&activation_root, &supervisor, &params).unwrap();
         assert!(first.reset);
         assert_eq!(first.run_id, "run-1");
         assert_eq!(BASE64.decode(first.stdout.data_base64).unwrap(), b"abcd");
@@ -1465,7 +1476,7 @@ mod tests {
         params.run_id = Some(first.run_id);
         params.stdout_cursor = first.stdout.next_cursor;
         params.stderr_cursor = first.stderr.next_cursor;
-        let second = app_log(&activation_root, &params).unwrap();
+        let second = app_log(&activation_root, &supervisor, &params).unwrap();
         assert!(!second.reset);
         assert_eq!(BASE64.decode(second.stdout.data_base64).unwrap(), b"efgh");
         assert_eq!(BASE64.decode(second.stderr.data_base64).unwrap(), b"r!");
@@ -1776,10 +1787,27 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(failed.pid, None);
+        let params = AppLogParams {
+            serial: "KT6-TEST".to_owned(),
+            app_id: "org.example.failure".to_owned(),
+            run_id: None,
+            stdout_cursor: 0,
+            stderr_cursor: 0,
+            max_bytes: None,
+        };
+        let failed_log = app_log(&activation_root, &supervisor, &params).unwrap();
+        assert_eq!(failed_log.state, AppState::Failed);
+        assert_eq!(failed_log.pid, None);
 
         let stopped = app_stop(&activation_root, &supervisor, "org.example.failure").unwrap();
         assert_eq!(stopped.state, AppState::Stopped);
         assert_eq!(stopped.pid, None);
+        assert_eq!(
+            app_log(&activation_root, &supervisor, &params)
+                .unwrap()
+                .state,
+            AppState::Stopped
+        );
     }
 
     #[test]

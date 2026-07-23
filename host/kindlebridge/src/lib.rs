@@ -1592,6 +1592,8 @@ mod tests {
                 "app_id": "org.example.reader",
                 "run_id": "run-1",
                 "reset": true,
+                "state": "running",
+                "pid": 2048,
                 "stdout": {
                     "cursor": 0,
                     "next_cursor": 6,

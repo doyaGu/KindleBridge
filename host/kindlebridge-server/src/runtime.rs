@@ -386,6 +386,8 @@ impl RuntimeState {
             app_id: params.app_id.clone(),
             run_id,
             reset,
+            state: app.state.clone(),
+            pid: app.pid,
             stdout: empty_app_log_chunk(stdout_cursor),
             stderr: empty_app_log_chunk(stderr_cursor),
         })
