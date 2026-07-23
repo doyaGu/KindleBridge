@@ -89,6 +89,9 @@ Cargo package is an internal build identifier, not a product release.
   server connection for each redeployment. Fake-device coverage proves two
   distinct deployments remain running and expose rollback, while a failed
   build sends no device mutation and leaves the previous application active.
+  The checked-in no-compiler hello example also passed one-shot run, two
+  source-triggered watch redeployments with changing PIDs, explicit stop, and
+  uninstall on the KT6 without a USB mode transition or daemon restart.
   Cancelling an obsolete in-flight build and merging live application logs
   remain required before this workflow is feature-complete.
 - A formal USB device link, not only a raw probe. The host automatically
