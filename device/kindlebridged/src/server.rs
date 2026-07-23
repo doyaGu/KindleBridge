@@ -159,7 +159,7 @@ impl TcpServer {
             listener,
             config,
             sync_store,
-            shells: ShellStreams::default(),
+            shells: ShellStreams::new(),
         })
     }
 
@@ -245,7 +245,7 @@ impl UsbServer {
             functionfs,
             config,
             sync_store,
-            shells: ShellStreams::default(),
+            shells: ShellStreams::new(),
         })
     }
 

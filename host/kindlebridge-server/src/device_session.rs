@@ -1579,6 +1579,62 @@ mod tests {
     }
 
     #[test]
+    fn shell_quota_reopens_only_after_a_shell_is_cleaned_up() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let server = TcpServer::bind(
+            SocketAddr::new(loopback, 0),
+            ServerConfig::new(DeviceInfo::kt6("KT6-SHELL-QUOTA")).allow_peer(loopback),
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let server_worker = thread::spawn(move || server.serve_once());
+        let provider = ConnectedDeviceProvider::connect(&[address]).unwrap();
+
+        let mut shells = (0..4)
+            .map(|_| open_echo_shell(&provider, "KT6-SHELL-QUOTA"))
+            .collect::<Vec<_>>();
+        assert!(provider
+            .open_shell("KT6-SHELL-QUOTA", echo_shell_open())
+            .is_err());
+
+        shells.pop().unwrap().close().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let replacement = loop {
+            match provider.open_shell("KT6-SHELL-QUOTA", echo_shell_open()) {
+                Ok(shell) => break shell,
+                Err(_) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => panic!("shell quota was not released after cleanup: {error}"),
+            }
+        };
+        replacement
+            .send(ShellPacket::Stdin(b"replacement\n".to_vec()))
+            .unwrap();
+        loop {
+            match replacement.recv().unwrap() {
+                DeviceShellEvent::Packet(ShellPacket::Stdout(bytes))
+                    if bytes
+                        .windows(b"replacement\n".len())
+                        .any(|window| window == b"replacement\n") =>
+                {
+                    break;
+                }
+                DeviceShellEvent::Packet(_) => {}
+                DeviceShellEvent::Closed => panic!("replacement shell closed before echo"),
+            }
+        }
+
+        replacement.close().unwrap();
+        drop(replacement);
+        for shell in shells {
+            shell.close().unwrap();
+        }
+        drop(provider);
+        server_worker.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn malformed_shell_packet_resets_only_its_stream() {
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let server = TcpServer::bind(
@@ -1792,6 +1848,27 @@ mod tests {
             output.write_all(&buffer[..count]).unwrap();
             output.flush().unwrap();
         }
+    }
+
+    fn echo_shell_open() -> ShellOpen {
+        let executable = std::env::current_exe().unwrap();
+        ShellOpen {
+            mode: kindlebridge_schema::device_protocol::ShellMode::Raw,
+            argv: vec![
+                executable.to_string_lossy().into_owned(),
+                "--exact".to_owned(),
+                "device_session::tests::shell_echo_child_helper".to_owned(),
+                "--ignored".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            terminal_size: None,
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            term: "linux".to_owned(),
+        }
+    }
+
+    fn open_echo_shell(provider: &ConnectedDeviceProvider, serial: &str) -> DeviceShell {
+        provider.open_shell(serial, echo_shell_open()).unwrap()
     }
 
     fn shell_echo_latencies(

@@ -20,12 +20,18 @@ use crate::shell::{ShellEvent, ShellWorker, ShellWorkerError};
 
 const MAX_CONCURRENT_SHELLS: usize = 4;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct ShellStreams {
     active: Arc<AtomicUsize>,
 }
 
 impl ShellStreams {
+    pub(crate) fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
     pub(crate) fn serve(&self, incoming: ActorIncomingStream) -> Result<(), ShellStreamError> {
         let Some(_slot) = ShellSlot::reserve(Arc::clone(&self.active)) else {
             incoming.reject("at most four Shell Streams may be active")?;
@@ -246,7 +252,7 @@ mod tests {
 
     #[test]
     fn registry_allows_four_streams_across_clones_and_releases_slots() {
-        let streams = ShellStreams::default();
+        let streams = ShellStreams::new();
         let mut slots = Vec::new();
         for _ in 0..MAX_CONCURRENT_SHELLS {
             slots.push(ShellSlot::reserve(Arc::clone(&streams.active)).unwrap());
