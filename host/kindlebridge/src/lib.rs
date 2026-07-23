@@ -3,6 +3,7 @@
 mod app;
 mod development;
 mod sync;
+mod sync_tree;
 
 pub use app::{AppArgs, AppCommand};
 pub use development::{deploy_project_after_build, run_project_once, RunArgs};
