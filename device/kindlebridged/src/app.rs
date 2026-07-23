@@ -1,7 +1,11 @@
 //! Deterministic application lifecycle state machine and process supervisor.
 
 use std::collections::BTreeMap;
-use std::fs;
+#[cfg(any(target_os = "linux", test))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
+#[cfg(any(target_os = "linux", test))]
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Mutex};
@@ -21,6 +25,10 @@ const RESTART_BACKOFFS: [Duration; MAX_CONSECUTIVE_RESTARTS as usize] = [
     Duration::from_millis(100),
     Duration::from_millis(200),
 ];
+#[cfg(target_os = "linux")]
+const MAX_APP_LOG_BYTES: u64 = 4 * 1024 * 1024;
+const APP_STDOUT_LOG: &str = "stdout.log";
+const APP_STDERR_LOG: &str = "stderr.log";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestartPolicy {
@@ -398,6 +406,12 @@ fn start_application(
     let data_dir = data_root.join(&app.app_id);
     ensure_plain_directory(data_root)?;
     ensure_plain_directory(&data_dir)?;
+    let log_dir = data_dir.join(".kindlebridge-logs");
+    ensure_plain_directory(&log_dir)?;
+    let stdout_log = log_dir.join(APP_STDOUT_LOG);
+    let stderr_log = log_dir.join(APP_STDERR_LOG);
+    File::create(&stdout_log).map_err(RuntimeError::Filesystem)?;
+    File::create(&stderr_log).map_err(RuntimeError::Filesystem)?;
     let working_dir = app
         .process
         .working_dir
@@ -416,7 +430,9 @@ fn start_application(
         .env("SHELL", "/bin/sh")
         .env("KINDLEBRIDGE_APP_ID", &app.app_id)
         .env("KINDLEBRIDGE_APP_ROOT", &app.image_root)
-        .env("KINDLEBRIDGE_DATA", &data_dir);
+        .env("KINDLEBRIDGE_DATA", &data_dir)
+        .env("KINDLEBRIDGE_STDOUT_LOG", stdout_log)
+        .env("KINDLEBRIDGE_STDERR_LOG", stderr_log);
     copy_device_environment(&mut command, "DISPLAY");
     copy_device_environment(&mut command, "LANG");
     copy_device_environment(&mut command, "LC_ALL");
@@ -630,6 +646,13 @@ pub fn run_application_supervisor(
         waited.add(signal);
     }
     waited.thread_block().map_err(|error| error.to_string())?;
+    let log_paths = match (
+        std::env::var_os("KINDLEBRIDGE_STDOUT_LOG"),
+        std::env::var_os("KINDLEBRIDGE_STDERR_LOG"),
+    ) {
+        (Some(stdout), Some(stderr)) => Some((PathBuf::from(stdout), PathBuf::from(stderr))),
+        _ => None,
+    };
 
     let mut restart_count = 0_u32;
     loop {
@@ -639,10 +662,31 @@ pub fn run_application_supervisor(
             .arg("exec-app")
             .arg("--entrypoint")
             .arg(entrypoint)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stdin(Stdio::null());
+        if log_paths.is_some() {
+            child_command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        } else {
+            child_command
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+        }
         let mut child = child_command.spawn().map_err(|error| error.to_string())?;
+        let mut pumps = if let Some((stdout_path, stderr_path)) = &log_paths {
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or("application stdout pipe is unavailable")?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or("application stderr pipe is unavailable")?;
+            Some([
+                spawn_log_pump(stdout, stdout_path.clone()),
+                spawn_log_pump(stderr, stderr_path.clone()),
+            ])
+        } else {
+            None
+        };
         let started = Instant::now();
         loop {
             let signal = waited.wait().map_err(|error| error.to_string())?;
@@ -650,6 +694,7 @@ pub fn run_application_supervisor(
                 let Some(status) = child.try_wait().map_err(|error| error.to_string())? else {
                     continue;
                 };
+                join_log_pumps(&mut pumps)?;
                 cleanup_process_group_members(getpgrp())?;
                 if status.success() {
                     return Ok(());
@@ -686,13 +731,62 @@ pub fn run_application_supervisor(
                     .is_some()
                 {
                     cleanup_process_group_members(application_group)?;
+                    join_log_pumps(&mut pumps)?;
                     return Ok(());
                 }
                 thread::sleep(Duration::from_millis(20));
             }
             let _ = killpg(application_group, Signal::SIGKILL);
             child.wait().map_err(|error| error.to_string())?;
+            join_log_pumps(&mut pumps)?;
             return Ok(());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_log_pump(
+    reader: impl Read + Send + 'static,
+    path: PathBuf,
+) -> JoinHandle<Result<(), String>> {
+    thread::spawn(move || copy_capped_log(reader, &path).map_err(|error| error.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn join_log_pumps(pumps: &mut Option<[JoinHandle<Result<(), String>>; 2]>) -> Result<(), String> {
+    if let Some(pumps) = pumps.take() {
+        for pump in pumps {
+            pump.join()
+                .map_err(|_| "application log pump panicked".to_owned())??;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn copy_capped_log(reader: impl Read, path: &Path) -> std::io::Result<()> {
+    copy_capped_log_with_limit(reader, path, MAX_APP_LOG_BYTES)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn copy_capped_log_with_limit(
+    mut reader: impl Read,
+    path: &Path,
+    limit: u64,
+) -> std::io::Result<()> {
+    let mut output = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut written = output.metadata()?.len().min(limit);
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return output.flush();
+        }
+        if written < limit {
+            let remaining = usize::try_from(limit - written).unwrap_or(usize::MAX);
+            let accepted = count.min(remaining);
+            output.write_all(&buffer[..accepted])?;
+            written += accepted as u64;
         }
     }
 }
@@ -859,6 +953,18 @@ fn signal_process_group(pid: u32, signal: nix::sys::signal::Signal) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_log_pump_drains_input_but_caps_the_file() {
+        let path =
+            std::env::temp_dir().join(format!("kindlebridge-app-log-{}", std::process::id()));
+        let _ = fs::remove_file(&path);
+        copy_capped_log_with_limit(&b"0123456789"[..], &path, 5).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"01234");
+        copy_capped_log_with_limit(&b"more"[..], &path, 5).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"01234");
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn restarts_only_failed_processes_when_requested() {
