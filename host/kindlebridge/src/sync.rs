@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -91,7 +92,7 @@ pub(super) fn execute<C: RpcCaller>(
                         caller,
                         serial,
                         Path::new(&local_path),
-                        remote_path.as_str(),
+                        &remote_path,
                         block_size,
                         json_output,
                     );
@@ -206,20 +207,19 @@ fn sync_push_directory<C: RpcCaller>(
     caller: &mut C,
     serial: &str,
     local_root: &Path,
-    remote_root: &str,
+    remote_root: &LogicalSyncPath,
     block_size: u32,
     json_output: bool,
 ) -> Result<String, CliError> {
     let started = Instant::now();
-    let tree = collect_local_tree(local_root)?;
+    let tree = prepare_push_tree(remote_root, collect_local_tree(local_root)?)?;
     let mut created_directories = 0_u64;
-    for relative in std::iter::once("").chain(tree.directories.iter().map(String::as_str)) {
-        let remote_path = join_remote_path(remote_root, relative);
+    for remote_path in &tree.directories {
         let (_, result): (_, SyncMkdirResult) = call_method::<_, host_rpc::SyncMkdir>(
             caller,
             &SyncMkdirParams {
                 serial: serial.to_owned(),
-                remote_path,
+                remote_path: remote_path.as_str().to_owned(),
             },
             "sync mkdir",
         )?;
@@ -228,14 +228,13 @@ fn sync_push_directory<C: RpcCaller>(
 
     let mut bytes = 0_u64;
     let mut transfers = Vec::with_capacity(tree.files.len());
-    for (relative, local_path) in &tree.files {
-        let remote_path = join_remote_path(remote_root, relative);
+    for (remote_path, local_path) in &tree.files {
         let (_, result): (_, SyncPushResult) = call_method::<_, host_rpc::SyncPush>(
             caller,
             &SyncPushParams {
                 serial: serial.to_owned(),
                 local_path: local_path.to_string_lossy().into_owned(),
-                remote_path,
+                remote_path: remote_path.as_str().to_owned(),
                 transfer_id: None,
                 block_size,
             },
@@ -247,9 +246,9 @@ fn sync_push_directory<C: RpcCaller>(
     format_tree_summary(
         "push",
         local_root.to_string_lossy().as_ref(),
-        remote_root,
+        remote_root.as_str(),
         tree.files.len(),
-        tree.directories.len() + 1,
+        tree.directories.len(),
         created_directories,
         bytes,
         transfers,
@@ -366,6 +365,11 @@ struct LocalTree {
     files: Vec<(String, PathBuf)>,
 }
 
+struct PreparedPushTree {
+    directories: Vec<LogicalSyncPath>,
+    files: Vec<(LogicalSyncPath, PathBuf)>,
+}
+
 fn collect_local_tree(root: &Path) -> Result<LocalTree, CliError> {
     let mut directories = Vec::new();
     let mut files = Vec::new();
@@ -415,6 +419,54 @@ fn collect_local_tree(root: &Path) -> Result<LocalTree, CliError> {
     directories.sort();
     files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(LocalTree { directories, files })
+}
+
+fn prepare_push_tree(
+    remote_root: &LogicalSyncPath,
+    tree: LocalTree,
+) -> Result<PreparedPushTree, CliError> {
+    let mut folded_paths = BTreeMap::new();
+    register_unique_path(remote_root, &mut folded_paths)?;
+
+    let mut directories = Vec::with_capacity(tree.directories.len() + 1);
+    directories.push(remote_root.clone());
+    for relative in tree.directories {
+        let path = join_logical_path(remote_root, &relative)?;
+        register_unique_path(&path, &mut folded_paths)?;
+        directories.push(path);
+    }
+
+    let mut files = Vec::with_capacity(tree.files.len());
+    for (relative, local_path) in tree.files {
+        let path = join_logical_path(remote_root, &relative)?;
+        register_unique_path(&path, &mut folded_paths)?;
+        files.push((path, local_path));
+    }
+    Ok(PreparedPushTree { directories, files })
+}
+
+fn register_unique_path(
+    path: &LogicalSyncPath,
+    folded_paths: &mut BTreeMap<String, String>,
+) -> Result<(), CliError> {
+    if let Some(first) = folded_paths.insert(path.ascii_case_fold_key(), path.as_str().to_owned()) {
+        return Err(CliError::RemotePathCollision {
+            first,
+            second: path.as_str().to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn join_logical_path(root: &LogicalSyncPath, relative: &str) -> Result<LogicalSyncPath, CliError> {
+    if relative.is_empty() {
+        return Ok(root.clone());
+    }
+    let path = format!("{}/{relative}", root.as_str());
+    LogicalSyncPath::parse(path.clone()).map_err(|error| CliError::InvalidRemotePath {
+        path,
+        reason: error.to_string(),
+    })
 }
 
 fn join_remote_path(root: &str, relative: &str) -> String {
@@ -550,6 +602,54 @@ mod tests {
             Err(CliError::InvalidRemotePath { path, reason })
                 if path == "apps/../reader.kbb"
                     && reason == "path contains an empty, dot, or dot-dot component"
+        ));
+    }
+
+    #[test]
+    fn push_tree_rejects_ascii_case_collisions_during_preflight() {
+        let root = LogicalSyncPath::parse("tree").unwrap();
+        let error = prepare_push_tree(
+            &root,
+            LocalTree {
+                directories: vec!["Assets".to_owned(), "assets".to_owned()],
+                files: Vec::new(),
+            },
+        )
+        .err()
+        .unwrap();
+
+        assert!(matches!(
+            error,
+            CliError::RemotePathCollision { first, second }
+                if first == "tree/Assets" && second == "tree/assets"
+        ));
+    }
+
+    #[test]
+    fn push_tree_validates_every_derived_path_during_preflight() {
+        let root = LogicalSyncPath::parse("tree").unwrap();
+        let relative = [
+            "a".repeat(255),
+            "b".repeat(255),
+            "c".repeat(255),
+            "d".repeat(255),
+        ]
+        .join("/");
+        let error = prepare_push_tree(
+            &root,
+            LocalTree {
+                directories: Vec::new(),
+                files: vec![(relative.clone(), PathBuf::from("source"))],
+            },
+        )
+        .err()
+        .unwrap();
+
+        assert!(matches!(
+            error,
+            CliError::InvalidRemotePath { path, reason }
+                if path == format!("tree/{relative}")
+                    && reason == "path exceeds 1024 UTF-8 bytes"
         ));
     }
 }

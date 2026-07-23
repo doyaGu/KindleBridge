@@ -247,6 +247,8 @@ pub enum CliError {
     InvalidBlockSize,
     #[error("invalid device path {path:?}: {reason}")]
     InvalidRemotePath { path: String, reason: String },
+    #[error("device paths collide after ASCII case folding: {first:?} and {second:?}")]
+    RemotePathCollision { first: String, second: String },
     #[error("could not resolve the current host directory: {0}")]
     CurrentDirectory(#[source] std::io::Error),
     #[error("invalid update binary: {0}")]

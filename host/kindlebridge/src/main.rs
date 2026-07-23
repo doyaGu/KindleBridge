@@ -955,6 +955,7 @@ fn command_error_code(error: &CliError) -> &'static str {
         CliError::InvalidResult { .. } => "INVALID_SERVER_RESULT",
         CliError::InvalidBlockSize => "INVALID_BLOCK_SIZE",
         CliError::InvalidRemotePath { .. } => "INVALID_REMOTE_PATH",
+        CliError::RemotePathCollision { .. } => "INVALID_REMOTE_PATH",
         CliError::CurrentDirectory(_) => "HOST_IO_ERROR",
         CliError::InvalidUpdateBinary(_) => "INVALID_UPDATE_BINARY",
         CliError::StreamingShellRequired => "STREAMING_SHELL_REQUIRED",
