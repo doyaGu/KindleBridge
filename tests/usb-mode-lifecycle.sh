@@ -464,6 +464,62 @@ test "$MANAGER_RC" -eq 0 || {
 }
 pass 'daemon restart is marked degraded without cycling FunctionFS'
 
+setup_case daemon_restart_after_functionfs_unbind
+export KINDLEBRIDGE_TEST_SUPERVISOR_RESTART=1
+export KINDLEBRIDGE_TEST_REAL_SLEEP=1
+run_manager "$CASE_ROOT/start-output" start 0
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/start-output" >&2
+    fail 'FunctionFS-unbind degraded-state setup failed'
+}
+old_daemon_pid=$(cat "$CONTROL_ROOT/runtime/run/daemon.pid")
+old_instance=$(sed -n '2s/^instance=//p' "$CONTROL_ROOT/runtime/run/heartbeat")
+PIDS="$PIDS $old_daemon_pid"
+kill -9 "$old_daemon_pid"
+attempts=100
+new_daemon_pid=$old_daemon_pid
+new_instance=$old_instance
+while test "$attempts" -gt 0 && {
+    test "$new_daemon_pid" = "$old_daemon_pid" ||
+        test "$new_instance" = "$old_instance"
+}; do
+    /usr/bin/sleep 0.02
+    new_daemon_pid=$(cat "$CONTROL_ROOT/runtime/run/daemon.pid" 2>/dev/null || true)
+    new_instance=$(sed -n '2s/^instance=//p' \
+        "$CONTROL_ROOT/runtime/run/heartbeat" 2>/dev/null || true)
+    attempts=$((attempts - 1))
+done
+test -n "$new_daemon_pid" && test "$new_daemon_pid" != "$old_daemon_pid" &&
+    test -n "$new_instance" && test "$new_instance" != "$old_instance" ||
+    fail 'fake launcher did not restart the daemon before FunctionFS unbound'
+PIDS="$PIDS $new_daemon_pid"
+
+# Real FunctionFS clears the gadget binding when the endpoint owner exits.
+# Reproduce that ordering before the health monitor observes the new process.
+printf '%s' '' >"$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/UDC"
+run_manager "$CASE_ROOT/monitor-output" monitor-once
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/monitor-output" >&2
+    fail 'health monitor failed while recording an unbound daemon restart'
+}
+assert_equal daemon-restarted \
+    "$(cat "$CASE_ROOT/var/local/kindlebridge/usb/recovery_required")" \
+    'FunctionFS unbind hid the daemon-restart recovery reason'
+run_manager "$CASE_ROOT/status-output" status
+test "$MANAGER_RC" -ne 0 || fail 'unbound restarted daemon was reported active'
+assert_equal degraded "$(sed -n '1p' "$CASE_ROOT/status-output")" \
+    'daemon restart lost priority to detached UDC status'
+grep -q '^reason=daemon-restarted$' "$CASE_ROOT/status-output" ||
+    fail 'unbound daemon restart did not preserve its actionable reason'
+assert_file_empty "$CASE_ROOT/sys/kernel/config/usb_gadget/mtpgadget/UDC" \
+    'health monitor rebound the FunctionFS gadget'
+run_manager "$CASE_ROOT/cleanup-output" stop
+test "$MANAGER_RC" -eq 0 || {
+    cat "$CASE_ROOT/cleanup-output" >&2
+    fail 'FunctionFS-unbind degraded-state cleanup failed'
+}
+pass 'daemon restart remains actionable after FunctionFS unbinds the gadget'
+
 setup_case healthy_monitor_lock_free
 run_manager "$CASE_ROOT/start-output" start 0
 test "$MANAGER_RC" -eq 0 || {

@@ -480,6 +480,18 @@ monitor_bridge_once_locked() {
         return 0
     fi
 
+    # FunctionFS unbinds the gadget as soon as the crashed daemon closes its
+    # last endpoint. Detect a confirmed replacement process before inspecting
+    # endpoints or UDC state, otherwise the most important recovery reason is
+    # lost behind the expected unbind side effect.
+    if test -n "$previous_daemon_pid" && test "$daemon_pid" != "$previous_daemon_pid"; then
+        write_state_value daemon_pid "$daemon_pid"
+        write_state_value daemon_instance "$instance"
+        write_state_value recovery_required daemon-restarted
+        log "daemon restarted $previous_daemon_pid -> $daemon_pid; leaving USB untouched and requiring an unplugged restart"
+        return 0
+    fi
+
     test -L "$LINK" || return 0
     test -e "$MOUNT/ep1" && test -e "$MOUNT/ep2" || return 0
     udc=$(read_state udc "$DEFAULT_UDC")
@@ -488,10 +500,6 @@ monitor_bridge_once_locked() {
     test "$bound" = "$udc" || return 0
     write_state_value daemon_pid "$daemon_pid"
     write_state_value daemon_instance "$instance"
-    if test "$daemon_pid" != "$previous_daemon_pid"; then
-        write_state_value recovery_required daemon-restarted
-        log "daemon restarted ${previous_daemon_pid:-unknown} -> $daemon_pid; leaving USB untouched and requiring an unplugged restart"
-    fi
 }
 
 monitor_bridge_once() {
@@ -772,6 +780,13 @@ status() {
             daemon_pid_is_owned "$daemon_pid"; then
             udc=$(read_state udc "$DEFAULT_UDC")
             bound=$(cat "$GADGET/UDC" 2>/dev/null || true)
+            if test -f "$STATE/recovery_required"; then
+                echo degraded
+                echo "reason=$(read_state recovery_required unknown)"
+                echo "recovery=unplug USB, switch to file transfer, then start development mode"
+                echo "slot=$(cat "$RUNTIME/current" 2>/dev/null || echo unknown)"
+                return 1
+            fi
             if test "$bound" != "$udc"; then
                 echo detached
                 echo "serial=$(tr -d '\000' <"$USID_FILE") link=unbound"
@@ -798,13 +813,6 @@ status() {
                 echo "reason=daemon-heartbeat"
                 echo "slot=$(cat "$RUNTIME/current" 2>/dev/null || echo unknown)"
                 return 0
-            fi
-            if test -f "$STATE/recovery_required"; then
-                echo degraded
-                echo "reason=$(read_state recovery_required unknown)"
-                echo "recovery=unplug USB, switch to file transfer, then start development mode"
-                echo "slot=$(cat "$RUNTIME/current" 2>/dev/null || echo unknown)"
-                return 1
             fi
             echo active
             link_state=$(udc_state "$udc")
