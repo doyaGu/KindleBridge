@@ -239,6 +239,7 @@ impl Drop for Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::os::fd::AsFd;
 
     #[test]
@@ -247,5 +248,28 @@ mod tests {
         let file = std::fs::File::open("/dev/null").unwrap();
         let error = context.write_all(file.as_fd(), b"data", 0, 1).unwrap_err();
         assert!(!error.submitted());
+    }
+
+    #[test]
+    fn writes_one_buffer_through_the_kernel_aio_abi() {
+        let path = std::env::temp_dir().join(format!(
+            "kindlebridge-linux-aio-test-{}",
+            std::process::id()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut context = Context::new(1).unwrap();
+        context
+            .write_all(file.as_fd(), b"kindlebridge-aio", 16 * 1024, 1)
+            .unwrap();
+        let mut written = Vec::new();
+        file.read_to_end(&mut written).unwrap();
+        assert_eq!(written, b"kindlebridge-aio");
+        drop(file);
+        std::fs::remove_file(path).unwrap();
     }
 }
