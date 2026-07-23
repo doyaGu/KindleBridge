@@ -14,10 +14,10 @@ use kindlebridge_functionfs::{
 };
 use kindlebridge_schema::device_protocol::{
     is_valid_session_id, DeviceAppInstallParams, DeviceCall, DeviceHello, DeviceReply, HostHello,
-    ShellOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE, APP_RESTART_FEATURE,
-    APP_ROLLBACK_FEATURE, APP_START_FEATURE, APP_STOP_FEATURE, APP_UNINSTALL_FEATURE,
-    DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, EXEC_FEATURE, LOG_TAIL_FEATURE,
-    PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION, RPC_SERVICE,
+    ShellOpen, SyncReply, SyncRequest, APP_INSTALL_FEATURE, APP_LIST_FEATURE, APP_LOG_FEATURE,
+    APP_RESTART_FEATURE, APP_ROLLBACK_FEATURE, APP_START_FEATURE, APP_STOP_FEATURE,
+    APP_UNINSTALL_FEATURE, DEFAULT_CONNECTION_WINDOW, DEFAULT_STREAM_WINDOW, EXEC_FEATURE,
+    LOG_TAIL_FEATURE, PROCESS_LIST_FEATURE, PROCESS_SIGNAL_FEATURE, PROTOCOL_VERSION, RPC_SERVICE,
     SHELL_STREAM_WINDOW, SHELL_V2_FEATURE, SHELL_V2_SERVICE, SYNC_FEATURE, SYNC_SERVICE,
 };
 #[cfg(test)]
@@ -62,6 +62,7 @@ const MAX_CONCURRENT_SHELLS: usize = 4;
 const DEVICE_RUNTIME_FEATURES: &[&str] = &[
     APP_INSTALL_FEATURE,
     APP_LIST_FEATURE,
+    APP_LOG_FEATURE,
     APP_RESTART_FEATURE,
     APP_ROLLBACK_FEATURE,
     APP_START_FEATURE,
@@ -1832,6 +1833,7 @@ fn dispatch(call: DeviceCall, config: &ServerConfig, sync_store: &SyncStore) -> 
         methods::LOG_TAIL => reply(dispatch_log_tail(call.params, config)),
         methods::APP_INSTALL => reply(dispatch_app_install(call.params, config, sync_store)),
         methods::APP_START => reply(dispatch_app_start(call.params, config)),
+        methods::APP_LOG => reply(dispatch_app_log(call.params, config)),
         methods::APP_STOP => reply(dispatch_app_stop(call.params, config)),
         methods::APP_RESTART => reply(dispatch_app_restart(call.params, config)),
         methods::APP_ROLLBACK => reply(dispatch_app_rollback(call.params, config)),
@@ -1990,6 +1992,18 @@ fn dispatch_app_start(
         &config.app_supervisor,
         &params.app_id,
     )
+}
+
+fn dispatch_app_log(
+    params: serde_json::Value,
+    config: &ServerConfig,
+) -> Result<impl Serialize, RpcError> {
+    let params = decode_params::<kindlebridge_schema::AppLogParams>(
+        params,
+        "expected serial, app_id, run_id, cursors, and max_bytes",
+    )?;
+    require_serial(&params.serial, config)?;
+    services::app_log(&config.activation_root, &params)
 }
 
 fn dispatch_app_stop(

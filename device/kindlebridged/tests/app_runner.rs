@@ -23,7 +23,7 @@ fn application_outlives_the_rpc_style_thread_that_requested_start() {
     let count_file = root.join("data").join("org.example.actor").join("count");
     fs::write(
         &entrypoint,
-        b"#!/bin/sh\ncount=0\ntest ! -f \"$KINDLEBRIDGE_DATA/count\" || count=$(cat \"$KINDLEBRIDGE_DATA/count\")\ncount=$((count + 1))\necho \"$count\" > \"$KINDLEBRIDGE_DATA/count\"\ntest \"$count\" -ge 3 || exit 42\ntrap 'exit 0' HUP INT TERM\nwhile :; do sleep 1; done\n",
+        b"#!/bin/sh\ncount=0\ntest ! -f \"$KINDLEBRIDGE_DATA/count\" || count=$(cat \"$KINDLEBRIDGE_DATA/count\")\ncount=$((count + 1))\necho \"$count\" > \"$KINDLEBRIDGE_DATA/count\"\necho \"stdout attempt $count\"\necho \"stderr attempt $count\" >&2\ntest \"$count\" -ge 3 || exit 42\ntrap 'exit 0' HUP INT TERM\nwhile :; do sleep 1; done\n",
     )
     .unwrap();
     fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o755)).unwrap();
@@ -55,6 +55,30 @@ fn application_outlives_the_rpc_style_thread_that_requested_start() {
     wait_until(Duration::from_secs(3), || {
         fs::read_to_string(&count_file).is_ok_and(|value| value.trim() == "3")
     });
+    let logs = root
+        .join("data")
+        .join("org.example.actor")
+        .join(".kindlebridge-logs");
+    wait_until(Duration::from_secs(3), || {
+        fs::read_to_string(logs.join("stdout.log"))
+            .is_ok_and(|value| value.contains("stdout attempt 3"))
+            && fs::read_to_string(logs.join("stderr.log"))
+                .is_ok_and(|value| value.contains("stderr attempt 3"))
+    });
+    assert_eq!(
+        fs::read_to_string(logs.join("stdout.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+    assert_eq!(
+        fs::read_to_string(logs.join("stderr.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
     assert_eq!(
         supervisor.status("org.example.actor", bundle_root).unwrap(),
         RuntimeStatus::Running(runner_pid)

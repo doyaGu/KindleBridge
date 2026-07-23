@@ -34,6 +34,7 @@ pub mod methods {
     pub const APP_ROLLBACK: &str = "v1.app.rollback";
     pub const APP_UNINSTALL: &str = "v1.app.uninstall";
     pub const APP_LIST: &str = "v1.app.list";
+    pub const APP_LOG: &str = "v1.app.log";
     pub const PROCESS_LIST: &str = "v1.process.list";
     pub const PROCESS_SIGNAL: &str = "v1.process.signal";
     pub const LOG_TAIL: &str = "v1.log.tail";
@@ -541,6 +542,36 @@ pub struct AppSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppList {
     pub apps: Vec<AppSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppLogParams {
+    pub serial: String,
+    pub app_id: String,
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub stdout_cursor: u64,
+    #[serde(default)]
+    pub stderr_cursor: u64,
+    pub max_bytes: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppLogChunk {
+    pub cursor: u64,
+    pub next_cursor: u64,
+    pub data_base64: String,
+    pub capped: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppLogSnapshot {
+    pub app_id: String,
+    pub run_id: String,
+    pub reset: bool,
+    pub stdout: AppLogChunk,
+    pub stderr: AppLogChunk,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

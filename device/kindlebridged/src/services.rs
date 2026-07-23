@@ -7,14 +7,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use kindlebridge_bundle::{
     ingest_verified_blocks, load_materialized_application, materialize_verified_application,
     verify, ActivationAction, ActivationEntry, ActivationGeneration, BundleKind, Digest,
     Error as BundleError, GenerationId, InstallStore, MaterializedApplication, VerifyOptions,
 };
 use kindlebridge_schema::{
-    error_codes, AppList, AppState, AppSummary, LogEntry, LogSnapshot, LogTailParams, ProcessList,
-    ProcessSignal, ProcessState, ProcessSummary, RpcError,
+    error_codes, AppList, AppLogChunk, AppLogParams, AppLogSnapshot, AppState, AppSummary,
+    LogEntry, LogSnapshot, LogTailParams, ProcessList, ProcessSignal, ProcessState, ProcessSummary,
+    RpcError,
 };
 
 use crate::app::{AppSupervisor, RuntimeError, RuntimeStatus};
@@ -27,6 +30,8 @@ const MAX_PROCESS_COUNT: usize = 65_536;
 const MAX_ACTIVATION_HISTORY: usize = 4096;
 const APP_BLOCK_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_APP_STOP_TIMEOUT_MS: u64 = 3_000;
+const MAX_APP_LOG_READ: u32 = 64 * 1024;
+const MAX_APP_LOG_BYTES: u64 = 4 * 1024 * 1024;
 static APP_OPERATION_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn app_install(
@@ -339,6 +344,87 @@ pub fn app_start(
     app_start_unlocked(activation_root, supervisor, app_id)
 }
 
+pub fn app_log(activation_root: &Path, params: &AppLogParams) -> Result<AppLogSnapshot, RpcError> {
+    active_application_entry(activation_root, &params.app_id)?;
+    let limit = params.max_bytes.unwrap_or(16 * 1024);
+    if limit == 0 || limit > MAX_APP_LOG_READ {
+        return Err(RpcError::invalid_params(
+            "max_bytes must be between 1 and 65536",
+        ));
+    }
+    let root = activation_root
+        .join("data")
+        .join(&params.app_id)
+        .join(".kindlebridge-logs");
+    let run_id = match fs::read_to_string(root.join("run-id")) {
+        Ok(run_id) => run_id.trim().to_owned(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AppLogSnapshot {
+                app_id: params.app_id.clone(),
+                run_id: "not-started".to_owned(),
+                reset: params.run_id.as_deref() != Some("not-started"),
+                stdout: empty_app_log_chunk(),
+                stderr: empty_app_log_chunk(),
+            });
+        }
+        Err(error) => return Err(app_log_io("read_run_id", &error)),
+    };
+    if run_id.is_empty() {
+        return Err(invalid_device_state("application log run ID is empty"));
+    }
+    let reset = params.run_id.as_deref() != Some(&run_id);
+    let stdout_cursor = if reset { 0 } else { params.stdout_cursor };
+    let stderr_cursor = if reset { 0 } else { params.stderr_cursor };
+    Ok(AppLogSnapshot {
+        app_id: params.app_id.clone(),
+        run_id,
+        reset,
+        stdout: read_app_log_chunk(&root.join("stdout.log"), stdout_cursor, limit)?,
+        stderr: read_app_log_chunk(&root.join("stderr.log"), stderr_cursor, limit)?,
+    })
+}
+
+fn read_app_log_chunk(path: &Path, cursor: u64, limit: u32) -> Result<AppLogChunk, RpcError> {
+    let mut file = File::open(path).map_err(|error| app_log_io("open", &error))?;
+    let length = file
+        .metadata()
+        .map_err(|error| app_log_io("stat", &error))?
+        .len();
+    let cursor = cursor.min(length);
+    file.seek(SeekFrom::Start(cursor))
+        .map_err(|error| app_log_io("seek", &error))?;
+    let mut data = vec![0; limit as usize];
+    let count = file
+        .read(&mut data)
+        .map_err(|error| app_log_io("read", &error))?;
+    data.truncate(count);
+    Ok(AppLogChunk {
+        cursor,
+        next_cursor: cursor + count as u64,
+        data_base64: BASE64.encode(data),
+        capped: length >= MAX_APP_LOG_BYTES,
+    })
+}
+
+fn empty_app_log_chunk() -> AppLogChunk {
+    AppLogChunk {
+        cursor: 0,
+        next_cursor: 0,
+        data_base64: String::new(),
+        capped: false,
+    }
+}
+
+fn app_log_io(operation: &str, error: &std::io::Error) -> RpcError {
+    RpcError::new(error_codes::INVALID_STATE, "Application log is unavailable").with_data(
+        serde_json::json!({
+            "operation": operation,
+            "reason": format!("io_{:?}", error.kind()),
+            "detail": error.to_string(),
+        }),
+    )
+}
+
 fn app_start_unlocked(
     activation_root: &Path,
     supervisor: &AppSupervisor,
@@ -630,13 +716,7 @@ fn active_materialized_application(
     ),
     RpcError,
 > {
-    let active = load_active_generation(activation_root)?.ok_or_else(|| app_not_found(app_id))?;
-    let entry = active
-        .entries
-        .iter()
-        .find(|entry| entry.kind == BundleKind::Application && entry.id == app_id)
-        .cloned()
-        .ok_or_else(|| app_not_found(app_id))?;
+    let (active, entry) = active_application_entry(activation_root, app_id)?;
     let store = InstallStore::open(activation_root, APP_BLOCK_QUOTA_BYTES)
         .map_err(|error| invalid_device_state(error.to_string()))?;
     let materialized =
@@ -651,6 +731,20 @@ fn active_materialized_application(
         ));
     }
     Ok((active, entry, materialized))
+}
+
+fn active_application_entry(
+    activation_root: &Path,
+    app_id: &str,
+) -> Result<(ActivationGeneration, ActivationEntry), RpcError> {
+    let active = load_active_generation(activation_root)?.ok_or_else(|| app_not_found(app_id))?;
+    let entry = active
+        .entries
+        .iter()
+        .find(|entry| entry.kind == BundleKind::Application && entry.id == app_id)
+        .cloned()
+        .ok_or_else(|| app_not_found(app_id))?;
+    Ok((active, entry))
 }
 
 fn app_runtime_error(operation: &str, app_id: &str, error: &RuntimeError) -> RpcError {
@@ -1317,6 +1411,64 @@ mod tests {
         assert_eq!(feature.code, error_codes::APP_INSTALL_FAILED);
         assert_eq!(feature.data.unwrap()["reason"], "required_feature");
         assert!(!activation_root.exists());
+    }
+
+    #[test]
+    fn app_log_tracks_independent_cursors_and_resets_for_a_new_run() {
+        let directory = TestDirectory::new("app-log");
+        let activation_root = directory.0.join("activations");
+        let bundle_path = directory.0.join("app.kbb");
+        let bytes = application_bundle("org.example.reader", "1.0.0", 1);
+        fs::write(&bundle_path, &bytes).unwrap();
+        let supervisor = AppSupervisor::new();
+        app_install(
+            &mut File::open(&bundle_path).unwrap(),
+            blake3::hash(&bytes).to_hex().as_ref(),
+            &activation_root,
+            "kindlehf",
+            "5.17.1.0.4",
+            &["app.install.v1", "sync.v1"],
+            &supervisor,
+        )
+        .unwrap();
+
+        let mut params = AppLogParams {
+            serial: "KT6-TEST".to_owned(),
+            app_id: "org.example.reader".to_owned(),
+            run_id: None,
+            stdout_cursor: 0,
+            stderr_cursor: 0,
+            max_bytes: Some(4),
+        };
+        let not_started = app_log(&activation_root, &params).unwrap();
+        assert_eq!(not_started.run_id, "not-started");
+        assert!(not_started.reset);
+        assert_eq!(not_started.stdout.next_cursor, 0);
+
+        let logs = activation_root
+            .join("data")
+            .join("org.example.reader")
+            .join(".kindlebridge-logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("run-id"), "run-1\n").unwrap();
+        fs::write(logs.join("stdout.log"), b"abcdefgh").unwrap();
+        fs::write(logs.join("stderr.log"), b"error!").unwrap();
+
+        params.run_id = Some(not_started.run_id);
+        params.stdout_cursor = 99;
+        let first = app_log(&activation_root, &params).unwrap();
+        assert!(first.reset);
+        assert_eq!(first.run_id, "run-1");
+        assert_eq!(BASE64.decode(first.stdout.data_base64).unwrap(), b"abcd");
+        assert_eq!(BASE64.decode(first.stderr.data_base64).unwrap(), b"erro");
+
+        params.run_id = Some(first.run_id);
+        params.stdout_cursor = first.stdout.next_cursor;
+        params.stderr_cursor = first.stderr.next_cursor;
+        let second = app_log(&activation_root, &params).unwrap();
+        assert!(!second.reset);
+        assert_eq!(BASE64.decode(second.stdout.data_base64).unwrap(), b"efgh");
+        assert_eq!(BASE64.decode(second.stderr.data_base64).unwrap(), b"r!");
     }
 
     #[cfg(unix)]

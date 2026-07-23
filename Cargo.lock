@@ -683,6 +683,7 @@ version = "0.1.0-dev.37"
 name = "kindlebridged"
 version = "0.1.0-dev.37"
 dependencies = [
+ "base64",
  "blake3",
  "clap",
  "ed25519-dalek",

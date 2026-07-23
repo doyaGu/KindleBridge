@@ -29,6 +29,7 @@ const RESTART_BACKOFFS: [Duration; MAX_CONSECUTIVE_RESTARTS as usize] = [
 const MAX_APP_LOG_BYTES: u64 = 4 * 1024 * 1024;
 const APP_STDOUT_LOG: &str = "stdout.log";
 const APP_STDERR_LOG: &str = "stderr.log";
+const APP_RUN_ID: &str = "run-id";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RestartPolicy {
@@ -410,8 +411,19 @@ fn start_application(
     ensure_plain_directory(&log_dir)?;
     let stdout_log = log_dir.join(APP_STDOUT_LOG);
     let stderr_log = log_dir.join(APP_STDERR_LOG);
+    let run_id = format!(
+        "{:x}-{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| {
+                RuntimeError::Filesystem(std::io::Error::other(error.to_string()))
+            })?
+            .as_nanos()
+    );
     File::create(&stdout_log).map_err(RuntimeError::Filesystem)?;
     File::create(&stderr_log).map_err(RuntimeError::Filesystem)?;
+    fs::write(log_dir.join(APP_RUN_ID), format!("{run_id}\n")).map_err(RuntimeError::Filesystem)?;
     let working_dir = app
         .process
         .working_dir
