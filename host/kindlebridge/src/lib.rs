@@ -7,14 +7,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use kindlebridge_bundle::{build_project_bundle, read_project_manifest};
 use kindlebridge_schema::{
-    methods, AppInstallParams, AppList, AppState, AppSummary, AppTargetParams, ClientError,
-    DeviceFeatures, DeviceList, DeviceState, ExecParams, ExecResult, LogSnapshot, LogTailParams,
-    ProcessList, ProcessSignalParams, ProcessSummary, RpcClient, SerialParams, ServerVersion,
-    SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult, SyncStatus, SyncStatusParams,
-    TransferState, DEFAULT_SYNC_BLOCK_SIZE, MAX_SYNC_BLOCK_SIZE,
+    methods, AppInstallParams, AppList, AppLogParams, AppLogSnapshot, AppState, AppSummary,
+    AppTargetParams, ClientError, DeviceFeatures, DeviceList, DeviceState, ExecParams, ExecResult,
+    LogSnapshot, LogTailParams, ProcessList, ProcessSignalParams, ProcessSummary, RpcClient,
+    SerialParams, ServerVersion, SyncPullParams, SyncPullResult, SyncPushParams, SyncPushResult,
+    SyncStatus, SyncStatusParams, TransferState, DEFAULT_SYNC_BLOCK_SIZE, MAX_SYNC_BLOCK_SIZE,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -228,6 +230,17 @@ pub enum AppCommand {
     Uninstall {
         serial: String,
         app_id: String,
+    },
+    /// Print captured application stdout and stderr.
+    Log {
+        serial: String,
+        app_id: String,
+        /// Keep printing new output and follow application restarts.
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Maximum bytes to fetch from each output stream per request.
+        #[arg(long, default_value_t = 16 * 1024, value_parser = clap::value_parser!(u32).range(1..=64 * 1024))]
+        max_bytes: u32,
     },
     List {
         serial: String,
@@ -1057,6 +1070,42 @@ fn execute_app<C: RpcCaller>(
                     .join("\n"))
             }
         }
+        AppCommand::Log {
+            serial,
+            app_id,
+            follow,
+            max_bytes,
+        } => {
+            if *follow {
+                return Err(CliError::Project(
+                    "app log --follow requires the streaming CLI path".to_owned(),
+                ));
+            }
+            let (value, snapshot): (_, AppLogSnapshot) = call_typed(
+                caller,
+                methods::APP_LOG,
+                &AppLogParams {
+                    serial: serial.clone(),
+                    app_id: app_id.clone(),
+                    run_id: None,
+                    stdout_cursor: 0,
+                    stderr_cursor: 0,
+                    max_bytes: Some(*max_bytes),
+                },
+                "app log",
+            )?;
+            if json_output {
+                pretty_json(&value)
+            } else {
+                let stdout = decode_app_log(&snapshot.stdout.data_base64)?;
+                let stderr = decode_app_log(&snapshot.stderr.data_base64)?;
+                Ok(format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                ))
+            }
+        }
         AppCommand::Start { serial, app_id }
         | AppCommand::Stop { serial, app_id }
         | AppCommand::Restart { serial, app_id }
@@ -1068,7 +1117,9 @@ fn execute_app<C: RpcCaller>(
                 AppCommand::Restart { .. } => methods::APP_RESTART,
                 AppCommand::Rollback { .. } => methods::APP_ROLLBACK,
                 AppCommand::Uninstall { .. } => methods::APP_UNINSTALL,
-                AppCommand::Install { .. } | AppCommand::List { .. } => unreachable!(),
+                AppCommand::Install { .. } | AppCommand::Log { .. } | AppCommand::List { .. } => {
+                    unreachable!()
+                }
             };
             let (value, app): (_, AppSummary) = call_typed(
                 caller,
@@ -1082,6 +1133,12 @@ fn execute_app<C: RpcCaller>(
             format_app_result(value, &app, json_output)
         }
     }
+}
+
+fn decode_app_log(encoded: &str) -> Result<Vec<u8>, CliError> {
+    BASE64
+        .decode(encoded)
+        .map_err(|_| CliError::InvalidResult { kind: "app log" })
 }
 
 fn execute_process<C: RpcCaller>(
@@ -1497,6 +1554,74 @@ mod tests {
             "99.0.0",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn app_log_cli_has_bounded_one_shot_and_follow_modes() {
+        let cli = Cli::try_parse_from([
+            "kindlebridge",
+            "app",
+            "log",
+            "KT6-TEST",
+            "org.example.reader",
+            "--follow",
+            "--max-bytes",
+            "4096",
+        ])
+        .unwrap();
+        let TopLevelCommand::App(AppArgs {
+            command:
+                AppCommand::Log {
+                    serial,
+                    app_id,
+                    follow,
+                    max_bytes,
+                },
+        }) = cli.command
+        else {
+            panic!("expected app log command");
+        };
+        assert_eq!(serial, "KT6-TEST");
+        assert_eq!(app_id, "org.example.reader");
+        assert!(follow);
+        assert_eq!(max_bytes, 4096);
+
+        let mut caller = RecordingCaller {
+            calls: Vec::new(),
+            replies: VecDeque::from([json!({
+                "app_id": "org.example.reader",
+                "run_id": "run-1",
+                "reset": true,
+                "stdout": {
+                    "cursor": 0,
+                    "next_cursor": 6,
+                    "data_base64": BASE64.encode(b"hello\n"),
+                    "capped": false
+                },
+                "stderr": {
+                    "cursor": 0,
+                    "next_cursor": 5,
+                    "data_base64": BASE64.encode(b"oops\n"),
+                    "capped": false
+                }
+            })]),
+        };
+        let output = execute(
+            &mut caller,
+            &TopLevelCommand::App(AppArgs {
+                command: AppCommand::Log {
+                    serial: "KT6-TEST".to_owned(),
+                    app_id: "org.example.reader".to_owned(),
+                    follow: false,
+                    max_bytes: 16 * 1024,
+                },
+            }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(output, "hello\noops\n");
+        assert_eq!(caller.calls[0].0, methods::APP_LOG);
+        assert_eq!(caller.calls[0].1.as_ref().unwrap()["stdout_cursor"], 0);
     }
 
     #[test]

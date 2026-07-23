@@ -20,16 +20,17 @@ use interprocess::local_socket::{
     prelude::*, GenericFilePath, GenericNamespaced, SendHalf, Stream,
 };
 use kindlebridge::{
-    deploy_project_after_build, execute_with_status, Cli, CliError, CommandOutput, RunArgs,
-    ServerCommand, ShellArgs, TopLevelCommand,
+    deploy_project_after_build, execute_with_status, AppCommand, Cli, CliError, CommandOutput,
+    RunArgs, ServerCommand, ShellArgs, TopLevelCommand,
 };
 use kindlebridge_bundle::read_project_manifest;
 use kindlebridge_schema::device_protocol::{ShellMode, ShellOpen, TerminalSize, SHELL_V2_FEATURE};
 use kindlebridge_schema::{
-    methods, read_json_frame, write_json_frame, ClientError, DeviceFeatures, RequestId, RpcClient,
-    RpcRequest, RpcResponse, ShellOpenParams, ShellOpenResult, StreamChannel, StreamClosedParams,
-    StreamCreditParams, StreamDataParams, StreamExitParams, StreamIdParams, StreamResizeParams,
-    StreamWriteParams, DEFAULT_MAX_CONTENT_LENGTH,
+    methods, read_json_frame, write_json_frame, AppLogParams, AppLogSnapshot, ClientError,
+    DeviceFeatures, RequestId, RpcClient, RpcRequest, RpcResponse, ShellOpenParams,
+    ShellOpenResult, StreamChannel, StreamClosedParams, StreamCreditParams, StreamDataParams,
+    StreamExitParams, StreamIdParams, StreamResizeParams, StreamWriteParams,
+    DEFAULT_MAX_CONTENT_LENGTH,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -132,6 +133,30 @@ fn run(cli: &Cli) -> Result<CommandOutput, RunError> {
     if let TopLevelCommand::Shell(args) = &cli.command {
         return run_shell(cli, args);
     }
+    if let TopLevelCommand::App(args) = &cli.command {
+        if let AppCommand::Log {
+            serial,
+            app_id,
+            follow,
+            max_bytes,
+        } = &args.command
+        {
+            if cli.json && *follow {
+                return Err(RunError::Arguments(
+                    "app log --follow streams raw bytes and does not support --json".to_owned(),
+                ));
+            }
+            if !cli.json {
+                return run_app_log(
+                    connect_or_start(cli)?,
+                    serial.clone(),
+                    app_id.clone(),
+                    *max_bytes,
+                    *follow,
+                );
+            }
+        }
+    }
     if let TopLevelCommand::Run(args) = &cli.command {
         if args.watch {
             return run_project_watch(cli, args);
@@ -161,6 +186,7 @@ fn run_project_watch(cli: &Cli, args: &RunArgs) -> Result<CommandOutput, RunErro
     })?;
     let manifest = read_project_manifest(&manifest_path)
         .map_err(|error| RunError::Message(format!("could not load project: {error}")))?;
+    let app_id = manifest.id.clone();
     let development = manifest.development.ok_or_else(|| {
         RunError::Message(format!(
             "{} is missing [development]",
@@ -182,6 +208,15 @@ fn run_project_watch(cli: &Cli, args: &RunArgs) -> Result<CommandOutput, RunErro
         previous,
     )?;
     print_run_result(deploy_project_connected(cli, args))?;
+    let log_serial = args.serial.clone();
+    let log_stream = connect_local().map_err(|error| {
+        RunError::Message(format!("could not follow application logs: {error}"))
+    })?;
+    thread::spawn(move || {
+        if let Err(error) = run_app_log(log_stream, log_serial, app_id, 16 * 1024, true) {
+            eprintln!("application log stream stopped: {error}");
+        }
+    });
     eprintln!(
         "watching {} (press Ctrl-C to stop)",
         watch_paths
@@ -248,6 +283,92 @@ fn run_project_watch(cli: &Cli, args: &RunArgs) -> Result<CommandOutput, RunErro
                 )
             }
         }
+    }
+}
+
+fn run_app_log(
+    stream: Stream,
+    serial: String,
+    app_id: String,
+    max_bytes: u32,
+    follow: bool,
+) -> Result<CommandOutput, RunError> {
+    let (reader, writer) = stream.split();
+    let mut client = RpcClient::new(BufReader::new(reader), BufWriter::new(writer));
+    let mut run_id = None;
+    let mut stdout_cursor = 0;
+    let mut stderr_cursor = 0;
+    let mut warned_stdout_cap = false;
+    let mut warned_stderr_cap = false;
+
+    loop {
+        let value = client
+            .call(
+                methods::APP_LOG,
+                Some(
+                    serde_json::to_value(AppLogParams {
+                        serial: serial.clone(),
+                        app_id: app_id.clone(),
+                        run_id: run_id.clone(),
+                        stdout_cursor,
+                        stderr_cursor,
+                        max_bytes: Some(max_bytes),
+                    })
+                    .map_err(|_| {
+                        RunError::Message("could not encode app log request".to_owned())
+                    })?,
+                ),
+            )
+            .map_err(|error| RunError::Message(format!("app log request failed: {error}")))?;
+        let snapshot: AppLogSnapshot = serde_json::from_value(value)
+            .map_err(|_| RunError::Message("server returned invalid app log data".to_owned()))?;
+        let restarted = run_id.is_some() && snapshot.reset;
+        if snapshot.reset {
+            warned_stdout_cap = false;
+            warned_stderr_cap = false;
+        }
+        if restarted {
+            eprintln!("\n--- {app_id} restarted ({}) ---", snapshot.run_id);
+        }
+        run_id = Some(snapshot.run_id);
+
+        let stdout = BASE64
+            .decode(&snapshot.stdout.data_base64)
+            .map_err(|_| RunError::Message("server returned invalid stdout log data".to_owned()))?;
+        let stderr = BASE64
+            .decode(&snapshot.stderr.data_base64)
+            .map_err(|_| RunError::Message("server returned invalid stderr log data".to_owned()))?;
+        if !stdout.is_empty() {
+            let mut output = io::stdout().lock();
+            output
+                .write_all(&stdout)
+                .and_then(|()| output.flush())
+                .map_err(|error| RunError::Message(format!("could not write stdout: {error}")))?;
+        }
+        if !stderr.is_empty() {
+            let mut output = io::stderr().lock();
+            output
+                .write_all(&stderr)
+                .and_then(|()| output.flush())
+                .map_err(|error| RunError::Message(format!("could not write stderr: {error}")))?;
+        }
+        stdout_cursor = snapshot.stdout.next_cursor;
+        stderr_cursor = snapshot.stderr.next_cursor;
+        if snapshot.stdout.capped && !warned_stdout_cap {
+            eprintln!("\nwarning: {app_id} stdout capture reached its 4 MiB limit");
+            warned_stdout_cap = true;
+        }
+        if snapshot.stderr.capped && !warned_stderr_cap {
+            eprintln!("\nwarning: {app_id} stderr capture reached its 4 MiB limit");
+            warned_stderr_cap = true;
+        }
+        if !follow {
+            return Ok(CommandOutput {
+                output: String::new(),
+                exit_code: 0,
+            });
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
