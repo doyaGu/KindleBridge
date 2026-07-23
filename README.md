@@ -115,7 +115,12 @@ processes share its USB connection. On Windows it listens on a named pipe; on
 Linux it uses a `0600` Unix socket. It exits after ten idle minutes. Inspect or
 stop it explicitly with `kindlebridge server status` and
 `kindlebridge server stop`; `kindlebridge-server --stdio` remains available for
-tests and IDE integrations. `device ping SERIAL` performs a bounded KBP
+tests and IDE integrations. Before using a shared service, the CLI verifies its
+server name, exact build version, and local API version. A stale KindleBridge
+server is stopped and replaced automatically; an unrelated process on the
+endpoint is never stopped. Concurrent CLIs converge on the first matching
+replacement instead of starting competing USB owners. `device ping SERIAL`
+performs a bounded KBP
 `PING`/`PONG` round trip through the selected Kindle; unlike `server ping`, it
 tests the real device transport.
 
