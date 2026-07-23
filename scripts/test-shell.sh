@@ -14,6 +14,7 @@ for script in \
     scripts/archive/unsafe-kt6-usb-lab.sh \
     scripts/hardware/usb-mode-cycle-gate.sh \
     tests/fixtures/usb-mode/fake-command.sh \
+    tests/fixtures/usb-mode/cleanup-process-tree.sh \
     tests/fixtures/usb-mode/kindlebridge-launcher \
     tests/fixtures/usb-mode/kindlebridged \
     tests/fixtures/usb-mode/same-name-launcher \
@@ -21,6 +22,43 @@ for script in \
     tests/usb-mode-lifecycle.sh; do
     sh -n "$script"
 done
+
+cleanup_fixture="${TMPDIR:-/tmp}/kindlebridge-cleanup-process-tree.$$"
+mkdir -p "$cleanup_fixture"
+cat >"$cleanup_fixture/parent.sh" <<'EOF'
+#!/bin/sh
+sleep 30 &
+printf '%s\n' "$!" >"$1"
+wait
+EOF
+chmod 0755 "$cleanup_fixture/parent.sh"
+"$cleanup_fixture/parent.sh" "$cleanup_fixture/child.pid" &
+cleanup_parent=$!
+cleanup_process_tree_fixture() {
+    sh tests/fixtures/usb-mode/cleanup-process-tree.sh "$cleanup_fixture" >/dev/null 2>&1 || true
+    wait "$cleanup_parent" 2>/dev/null || true
+    rm -rf "$cleanup_fixture"
+}
+trap cleanup_process_tree_fixture EXIT
+trap 'exit 1' HUP INT TERM
+attempts=20
+while test "$attempts" -gt 0 && test ! -s "$cleanup_fixture/child.pid"; do
+    /usr/bin/sleep 0.05
+    attempts=$((attempts - 1))
+done
+test -s "$cleanup_fixture/child.pid" || {
+    echo 'cleanup process-tree fixture did not start' >&2
+    exit 1
+}
+cleanup_child=$(cat "$cleanup_fixture/child.pid")
+sh tests/fixtures/usb-mode/cleanup-process-tree.sh "$cleanup_fixture"
+if kill -0 "$cleanup_parent" 2>/dev/null || kill -0 "$cleanup_child" 2>/dev/null; then
+    echo 'cleanup process-tree fixture left a process behind' >&2
+    exit 1
+fi
+wait "$cleanup_parent" 2>/dev/null || true
+rm -rf "$cleanup_fixture"
+trap - EXIT HUP INT TERM
 
 if KINDLEBRIDGE_ALLOW_UNSAFE_USB_LAB=0 \
     sh scripts/archive/unsafe-kt6-usb-lab.sh restore >/dev/null 2>&1; then

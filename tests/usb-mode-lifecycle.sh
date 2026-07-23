@@ -23,12 +23,14 @@ case "$RUN_ROOT" in
 esac
 
 cleanup() {
+    sh "$FIXTURES/cleanup-process-tree.sh" "$RUN_ROOT"
     for pid in $PIDS; do
-        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
     done
     rm -rf "$RUN_ROOT"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2

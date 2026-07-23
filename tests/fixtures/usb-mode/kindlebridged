@@ -1,6 +1,14 @@
 #!/bin/sh
 
-trap 'exit 0' HUP INT TERM
+child=
+cleanup() {
+    if test -n "$child"; then
+        kill "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+    fi
+    exit 0
+}
+trap cleanup HUP INT TERM
 if test "${KINDLEBRIDGE_TEST_SUPERVISOR_RACE:-0}" = 1; then
     gadget="$KINDLEBRIDGE_TEST_ROOT/sys/kernel/config/usb_gadget/mtpgadget"
     state="$KINDLEBRIDGE_TEST_ROOT/var/local/kindlebridge/control/runtime/launcher/watchdog-state"
@@ -16,6 +24,9 @@ if test "${KINDLEBRIDGE_TEST_SUPERVISOR_RACE:-0}" = 1; then
     done
 else
     while :; do
-        /usr/bin/sleep 30
+        /usr/bin/sleep 30 &
+        child=$!
+        wait "$child" 2>/dev/null || true
+        child=
     done
 fi

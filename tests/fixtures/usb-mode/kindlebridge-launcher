@@ -59,6 +59,7 @@ start_child() {
 }
 
 start_child "$@"
+trap 'kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 0' HUP INT TERM
 if test "${KINDLEBRIDGE_TEST_SUPERVISOR_RACE:-0}" = 1 ||
     test "${KINDLEBRIDGE_TEST_SUPERVISOR_RESTART:-0}" = 1; then
     crashes=0
@@ -74,6 +75,5 @@ if test "${KINDLEBRIDGE_TEST_SUPERVISOR_RACE:-0}" = 1 ||
         start_child "$@"
     done
 else
-    trap 'kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 0' HUP INT TERM
     wait "$child"
 fi
