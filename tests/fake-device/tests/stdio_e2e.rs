@@ -4,8 +4,9 @@ use std::io::BufReader;
 use std::process::{Command, Stdio};
 
 use kindlebridge::{
-    execute, AppArgs, AppCommand, DeviceArgs, DeviceCommand, LogArgs, LogCommand, ProcessArgs,
-    ProcessCommand, ServerArgs, ServerCommand, SyncArgs, SyncCommand, TopLevelCommand,
+    execute, run_project_once, AppArgs, AppCommand, CliError, DeviceArgs, DeviceCommand, LogArgs,
+    LogCommand, ProcessArgs, ProcessCommand, RunArgs, ServerArgs, ServerCommand, SyncArgs,
+    SyncCommand, TopLevelCommand,
 };
 use kindlebridge_bundle::{BuildConfig, BundleBuilder, BundleKind};
 use kindlebridge_fake_device::SERIAL;
@@ -14,6 +15,145 @@ use kindlebridge_schema::{
     ExecResult, LogSnapshot, ProcessList, RpcClient, ServerVersion, SyncStatus,
 };
 use serde_json::{json, Value};
+
+#[test]
+fn run_builds_installs_and_starts_a_development_project() {
+    let root = std::env::temp_dir().join(format!("kindlebridge-run-e2e-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("root/bin")).unwrap();
+    fs::write(root.join("root/bin/app"), b"#!/bin/sh\nsleep 60\n").unwrap();
+    fs::write(root.join("dev.key"), [0x42; 32]).unwrap();
+    let build = if cfg!(windows) {
+        r#"["cmd", "/d", "/c", "exit", "0"]"#
+    } else {
+        r#"["sh", "-c", "true"]"#
+    };
+    let manifest = format!(
+        r#"
+kind = "application"
+id = "org.example.run"
+version = "0.1.0"
+release = 1
+entrypoints = {{ main = "bin/app" }}
+
+[process]
+restart = "never"
+stop_timeout_ms = 100
+
+[development]
+build = {build}
+input = "root"
+signing_key = "dev.key"
+watch = ["src"]
+"#
+    );
+    fs::write(root.join("kindlebridge.toml"), &manifest).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kindlebridge-fake-device"))
+        .arg("--stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut client = RpcClient::new(
+        BufReader::new(child.stdout.take().unwrap()),
+        child.stdin.take().unwrap(),
+    );
+    let output = run_project_once(
+        &mut client,
+        &RunArgs {
+            serial: SERIAL.to_owned(),
+            manifest: root.join("kindlebridge.toml"),
+            watch: false,
+        },
+        false,
+    )
+    .unwrap();
+    assert!(output.contains("org.example.run"));
+    assert!(output.contains("running"));
+
+    let apps = execute(
+        &mut client,
+        &TopLevelCommand::App(AppArgs {
+            command: AppCommand::List {
+                serial: SERIAL.to_owned(),
+            },
+        }),
+        true,
+    )
+    .unwrap();
+    let apps: AppList = serde_json::from_str(&apps).unwrap();
+    assert_eq!(apps.apps.len(), 1);
+    assert_eq!(apps.apps[0].app_id, "org.example.run");
+    assert_eq!(apps.apps[0].state, AppState::Running);
+
+    fs::write(root.join("root/bin/app"), b"#!/bin/sh\nsleep 59\n").unwrap();
+    run_project_once(
+        &mut client,
+        &RunArgs {
+            serial: SERIAL.to_owned(),
+            manifest: root.join("kindlebridge.toml"),
+            watch: false,
+        },
+        false,
+    )
+    .unwrap();
+    let apps = execute(
+        &mut client,
+        &TopLevelCommand::App(AppArgs {
+            command: AppCommand::List {
+                serial: SERIAL.to_owned(),
+            },
+        }),
+        true,
+    )
+    .unwrap();
+    let apps: AppList = serde_json::from_str(&apps).unwrap();
+    assert_eq!(apps.apps[0].state, AppState::Running);
+    assert!(apps.apps[0].rollback_available);
+
+    let failing_build = if cfg!(windows) {
+        r#"["cmd", "/d", "/c", "exit", "23"]"#
+    } else {
+        r#"["sh", "-c", "exit 23"]"#
+    };
+    fs::write(
+        root.join("kindlebridge.toml"),
+        manifest.replace(
+            &format!("build = {build}"),
+            &format!("build = {failing_build}"),
+        ),
+    )
+    .unwrap();
+    let error = run_project_once(
+        &mut client,
+        &RunArgs {
+            serial: SERIAL.to_owned(),
+            manifest: root.join("kindlebridge.toml"),
+            watch: false,
+        },
+        false,
+    )
+    .unwrap_err();
+    assert!(matches!(error, CliError::BuildFailed { exit_code: 23, .. }));
+    let apps = execute(
+        &mut client,
+        &TopLevelCommand::App(AppArgs {
+            command: AppCommand::List {
+                serial: SERIAL.to_owned(),
+            },
+        }),
+        true,
+    )
+    .unwrap();
+    let apps: AppList = serde_json::from_str(&apps).unwrap();
+    assert_eq!(apps.apps[0].state, AppState::Running);
+
+    drop(client);
+    assert!(child.wait().unwrap().success());
+    fs::remove_dir_all(root).unwrap();
+}
 
 #[test]
 fn all_v1_discovery_methods_work_over_stdio_and_cli_rpc() {

@@ -80,6 +80,17 @@ Cargo package is an internal build identifier, not a product release.
   on-failure restart are connected to the signed activation store and real
   supervisor. Privileged operations remain unavailable rather than reporting
   fake success.
+- The first `run` development-loop slice is connected end to end. A
+  `[development]` manifest section provides one shell-free build argv, bundle
+  input, signing key, and explicit watch paths. `run` executes the build,
+  creates a verified KBB through the same library path as
+  `kindlebridge-bundle build`, atomically installs it, and starts the
+  application. `run --watch` debounces source changes and obtains a fresh local
+  server connection for each redeployment. Fake-device coverage proves two
+  distinct deployments remain running and expose rollback, while a failed
+  build sends no device mutation and leaves the previous application active.
+  Cancelling an obsolete in-flight build and merging live application logs
+  remain required before this workflow is feature-complete.
 - A formal USB device link, not only a raw probe. The host automatically
   discovers and claims the exact `VID_1949:PID_9981` `ff/4b/01` interface,
   leaves MTP alone, performs the normal KBP HELLO, and exposes the same exec and
@@ -191,8 +202,9 @@ Cargo package is an internal build identifier, not a product release.
 - Wi-Fi/TCP discovery, authenticated pairing, session encryption, multi-transport
   reconnect, and hardware throughput/latency measurements under concurrent streams.
 - A narrowly scoped, locally authenticated root broker IPC implementation.
-- Root exec grants, sync progress/cancellation and directory semantics, app
-  `run --watch`, logs/events, process control, forward/reverse, GDB,
+- Root exec grants, sync progress/cancellation and directory semantics,
+  cancellation of obsolete watch builds, merged live logs/events, process
+  control, forward/reverse, GDB,
   core dumps, basic perf, screenshot, and bugreport services.
 - KT6 fault-injection validation of offline daemon A/B activation and automatic
   pre-bind rollback. Safe-mode, complete uninstall, and stock USB recovery

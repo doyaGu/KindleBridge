@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
+use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -18,8 +20,10 @@ use interprocess::local_socket::{
     prelude::*, GenericFilePath, GenericNamespaced, SendHalf, Stream,
 };
 use kindlebridge::{
-    execute_with_status, Cli, CliError, CommandOutput, ServerCommand, ShellArgs, TopLevelCommand,
+    execute_with_status, run_project_once, Cli, CliError, CommandOutput, RunArgs, ServerCommand,
+    ShellArgs, TopLevelCommand,
 };
+use kindlebridge_bundle::read_project_manifest;
 use kindlebridge_schema::device_protocol::{ShellMode, ShellOpen, TerminalSize, SHELL_V2_FEATURE};
 use kindlebridge_schema::{
     methods, read_json_frame, write_json_frame, ClientError, DeviceFeatures, RequestId, RpcClient,
@@ -29,6 +33,7 @@ use kindlebridge_schema::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use walkdir::WalkDir;
 
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -127,7 +132,158 @@ fn run(cli: &Cli) -> Result<CommandOutput, RunError> {
     if let TopLevelCommand::Shell(args) = &cli.command {
         return run_shell(cli, args);
     }
+    if let TopLevelCommand::Run(args) = &cli.command {
+        if args.watch {
+            return run_project_watch(cli, args);
+        }
+    }
     run_rpc(connect_or_start(cli)?, cli)
+}
+
+fn run_project_watch(cli: &Cli, args: &RunArgs) -> Result<CommandOutput, RunError> {
+    if cli.json {
+        return Err(RunError::Arguments(
+            "run --watch does not support --json yet".to_owned(),
+        ));
+    }
+    let manifest_path = if args.manifest.is_absolute() {
+        args.manifest.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| RunError::Message(error.to_string()))?
+            .join(&args.manifest)
+    };
+    let project_root = manifest_path.parent().ok_or_else(|| {
+        RunError::Message(format!(
+            "manifest has no parent directory: {}",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest = read_project_manifest(&manifest_path)
+        .map_err(|error| RunError::Message(format!("could not load project: {error}")))?;
+    let development = manifest.development.ok_or_else(|| {
+        RunError::Message(format!(
+            "{} is missing [development]",
+            manifest_path.display()
+        ))
+    })?;
+    if development.watch.is_empty() {
+        return Err(RunError::Arguments(
+            "[development].watch must list source paths for run --watch".to_owned(),
+        ));
+    }
+    let watch_paths = development
+        .watch
+        .iter()
+        .map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                project_root.join(path)
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut previous = watch_snapshot(&watch_paths)?;
+    print_run_result(run_project_connected(cli, args))?;
+    eprintln!(
+        "watching {} (press Ctrl-C to stop)",
+        watch_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    loop {
+        thread::sleep(Duration::from_millis(100));
+        let current = watch_snapshot(&watch_paths)?;
+        if current == previous {
+            continue;
+        }
+        let mut stable = current;
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            let next = watch_snapshot(&watch_paths)?;
+            if next == stable {
+                break;
+            }
+            stable = next;
+        }
+        previous = stable;
+        eprintln!("change detected; rebuilding...");
+        match run_project_connected(cli, args) {
+            Ok(output) => println!("{output}"),
+            Err(error) => {
+                eprintln!(
+                    "redeploy failed; use `kindlebridge app list` to inspect current state: {error}"
+                )
+            }
+        }
+    }
+}
+
+fn run_project_connected(cli: &Cli, args: &RunArgs) -> Result<String, CliError> {
+    let stream = connect_or_start(cli).map_err(|error| {
+        CliError::Project(format!("could not connect to the host server: {error}"))
+    })?;
+    let (reader, writer) = stream.split();
+    let mut client = RpcClient::new(BufReader::new(reader), BufWriter::new(writer));
+    run_project_once(&mut client, args, false)
+}
+
+fn print_run_result(result: Result<String, CliError>) -> Result<(), RunError> {
+    let output = result.map_err(RunError::Command)?;
+    if !output.is_empty() {
+        println!("{output}");
+    }
+    Ok(())
+}
+
+fn watch_snapshot(
+    paths: &[PathBuf],
+) -> Result<BTreeMap<PathBuf, (u64, std::time::SystemTime)>, RunError> {
+    let mut snapshot = BTreeMap::new();
+    for path in paths {
+        if path.is_file() {
+            add_watch_entry(&mut snapshot, path)?;
+            continue;
+        }
+        if !path.is_dir() {
+            return Err(RunError::Message(format!(
+                "watch path does not exist: {}",
+                path.display()
+            )));
+        }
+        for entry in WalkDir::new(path)
+            .follow_links(false)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(|entry| entry.file_name() != ".kindlebridge")
+        {
+            let entry = entry.map_err(|error| RunError::Message(error.to_string()))?;
+            if entry.file_type().is_file() {
+                add_watch_entry(&mut snapshot, entry.path())?;
+            }
+        }
+    }
+    Ok(snapshot)
+}
+
+fn add_watch_entry(
+    snapshot: &mut BTreeMap<PathBuf, (u64, std::time::SystemTime)>,
+    path: &Path,
+) -> Result<(), RunError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        RunError::Message(format!("could not inspect {}: {error}", path.display()))
+    })?;
+    let modified = metadata.modified().map_err(|error| {
+        RunError::Message(format!(
+            "could not read modification time for {}: {error}",
+            path.display()
+        ))
+    })?;
+    snapshot.insert(path.to_owned(), (metadata.len(), modified));
+    Ok(())
 }
 
 fn run_stdio_rpc(cli: &Cli) -> Result<CommandOutput, RunError> {
@@ -135,6 +291,11 @@ fn run_stdio_rpc(cli: &Cli) -> Result<CommandOutput, RunError> {
         return Err(RunError::Arguments(
             "--server-stdio does not support streaming shell; use the shared local server"
                 .to_owned(),
+        ));
+    }
+    if matches!(&cli.command, TopLevelCommand::Run(args) if args.watch) {
+        return Err(RunError::Arguments(
+            "--server-stdio does not support run --watch; use the shared local server".to_owned(),
         ));
     }
     let mut command = Command::new(&cli.server);
@@ -989,12 +1150,48 @@ fn command_error_code(error: &CliError) -> &'static str {
         CliError::InvalidUpdateBinary(_) => "INVALID_UPDATE_BINARY",
         CliError::StreamingShellRequired => "STREAMING_SHELL_REQUIRED",
         CliError::UpdateRejected { .. } => "UPDATE_REJECTED",
+        CliError::Project(_) => "INVALID_PROJECT",
+        CliError::BuildFailed { .. } => "BUILD_FAILED",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_snapshot_detects_file_changes_additions_and_removals() {
+        let root = std::env::temp_dir().join(format!(
+            "kindlebridge-watch-snapshot-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.txt");
+        fs::write(&first, b"a").unwrap();
+        let initial = watch_snapshot(std::slice::from_ref(&root)).unwrap();
+
+        fs::create_dir_all(root.join(".kindlebridge")).unwrap();
+        fs::write(root.join(".kindlebridge/run.kbb"), b"generated").unwrap();
+        assert_eq!(
+            watch_snapshot(std::slice::from_ref(&root)).unwrap(),
+            initial
+        );
+
+        fs::write(&first, b"longer").unwrap();
+        let changed = watch_snapshot(std::slice::from_ref(&root)).unwrap();
+        assert_ne!(changed, initial);
+
+        let second = root.join("second.txt");
+        fs::write(&second, b"new").unwrap();
+        let added = watch_snapshot(std::slice::from_ref(&root)).unwrap();
+        assert_ne!(added, changed);
+
+        fs::remove_file(first).unwrap();
+        let removed = watch_snapshot(std::slice::from_ref(&root)).unwrap();
+        assert_ne!(removed, added);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn shutdown_wait_does_not_return_while_the_old_endpoint_accepts_connections() {

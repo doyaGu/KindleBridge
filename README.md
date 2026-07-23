@@ -233,6 +233,35 @@ the required toolchain and hardware are not available on hosted runners.
 
 ## KBB development bundles
 
+An application project can keep its build loop in the same signed KBB
+manifest:
+
+```toml
+[development]
+build = ["meson", "compile", "-C", "build-kindlehf"]
+input = "build-kindlehf/bundle-root"
+signing_key = ".kindlebridge/dev.key"
+watch = ["src", "meson.build", "kindlebridge.toml"]
+```
+
+The command is an argument array and is executed directly from the manifest
+directory, without host-shell reparsing. The other paths are also relative to
+that directory. A one-shot run builds, creates a verified KBB, installs it
+atomically, and starts the declared application:
+
+```powershell
+kindlebridge run YOUR_KINDLE_SERIAL
+kindlebridge run YOUR_KINDLE_SERIAL --watch
+```
+
+Watch mode debounces changes to the explicitly listed paths and reconnects to
+the shared host service for every deployment. Build or bundle failures occur
+before any device mutation, so the previous application remains active.
+Generated development bundles live below `.kindlebridge/` and receive a
+monotonic development release without rewriting the source manifest. Build
+cancellation and merged live application logs are the next development-loop
+increments.
+
 ```powershell
 cargo run --package kindlebridge-bundle -- key init --output dev.key
 cargo run --package kindlebridge-bundle -- build --manifest kindlebridge.toml --input app-root --signing-key dev.key --output app.kbb
