@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod app;
-pub mod application;
+mod application;
 pub mod exec;
 pub mod probe;
 pub mod server;
