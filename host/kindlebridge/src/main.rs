@@ -766,11 +766,11 @@ impl SyncProgressDisplay {
                 self.last_transfer = Some(transfer_id.to_owned());
             }
         }
-        let bucket = if progress.total == 0 {
-            0
-        } else {
-            progress.transferred.saturating_mul(10) / progress.total
-        };
+        let bucket = progress
+            .transferred
+            .saturating_mul(10)
+            .checked_div(progress.total)
+            .unwrap_or(0);
         let changed_operation = self.last_operation.as_deref() != Some(&progress.operation_id);
         let changed_phase = self.last_phase.as_ref() != Some(&progress.phase);
         let should_print =
@@ -782,15 +782,17 @@ impl SyncProgressDisplay {
             SyncProgressPhase::Hashing => "hashing",
             SyncProgressPhase::Transferring => "transferring",
         };
-        let status = if progress.total == 0 {
-            format!("{} transferred", format_bytes(progress.transferred))
-        } else {
-            let percentage = progress.transferred.saturating_mul(100) / progress.total;
-            format!(
+        let status = match progress
+            .transferred
+            .saturating_mul(100)
+            .checked_div(progress.total)
+        {
+            Some(percentage) => format!(
                 "{} / {} ({percentage}%)",
                 format_bytes(progress.transferred),
                 format_bytes(progress.total)
-            )
+            ),
+            None => format!("{} transferred", format_bytes(progress.transferred)),
         };
         if self.terminal {
             eprint!("\r{phase} {}: {status}\u{1b}[K", progress.remote_path);
