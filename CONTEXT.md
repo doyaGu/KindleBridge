@@ -16,6 +16,10 @@ _Avoid_: Sync manager, sync session
 A non-empty, Unicode NFC, forward-slash relative path naming one location below the KindleBridge sync root. Host absolute-root aliases and backslashes are developer input forms, not Logical Sync Paths.
 _Avoid_: Remote filesystem path, host input path
 
+**Sync Tree**:
+A bounded hierarchy rooted at one Logical Sync Path. The Host preflights the whole hierarchy, then realizes it with ordered directory operations and one Sync Stream per file. A pulled Sync Tree is accepted only when its final names, kinds, and sizes still match the preflight manifest.
+_Avoid_: Recursive Sync Stream, atomic directory snapshot
+
 **Shell Stream**:
 A single `shell.v2` KBP stream that owns exactly one shell process from its opening metadata through exit and close or reset. A disconnected Shell Stream is destroyed and cannot be resumed.
 _Avoid_: Shell connection, resumable shell session
@@ -41,6 +45,10 @@ _Avoid_: Shell connection, resumable shell session
 > Developer: May a recursive pull begin writing locally while it is still discovering the device tree?
 >
 > Domain expert: No. It first builds and validates a complete manifest. Each file is verified independently with BLAKE3, and the Host Sync Client compares names, kinds, and sizes with a final manifest before accepting the result. A mismatch removes the partial result and asks the developer to retry. This does not claim that every file came from one atomic device snapshot.
+>
+> Developer: Is a recursive directory push one Sync Stream?
+>
+> Domain expert: No. It is one Sync Tree realized through ordered directory operations and one independent Sync Stream for each file.
 >
 > Developer: Does the same apply to an interactive shell?
 >
