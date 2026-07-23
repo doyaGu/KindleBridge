@@ -7,7 +7,6 @@ members = [
     "crates/kindlebridge-transport-tcp",
     "crates/kindlebridge-transport-usb",
     "crates/kindlebridge-bundle",
-    "crates/kindlebridge-linux-aio",
     "host/kindlebridge",
     "host/kindlebridge-server",
     "device/kindlebridged",

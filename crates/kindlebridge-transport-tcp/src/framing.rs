@@ -114,11 +114,6 @@ impl<W: Write> FrameWriter<W> {
         write_frame_to(&mut self.writer, frame, self.config)
     }
 
-    /// Validate and encode one complete frame for a transport-specific writer.
-    pub fn encode_frame(&self, frame: &Frame) -> Result<Vec<u8>, TransportError> {
-        encode_frame_for_write(frame, self.config)
-    }
-
     /// Write one frame from a contiguous header-and-payload buffer.
     ///
     /// FunctionFS uses this so its bounded write adapter chunks the complete
