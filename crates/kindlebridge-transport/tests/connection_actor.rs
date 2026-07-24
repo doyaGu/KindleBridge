@@ -655,6 +655,80 @@ fn fresh_hello_restarts_the_session_without_reopening_the_transport() {
 }
 
 #[test]
+fn graceful_goaway_acknowledges_and_waits_for_a_fresh_hello() {
+    let (host_to_device_tx, host_to_device_rx) = mpsc::channel();
+    let (device_to_host_tx, device_to_host_rx) = mpsc::channel();
+    let (_connection, _incoming) = Connection::start_restartable(
+        online_device_state(),
+        ChannelSource(host_to_device_rx),
+        ChannelSink(device_to_host_tx),
+        |_hello| {
+            Ok(RestartedSession {
+                state: online_device_state(),
+                hello_response: Frame::new(
+                    Header::new(Command::Hello, 0, 0),
+                    b"replacement session".to_vec(),
+                )
+                .unwrap(),
+            })
+        },
+    );
+
+    host_to_device_tx
+        .send(Frame::new(Header::new(Command::Ping, 0, 1), b"prior ping".to_vec()).unwrap())
+        .unwrap();
+    let pong = device_to_host_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(pong.header.command, Command::Pong);
+    assert_eq!(pong.header.sequence, 1);
+    host_to_device_tx
+        .send(Frame::new(Header::new(Command::GoAway, 0, 2), Vec::new()).unwrap())
+        .unwrap();
+    let goaway = device_to_host_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(goaway.header.command, Command::GoAway);
+    assert_eq!(goaway.header.sequence, 2);
+    host_to_device_tx
+        .send(Frame::new(Header::new(Command::Hello, 0, 0), b"new host".to_vec()).unwrap())
+        .unwrap();
+    assert_eq!(
+        device_to_host_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .header
+            .command,
+        Command::Hello
+    );
+}
+
+#[test]
+fn connection_goaway_waits_for_the_peer_acknowledgement() {
+    let (device_tx, device_rx) = mpsc::channel();
+    let (host_tx, host_rx) = mpsc::channel();
+    let (connection, _incoming) = Connection::start(
+        online_host_state(),
+        ChannelSource(device_rx),
+        ChannelSink(host_tx),
+    );
+
+    let shutdown = thread::spawn(move || connection.go_away(Duration::from_secs(1)));
+    assert_eq!(
+        host_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .header
+            .command,
+        Command::GoAway
+    );
+    device_tx
+        .send(Frame::new(Header::new(Command::GoAway, 0, 1), Vec::new()).unwrap())
+        .unwrap();
+    assert_eq!(shutdown.join().unwrap(), Ok(()));
+}
+
+#[test]
 fn failed_usb_write_waits_for_a_fresh_hello_and_then_recovers() {
     let (host_to_device_tx, host_to_device_rx) = mpsc::channel();
     let (device_to_host_tx, device_to_host_rx) = mpsc::channel();

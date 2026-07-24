@@ -107,16 +107,21 @@ fn run(args: Args) -> Result<(), String> {
         DeviceRegistry::direct(Arc::new(MemoryDeviceProvider::new(records)))
     };
     let registry = Arc::new(registry);
-    if args.stdio {
+    let result = if args.stdio {
         serve_streaming(
             &mut BufReader::new(io::stdin()),
             BufWriter::new(io::stdout()),
-            registry,
+            Arc::clone(&registry),
         )
         .map_err(|error| error.to_string())
     } else {
-        run_local_service(registry, Duration::from_secs(args.idle_timeout_secs))
-    }
+        run_local_service(
+            Arc::clone(&registry),
+            Duration::from_secs(args.idle_timeout_secs),
+        )
+    };
+    registry.shutdown();
+    result
 }
 
 fn run_local_service(registry: Arc<DeviceRegistry>, idle_timeout: Duration) -> Result<(), String> {

@@ -7,6 +7,10 @@
 //! WinUSB, preferably through a firmware-provided WCID descriptor.
 
 use std::io::{self, Read, Write};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Condvar, Mutex,
+};
 use std::time::{Duration, Instant};
 
 use nusb::descriptors::TransferType as NusbTransferType;
@@ -20,6 +24,8 @@ pub const MIN_TRANSFER_SIZE: usize = 64;
 pub const MAX_TRANSFER_SIZE: usize = 1024 * 1024;
 pub const MAX_QUEUE_DEPTH: usize = 32;
 pub const MAX_BUFFER_BYTES_PER_DIRECTION: usize = 16 * 1024 * 1024;
+const SHUTDOWN_READ_POLL: Duration = Duration::from_millis(100);
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UsbMatch {
@@ -355,6 +361,9 @@ fn unique_endpoint<'a>(
 
 pub struct UsbReader {
     inner: Option<EndpointRead<Bulk>>,
+    logical_timeout: Duration,
+    shutdown: Arc<UsbShutdownState>,
+    _owner: Arc<UsbEndpointOwner>,
 }
 
 impl UsbReader {
@@ -363,24 +372,44 @@ impl UsbReader {
     /// The host uses a finite value only while establishing a session, then
     /// restores `Duration::MAX` before application traffic begins.
     pub fn set_read_timeout(&mut self, timeout: Duration) {
+        self.logical_timeout = timeout;
         self.inner
             .as_mut()
             .expect("USB reader is present until drop")
-            .set_read_timeout(timeout);
+            .set_read_timeout(timeout.min(SHUTDOWN_READ_POLL));
     }
 }
 
 impl Read for UsbReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.inner
-            .as_mut()
-            .expect("USB reader is present until drop")
-            .read(buffer)
+        let started = Instant::now();
+        loop {
+            if self.shutdown.requested.load(Ordering::Acquire) {
+                trace_usb_open(format_args!("reader observed shutdown request"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "USB transport shutdown requested",
+                ));
+            }
+            match self
+                .inner
+                .as_mut()
+                .expect("USB reader is present until drop")
+                .read(buffer)
+            {
+                Err(error)
+                    if error.kind() == io::ErrorKind::TimedOut
+                        && (self.logical_timeout == Duration::MAX
+                            || started.elapsed() < self.logical_timeout) => {}
+                outcome => return outcome,
+            }
+        }
     }
 }
 
 impl Drop for UsbReader {
     fn drop(&mut self) {
+        trace_usb_open(format_args!("dropping bulk IN reader"));
         if let Some(reader) = self.inner.take() {
             let mut endpoint = reader.into_inner();
             endpoint.cancel_all();
@@ -391,6 +420,7 @@ impl Drop for UsbReader {
 
 pub struct UsbWriter {
     inner: Option<EndpointWrite<Bulk>>,
+    _owner: Arc<UsbEndpointOwner>,
 }
 
 impl UsbWriter {
@@ -425,6 +455,7 @@ impl Write for UsbWriter {
 
 impl Drop for UsbWriter {
     fn drop(&mut self) {
+        trace_usb_open(format_args!("dropping bulk OUT writer"));
         if let Some(writer) = self.inner.take() {
             let mut endpoint = writer.into_inner();
             endpoint.cancel_all();
@@ -454,12 +485,90 @@ pub struct UsbTransport {
     pub selection: EndpointSelection,
     pub reader: UsbReader,
     pub writer: UsbWriter,
+    shutdown: UsbShutdown,
 }
 
 impl UsbTransport {
     #[must_use]
+    pub fn shutdown_handle(&self) -> UsbShutdown {
+        self.shutdown.clone()
+    }
+
+    #[must_use]
     pub fn split(self) -> (UsbReader, UsbWriter) {
         (self.reader, self.writer)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UsbShutdown {
+    state: Arc<UsbShutdownState>,
+}
+
+impl UsbShutdown {
+    pub fn request(&self) {
+        trace_usb_open(format_args!("USB shutdown requested"));
+        self.state.requested.store(true, Ordering::Release);
+    }
+
+    pub fn wait(&self) -> Result<(), String> {
+        let deadline = Instant::now() + SHUTDOWN_WAIT;
+        let mut outcome = self
+            .state
+            .outcome
+            .lock()
+            .map_err(|_| "USB shutdown state is unavailable".to_owned())?;
+        loop {
+            if let Some(outcome) = outcome.as_ref() {
+                return outcome.clone();
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("USB interface did not deactivate within 2 seconds".to_owned());
+            }
+            let (next, _) = self
+                .state
+                .changed
+                .wait_timeout(outcome, remaining)
+                .map_err(|_| "USB shutdown state is unavailable".to_owned())?;
+            outcome = next;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UsbShutdownState {
+    requested: AtomicBool,
+    outcome: Mutex<Option<Result<(), String>>>,
+    changed: Condvar,
+}
+
+impl UsbShutdownState {
+    fn new() -> Self {
+        Self {
+            requested: AtomicBool::new(false),
+            outcome: Mutex::new(None),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn finish(&self, outcome: Result<(), String>) {
+        if let Ok(mut stored) = self.outcome.lock() {
+            *stored = Some(outcome);
+            self.changed.notify_all();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UsbEndpointOwner {
+    shutdown: Arc<UsbShutdownState>,
+}
+
+impl Drop for UsbEndpointOwner {
+    fn drop(&mut self) {
+        trace_usb_open(format_args!("all vendor endpoint owners released"));
+        self.shutdown.finish(Ok(()));
     }
 }
 
@@ -536,7 +645,7 @@ pub fn open(criteria: &UsbMatch, buffers: BufferConfig) -> Result<UsbTransport, 
             .set_alt_setting(selection.alternate_setting)
             .wait()
             .map_err(|source| TransportError::UsbOperation {
-                operation: "select vendor interface alternate setting",
+                operation: "activate vendor interface endpoints",
                 source,
             })?;
     }
@@ -552,6 +661,10 @@ pub fn open(criteria: &UsbMatch, buffers: BufferConfig) -> Result<UsbTransport, 
         return Err(TransportError::DescriptorChanged);
     }
 
+    let shutdown_state = Arc::new(UsbShutdownState::new());
+    let owner = Arc::new(UsbEndpointOwner {
+        shutdown: Arc::clone(&shutdown_state),
+    });
     let in_endpoint = interface
         .endpoint::<Bulk, In>(selection.bulk_in_address)
         .map_err(|source| TransportError::UsbOperation {
@@ -572,7 +685,7 @@ pub fn open(criteria: &UsbMatch, buffers: BufferConfig) -> Result<UsbTransport, 
     let reader = in_endpoint
         .reader(buffers.transfer_size)
         .with_num_transfers(buffers.read_queue_depth)
-        .with_read_timeout(buffers.read_timeout);
+        .with_read_timeout(buffers.read_timeout.min(SHUTDOWN_READ_POLL));
     let writer = out_endpoint
         .writer(buffers.transfer_size)
         .with_num_transfers(buffers.write_queue_depth)
@@ -584,9 +697,16 @@ pub fn open(criteria: &UsbMatch, buffers: BufferConfig) -> Result<UsbTransport, 
         selection,
         reader: UsbReader {
             inner: Some(reader),
+            logical_timeout: buffers.read_timeout,
+            shutdown: Arc::clone(&shutdown_state),
+            _owner: Arc::clone(&owner),
         },
         writer: UsbWriter {
             inner: Some(writer),
+            _owner: owner,
+        },
+        shutdown: UsbShutdown {
+            state: shutdown_state,
         },
     })
 }
@@ -841,6 +961,20 @@ mod tests {
             validate_rounded_pools(packet_rounded, selection),
             Err(TransportError::InvalidBufferConfig { .. })
         ));
+    }
+
+    #[test]
+    fn shutdown_handle_signals_and_observes_endpoint_deactivation() {
+        let state = Arc::new(UsbShutdownState::new());
+        let shutdown = UsbShutdown {
+            state: Arc::clone(&state),
+        };
+
+        assert!(!state.requested.load(Ordering::Acquire));
+        shutdown.request();
+        assert!(state.requested.load(Ordering::Acquire));
+        state.finish(Ok(()));
+        shutdown.wait().unwrap();
     }
 
     #[test]

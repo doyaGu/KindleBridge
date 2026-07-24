@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -55,6 +55,8 @@ pub enum ConnectionError {
     QueueFull,
     #[error("KBP control ping timed out")]
     PingTimedOut,
+    #[error("KBP graceful shutdown timed out")]
+    GoAwayTimedOut,
     #[error("invalid service response: {0}")]
     InvalidService(String),
 }
@@ -107,10 +109,8 @@ impl Connection {
         Self::start_inner(state, source, sink, None)
     }
 
-    /// Start a connection that can accept a new peer HELLO on the same
-    /// transport. FunctionFS keeps its endpoint pair configured when a host
-    /// process releases and reclaims WinUSB, so USB users must restart the KBP
-    /// session in place instead of closing and reopening ep1/ep2.
+    /// Start a connection that can acknowledge peer GOAWAY and accept a new
+    /// HELLO on the same transport without closing or reopening its endpoints.
     pub fn start_restartable<R, W, Restart>(
         state: SessionState,
         source: R,
@@ -206,6 +206,29 @@ impl Connection {
 
     pub fn shutdown(&self) {
         let _ = self.inner.commands.try_send(ActorCommand::Shutdown);
+    }
+
+    pub fn go_away(&self, timeout: Duration) -> Result<(), ConnectionError> {
+        if timeout.is_zero() {
+            return Err(ConnectionError::GoAwayTimedOut);
+        }
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.inner
+            .commands
+            .try_send(ActorCommand::GoAway {
+                generation,
+                response: response_tx,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => ConnectionError::QueueFull,
+                TrySendError::Disconnected(_) => self.disconnect_error(),
+            })?;
+        match response_rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ConnectionError::GoAwayTimedOut),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.disconnect_error()),
+        }
     }
 
     #[must_use]
@@ -390,6 +413,10 @@ enum ActorCommand {
         stream_id: u32,
         response: SyncSender<Result<(), ConnectionError>>,
     },
+    GoAway {
+        generation: u64,
+        response: SyncSender<Result<(), ConnectionError>>,
+    },
     Shutdown,
 }
 
@@ -404,7 +431,8 @@ impl ActorCommand {
             | Self::Receive { generation, .. }
             | Self::Close { generation, .. }
             | Self::Reset { generation, .. }
-            | Self::CancelReceive { generation, .. } => Some(*generation),
+            | Self::CancelReceive { generation, .. }
+            | Self::GoAway { generation, .. } => Some(*generation),
             Self::Shutdown => None,
         }
     }
@@ -422,7 +450,8 @@ impl ActorCommand {
             | Self::SendData { response, .. }
             | Self::Close { response, .. }
             | Self::Reset { response, .. }
-            | Self::CancelReceive { response, .. } => {
+            | Self::CancelReceive { response, .. }
+            | Self::GoAway { response, .. } => {
                 let _ = response.send(Err(error));
             }
             Self::Receive { response, .. } => {
@@ -477,6 +506,7 @@ struct Actor<W> {
     sequences: HashMap<u32, u32>,
     write_waiters: HashMap<(u32, u32), SyncSender<Result<(), ConnectionError>>>,
     pending_pings: HashMap<Vec<u8>, PendingPing>,
+    pending_goaway: Option<SyncSender<Result<(), ConnectionError>>>,
     next_ping_id: u64,
     control_sequence: u32,
     scheduler: FrameScheduler,
@@ -502,6 +532,7 @@ impl<W: FrameSink> Actor<W> {
             sequences: HashMap::new(),
             write_waiters: HashMap::new(),
             pending_pings: HashMap::new(),
+            pending_goaway: None,
             next_ping_id: 0,
             control_sequence: 1,
             scheduler: FrameScheduler::new(MAX_SCHEDULED_BYTES),
@@ -806,6 +837,25 @@ impl<W: FrameSink> Actor<W> {
                 let _ = response.send(Ok(()));
                 Ok(())
             }
+            ActorCommand::GoAway {
+                generation: _,
+                response,
+            } => {
+                if self.pending_goaway.is_some() {
+                    let _ = response.send(Err(ConnectionError::QueueFull));
+                    return Ok(());
+                }
+                self.queue_frame(
+                    Command::GoAway,
+                    0,
+                    Vec::new(),
+                    false,
+                    TrafficClass::Control,
+                    FrameContext::default(),
+                )?;
+                self.pending_goaway = Some(response);
+                Ok(())
+            }
             ActorCommand::Shutdown => Ok(()),
         }
     }
@@ -871,7 +921,28 @@ impl<W: FrameSink> Actor<W> {
                 }
                 Ok(())
             }
-            Command::GoAway | Command::Error => Err(ConnectionError::Disconnected),
+            Command::GoAway => {
+                if let Some(response) = self.pending_goaway.take() {
+                    let _ = response.send(Ok(()));
+                    return Err(ConnectionError::Disconnected);
+                }
+                if self.restart.is_some() {
+                    let control_sequence = self.control_sequence;
+                    self.fail_streams(ConnectionError::Disconnected);
+                    self.control_sequence = control_sequence;
+                    self.awaiting_restart = true;
+                    return self.queue_frame(
+                        Command::GoAway,
+                        0,
+                        Vec::new(),
+                        false,
+                        TrafficClass::Control,
+                        FrameContext::default(),
+                    );
+                }
+                Err(ConnectionError::Disconnected)
+            }
+            Command::Error => Err(ConnectionError::Disconnected),
             _ => Err(ConnectionError::Protocol(format!(
                 "unexpected {:?} after handshake",
                 frame.header.command
@@ -1268,6 +1339,9 @@ impl<W: FrameSink> Actor<W> {
         }
         for (_, pending) in self.pending_pings.drain() {
             let _ = pending.response.send(Err(error.clone()));
+        }
+        if let Some(response) = self.pending_goaway.take() {
+            let _ = response.send(Err(error.clone()));
         }
         let _ = self.incoming.try_send(Err(error));
     }

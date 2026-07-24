@@ -43,7 +43,7 @@ use kindlebridge_transport_tcp::{
     TransportConfig, TransportError,
 };
 use kindlebridge_transport_usb::{
-    BufferConfig, TransportError as UsbTransportError, UsbMatch, UsbReader, UsbWriter,
+    BufferConfig, TransportError as UsbTransportError, UsbMatch, UsbReader, UsbShutdown, UsbWriter,
 };
 use kindlebridge_wire::{
     Command, DecodeLimits, EndpointRole, Frame, FrameContext, Header, ProtocolError, SessionConfig,
@@ -65,6 +65,7 @@ const USB_TRANSFER_SIZE: usize = 16 * 1024;
 const USB_READ_QUEUE_DEPTH: usize = 4;
 const USB_WRITE_QUEUE_DEPTH: usize = 4;
 const USB_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const USB_GOAWAY_TIMEOUT: Duration = Duration::from_secs(2);
 const USB_RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const USB_RECOVERY_DRAIN_POLL: Duration = Duration::from_millis(250);
 
@@ -175,6 +176,12 @@ impl ConnectedDeviceProvider {
                 .devices
                 .iter()
                 .all(|device| device.session.connection.is_online())
+    }
+
+    pub(crate) fn shutdown(&self) {
+        for device in &self.devices {
+            device.session.shutdown();
+        }
     }
 }
 
@@ -508,6 +515,7 @@ fn link_rpc_error(error: LinkError) -> RpcError {
 #[derive(Clone, Debug)]
 struct ActorDeviceSession {
     connection: Connection,
+    usb_shutdown: Option<UsbShutdown>,
 }
 
 impl ActorDeviceSession {
@@ -527,7 +535,13 @@ impl ActorDeviceSession {
         let (state, hello) = negotiate(&mut sink, limits, false, &session_id)?;
         let (connection, _incoming) =
             Connection::start(state, TcpActorSource(source), TcpActorSink(sink));
-        Ok((Self { connection }, hello))
+        Ok((
+            Self {
+                connection,
+                usb_shutdown: None,
+            },
+            hello,
+        ))
     }
 
     fn connect_usb(criteria: &UsbMatch) -> Result<(Self, DeviceHello), LinkError> {
@@ -560,6 +574,7 @@ impl ActorDeviceSession {
     ) -> Result<(Self, DeviceHello), LinkError> {
         let (limits, transport_config) = session_transport_config();
         let transport = kindlebridge_transport_usb::open(criteria, usb_buffer_config())?;
+        let usb_shutdown = transport.shutdown_handle();
         let (mut reader, mut writer) = transport.split();
         if recover_abandoned_frame {
             trace_usb_recovery(format_args!("recovery transport opened"));
@@ -580,7 +595,30 @@ impl ActorDeviceSession {
         let source = UsbActorSource(FrameReader::new(reader, transport_config)?);
         let sink = UsbActorSink(FrameWriter::new(writer, transport_config)?);
         let (connection, _incoming) = Connection::start(state, source, sink);
-        Ok((Self { connection }, hello))
+        Ok((
+            Self {
+                connection,
+                usb_shutdown: Some(usb_shutdown),
+            },
+            hello,
+        ))
+    }
+
+    fn shutdown(&self) {
+        if self.usb_shutdown.is_some() {
+            if let Err(error) = self.connection.go_away(USB_GOAWAY_TIMEOUT) {
+                trace_usb_recovery(format_args!("USB GOAWAY incomplete: {error}"));
+            }
+        }
+        if let Some(shutdown) = &self.usb_shutdown {
+            shutdown.request();
+        }
+        self.connection.shutdown();
+        if let Some(shutdown) = &self.usb_shutdown {
+            if let Err(error) = shutdown.wait() {
+                trace_usb_recovery(format_args!("USB shutdown incomplete: {error}"));
+            }
+        }
     }
 
     fn call(&self, method: &str, params: &impl Serialize) -> Result<Value, LinkError> {
@@ -2122,7 +2160,10 @@ mod tests {
         };
         let (connection, _incoming) =
             Connection::start(state, TcpActorSource(actor_source), counted);
-        let session = ActorDeviceSession { connection };
+        let session = ActorDeviceSession {
+            connection,
+            usb_shutdown: None,
+        };
         let before = flushes.load(Ordering::Relaxed);
         let mut file = File::open(&source).unwrap();
         session

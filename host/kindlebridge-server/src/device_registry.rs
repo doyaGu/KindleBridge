@@ -107,6 +107,14 @@ impl DeviceRegistry {
         };
         sessions.invalidate(failed);
     }
+
+    pub fn shutdown(&self) {
+        if let RegistrySource::Usb { sessions, .. } = &self.source {
+            if let Some(provider) = sessions.take_current() {
+                provider.shutdown();
+            }
+        }
+    }
 }
 
 impl ProviderLease {
@@ -170,6 +178,15 @@ impl<T> SessionCache<T> {
                 state.current = None;
             }
         }
+    }
+
+    fn take_current(&self) -> Option<Arc<T>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current
+            .take()
+            .map(|lease| lease.value)
     }
 }
 
@@ -282,6 +299,30 @@ mod tests {
                 .id,
             1
         );
+        assert_eq!(connects.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn taking_current_session_clears_the_cache() {
+        let cache = SessionCache::new();
+        let connects = AtomicUsize::new(0);
+        let connect = || {
+            let id = connects.fetch_add(1, Ordering::AcqRel);
+            Ok::<_, ()>(FakeSession {
+                online: AtomicBool::new(true),
+                id,
+            })
+        };
+        let first = cache
+            .acquire(connect, |session| session.online.load(Ordering::Acquire))
+            .unwrap();
+
+        let taken = cache.take_current().unwrap();
+        assert_eq!(taken.id, first.value.id);
+        let second = cache
+            .acquire(connect, |session| session.online.load(Ordering::Acquire))
+            .unwrap();
+        assert_ne!(second.generation, first.generation);
         assert_eq!(connects.load(Ordering::Acquire), 2);
     }
 
