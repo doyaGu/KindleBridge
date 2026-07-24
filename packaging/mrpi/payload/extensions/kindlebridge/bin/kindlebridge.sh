@@ -25,6 +25,41 @@ show() {
     printf '%s\n' "$message"
 }
 
+package_version() {
+    tr -d '\r\n' <"$VERSION_FILE" 2>/dev/null || echo unknown
+}
+
+daemon_version() {
+    slot=$1
+    case "$slot" in
+        A|B) ;;
+        *) return 1 ;;
+    esac
+    daemon="$VAR_LOCAL_ROOT/kindlebridge/control/runtime/slots/$slot/bin/kindlebridged"
+    test -x "$daemon" || return 1
+    output=$("$daemon" --version 2>/dev/null) || return 1
+    name=${output%% *}
+    version=${output#* }
+    test "$name" = kindlebridged || return 1
+    test "$version" != "$output" && test -n "$version" || return 1
+    case "$version" in
+        *[!0-9A-Za-z.+_-]*) return 1 ;;
+    esac
+    printf '%s\n' "$version"
+}
+
+version_message() {
+    slot=$1
+    package=$2
+    daemon=$(daemon_version "$slot" 2>/dev/null || echo unknown)
+    if test "$daemon" = "$package"; then
+        printf 'KindleBridge %s\nDaemon slot %s\n' "$daemon" "${slot:-unknown}"
+    else
+        printf 'Daemon %s (slot %s)\nKUAL %s\n' \
+            "$daemon" "${slot:-unknown}" "$package"
+    fi
+}
+
 failure_code() {
     case "$1" in
         *"Unplug USB before"*) echo E-CABLE ;;
@@ -151,11 +186,11 @@ export_diagnostics() {
     {
         echo "KindleBridge diagnostics v1"
         echo "captured=$(date '+%Y-%m-%dT%H:%M:%S%z')"
-        if test -f "$VERSION_FILE"; then
-            echo "version=$(tr -d '\r\n' <"$VERSION_FILE")"
-        else
-            echo "version=unknown"
-        fi
+        package=$(package_version)
+        slot=$(cat "$VAR_LOCAL_ROOT/kindlebridge/control/runtime/current" 2>/dev/null || echo unknown)
+        echo "package_version=$package"
+        echo "daemon_slot=$slot"
+        echo "daemon_version=$(daemon_version "$slot" 2>/dev/null || echo unknown)"
         echo
         echo "[manager status]"
         if test -x "$MANAGER"; then
@@ -277,7 +312,11 @@ Connect USB to the computer."
         status_output=$(sh "$MANAGER" status 2>&1 || true)
         status=$(printf '%s\n' "$status_output" | sed -n '1p')
         reason=$(printf '%s\n' "$status_output" | sed -n 's/^reason=//p' | sed -n '1p')
-        version=$(tr -d '\r\n' <"$VERSION_FILE" 2>/dev/null || echo unknown)
+        slot=$(printf '%s\n' "$status_output" | sed -n 's/^slot=//p' | sed -n '1p')
+        if test -z "$slot"; then
+            slot=$(cat "$VAR_LOCAL_ROOT/kindlebridge/control/runtime/current" 2>/dev/null || echo unknown)
+        fi
+        version=$(version_message "$slot" "$(package_version)")
         if test -s "$ERROR_LOG"; then
             code=$(sed -n '1p' "$ERROR_LOG")
             show_last_failure "$code"
@@ -285,19 +324,19 @@ Connect USB to the computer."
         fi
         case "$status" in
             active)
-                show "KindleBridge $version
+                show "$version
 Development mode is ready.
 Connect USB to the computer.
 PC: kindlebridge device list"
                 ;;
             inactive)
-                show "KindleBridge $version
+                show "$version
 USB file transfer is ready.
 To develop, keep USB unplugged
 and switch to development mode."
                 ;;
             recovering)
-                show "KindleBridge $version
+                show "$version
 Development service is recovering.
 Wait 10 seconds, then check status."
                 ;;

@@ -1,5 +1,10 @@
 #!/bin/sh
 
+if test "${1:-}" = --version; then
+    echo "kindlebridged 0.1.0-daemon-test"
+    exit 0
+fi
+
 child=
 cleanup() {
     if test -n "$child"; then

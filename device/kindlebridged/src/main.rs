@@ -18,7 +18,7 @@ struct Report<'a> {
 }
 
 #[derive(Debug, Parser)]
-#[command(about = "KindleBridge unprivileged device daemon")]
+#[command(about = "KindleBridge unprivileged device daemon", version)]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
@@ -179,4 +179,16 @@ fn run_probe(listen: SocketAddr, allowed_peer: IpAddr) -> Result<(), String> {
         serde_json::to_string(&report).map_err(|error| error.to_string())?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_flag_reports_the_daemon_build() {
+        let error = Args::try_parse_from(["kindlebridged", "--version"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
 }

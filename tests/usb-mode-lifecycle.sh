@@ -861,7 +861,20 @@ grep -q '\[managed processes\]' "$CASE_ROOT/mnt/us/kindlebridge-diagnostics.txt"
 grep -q '^launcher.pid=4242$' "$CASE_ROOT/mnt/us/kindlebridge-diagnostics.txt" ||
     fail 'KUAL diagnostics read the launcher PID from the wrong state path'
 rm -f "$CASE_ROOT/var/local/kindlebridge/last-error.log"
-mv "$CONTROL_ROOT/bin/usb-gadget-manager.sh" "$CONTROL_ROOT/bin/usb-gadget-manager.real"
+printf '%s\n' '#!/bin/sh' \
+    'printf "%s\n" active slot=A timeout=disabled' \
+    >"$CONTROL_ROOT/bin/usb-gadget-manager.sh"
+chmod 0755 "$CONTROL_ROOT/bin/usb-gadget-manager.sh"
+sh "$KUAL_WRAPPER" status >"$CASE_ROOT/kual-version-output" 2>&1
+grep -q 'Daemon 0.1.0-daemon-test (slot A)' "$KUAL_CAPTURE" ||
+    fail 'KUAL status did not identify the active daemon version and slot'
+grep -q 'KUAL 0.1.0-test' "$KUAL_CAPTURE" ||
+    fail 'KUAL status did not distinguish the installed KUAL package version'
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" inactive' \
+    >"$CONTROL_ROOT/bin/usb-gadget-manager.sh"
+sh "$KUAL_WRAPPER" status >"$CASE_ROOT/kual-inactive-version-output" 2>&1
+grep -q 'Daemon 0.1.0-daemon-test (slot A)' "$KUAL_CAPTURE" ||
+    fail 'KUAL inactive status did not resolve the selected daemon slot'
 printf '%s\n' '#!/bin/sh' \
     'printf "%s\n" degraded reason=daemon-restarted' \
     'exit 1' >"$CONTROL_ROOT/bin/usb-gadget-manager.sh"
